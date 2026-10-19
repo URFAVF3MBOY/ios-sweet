@@ -109,16 +109,31 @@
  	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
  	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
  	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
-@@ -160,7 +188,7 @@
+@@ -160,13 +188,17 @@
  			return false;
  		}
  	}
 -	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
-+	const uint32_t branches[] = {TOUCH_BR_MAHB, TOUCH_BR_SAHB, TOUCH_BR_S0};
++	/* S_AHB has hardware clock gating (CBCR bit 1): CLK_OFF legitimately reads 1
++	 * while the bus is idle (seen as 0x80000002), so it is not a failure. */
++	const struct { uint32_t reg; bool hwgated; const char *name; } branches[] = {
++		{TOUCH_BR_MAHB, false, "m_ahb"}, {TOUCH_BR_SAHB, true, "s_ahb"},
++		{TOUCH_BR_S0, false, "s0"},
++	};
  	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
- 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
- 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
-@@ -218,7 +246,7 @@
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
+-		}
++		bool on = touch_wait_clear(st.gcc, branches[i].reg, 1u << 31);
++		printf("SWEET TOUCH: branch %s %#x = %#x%s\n", branches[i].name, branches[i].reg,
++		    touch_rd(st.gcc, branches[i].reg),
++		    on ? "" : (branches[i].hwgated ? " (hw-gated idle, ok)" : " HALTED; continuing"));
+ 	}
+ 	return true;
+ }
+@@ -218,7 +250,7 @@
  		return EIO;
  	}
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
@@ -127,7 +142,7 @@
  		return EBUSY;
  	}
  	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
-@@ -233,7 +261,7 @@
+@@ -233,7 +265,7 @@
  			err = (irq & SE_NACK) ? ENXIO : EIO;
  			/* A completed NACK is normal during address probing. Aborting an
  			 * idle sequencer may never produce ABORT_DONE. Wait for completion
@@ -136,7 +151,7 @@
  			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
  				delay(1);
  				irq = touch_irq();
-@@ -296,73 +324,104 @@
+@@ -296,73 +328,104 @@
  	st.sent = st.got = 0;
  	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
  	if (st.probing) {
@@ -270,18 +285,18 @@
 +	err = rmi_write(st.f01_ctrl, (uint8_t)((c0 & ~0x03u) | 0x84u));
 +	if (!err) {
 +		err = rmi_write((uint8_t)(st.f01_ctrl + 1u), 0x7f); /* all sources, as vendor */
-+	}
-+	if (!err) {
-+		err = rmi_read(st.f01_data, s, 2); /* clears pending interrupt bits */
  	}
 -	return (sum & 0xffffu) == touch_be16(buf + len - 2);
++	if (!err) {
++		err = rmi_read(st.f01_data, s, 2); /* clears pending interrupt bits */
++	}
 +	printf("SWEET TOUCH: configure ctrl0 %#x->%#x err=%d status=%#x irq=%#x\n",
 +	    c0, (c0 & ~0x03u) | 0x84u, err, s[0], s[1]);
 +	return err;
  }
  
  static void
-@@ -384,104 +443,57 @@
+@@ -384,104 +447,57 @@
  }
  
  static int
@@ -312,19 +327,7 @@
 -	if (n > TOUCH_MAX) {
 -		(void)touch_goodix_ack();
 -		return EIO;
-+	if (s[0] & 0x80u) { /* unconfigured: IC reset itself */
-+		printf("SWEET TOUCH: IC reports unconfigured (%#x); reconfiguring\n", s[0]);
-+		touch_report(0, st.x, st.y);
-+		return rmi_configure();
-+	}
-+	if (s[0] & 0x0fu) {
-+		return EIO; /* device status error code */
-+	}
-+	/* New frame, or a contact is down (a missed release must not stick),
-+	 * or sweettouchforce=1 for bring-up when the interrupt bit is doubtful. */
-+	if (!(s[1] & st.f12_irq) && !st.active && !st.force) {
-+		return 0;
- 	}
+-	}
 -	if (n) {
 -		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
 -		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
@@ -349,7 +352,19 @@
 -		mask |= 1u << id;
 -		x[id] = (int)px;
 -		y[id] = (int)py;
--	}
++	if (s[0] & 0x80u) { /* unconfigured: IC reset itself */
++		printf("SWEET TOUCH: IC reports unconfigured (%#x); reconfiguring\n", s[0]);
++		touch_report(0, st.x, st.y);
++		return rmi_configure();
++	}
++	if (s[0] & 0x0fu) {
++		return EIO; /* device status error code */
++	}
++	/* New frame, or a contact is down (a missed release must not stick),
++	 * or sweettouchforce=1 for bring-up when the interrupt bit is doubtful. */
++	if (!(s[1] & st.f12_irq) && !st.active && !st.force) {
++		return 0;
+ 	}
 -	err = touch_goodix_ack();
 -	if (!err) {
 -		touch_report(mask, x, y);
@@ -426,7 +441,7 @@
  	}
  	touch_report(mask, x, y);
  	return 0;
-@@ -492,17 +504,17 @@
+@@ -492,17 +508,17 @@
  {
  	uint32_t fw = touch_rd(st.se, SE_FW);
  	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
@@ -447,7 +462,7 @@
  		return false;
  	}
  	touch_wr(st.se, 0xe18, 0); /* no GSI events */
-@@ -516,8 +528,15 @@
+@@ -516,8 +532,15 @@
  	touch_wr(st.se, 0x24, 0x7f);
  	touch_wr(st.se, 0x20, 1);
  	touch_wr(st.se, SE_CLK_SEL, 0);
@@ -465,7 +480,7 @@
  	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
  	touch_wr(st.se, 0x254, 0);
  	touch_wr(st.se, 0x260, SE_PACK0);
-@@ -548,74 +567,63 @@
+@@ -548,74 +571,63 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
@@ -576,7 +591,7 @@
  			if (err) {
  				if ((errors++ % 100u) == 0) {
  					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
-@@ -629,10 +637,9 @@
+@@ -629,10 +641,9 @@
  		}
  		touch_wait(10);
  	}
@@ -589,7 +604,7 @@
  }
  
  void
-@@ -646,6 +653,8 @@
+@@ -646,6 +657,8 @@
  	st.started = true;
  	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
  	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
