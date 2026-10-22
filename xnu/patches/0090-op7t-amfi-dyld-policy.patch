@@ -1,0 +1,95 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,8 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -305,8 +307,73 @@
+ 	}
+ }
+ 
++/*
++ * dyld asks AMFI what it may do for the process it starts: __mac_syscall("AMFI", 0x5a,
++ * { uint64_t flags in; user_addr_t flags out }) ("check dyld policy"). Without a policy named
++ * "AMFI" the call fails with ENOPOLICY and dyld treats the process as restricted: it silently
++ * drops every DYLD_* variable, so DYLD_INSERT_LIBRARIES in a launchd job did nothing (U2:
++ * libredwood never loaded into backboardd -- no RedwoodGPU lookup in the log). As HackiOS
++ * kern_minimac.c miniamfi_policy_syscall: everything allowed (0xff), here only for the processes in sweetdyld=. Every other AMFI call keeps
++ * the answer it had before (ENOPOLICY), so only dyld's question changes.
++ */
++#define SWEET_AMFI_SYSCALL_CHECK_DYLD_POLICY	0x5a
++#define SWEET_AMFI_DYLD_OUTPUT_ALLOW_ALL	0xffULL
++
++static int
++sweet_amfi_syscall(struct proc *p __unused, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = SWEET_AMFI_DYLD_OUTPUT_ALLOW_ALL;
++	int error;
++
++	if (call != SWEET_AMFI_SYSCALL_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	/*
++	 * Only for the processes named in boot-arg sweetdyld=NAME[,NAME...] (default "backboardd";
++	 * names as the kernel keeps them, at most 16 characters, e.g. containermanager).
++	 * Everybody else gets the old answer (ENOPOLICY: dyld drops DYLD_* variables), so an
++	 * injection left in another launchd job stays inert without rebuilding the image.
++	 * sweetdyld=none: nobody.
++	 */
++	{
++		char list[128] = "backboardd", me[MAXCOMLEN + 1];
++		const char *at;
++		size_t mine;
++		int allowed = 0;
++
++		(void)PE_parse_boot_argn("sweetdyld", list, sizeof(list));
++		proc_selfname(me, sizeof(me));
++		mine = strlen(me);
++		for (at = list; *at != '\0';) {
++			size_t len = strcspn(at, ",");
++			if (len == mine && mine != 0 && strncmp(at, me, len) == 0) {
++				allowed = 1;
++				break;
++			}
++			at += len;
++			if (*at == ',') {
++				at++;
++			}
++		}
++		if (!allowed) {
++			return ENOPOLICY;
++		}
++		printf("SWEET AMFI: dyld policy: DYLD_* allowed for %s\n", me);
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +427,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",		/* the name __mac_syscall("AMFI", ...) looks for (was "SWEET AMFI") */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
