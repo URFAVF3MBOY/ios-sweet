@@ -1,35 +1,32 @@
-diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,7 @@
- bsd/dev/sweet_sample.c			standard
- bsd/dev/sweet_keys.c			standard
- bsd/dev/sweet_touch.c			standard
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_gpu.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +52,7 @@
- extern void sweet_sample_start(void);
+@@ -53,6 +53,7 @@
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
 +extern void sweet_gpu_init(void);
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -658,6 +659,8 @@
- 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -660,6 +661,8 @@
  	sweet_keys_init();
  	sweet_touch_init();
-+	/* GPU framebuffer blitting (off unless sweetgpu4=1). */
+ 	sweet_usb_probe();
++	/* GPU framebuffer blitting (bsd/dev/sweet_gpu.c; off unless sweetgpu4=1). */
 +	sweet_gpu_init();
  	return 0;
  }
  
-diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
 @@ -0,0 +1,420 @@
