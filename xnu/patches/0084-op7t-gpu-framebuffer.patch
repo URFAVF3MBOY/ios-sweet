@@ -29,7 +29,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,424 @@
 +/*
 + * OnePlus 7T (hotdogb, SM8150) Adreno 640: GPU framebuffer blitting under XNU.
 + *
@@ -104,6 +104,7 @@
 +#define G4_FB_BYTES		(FB_STRIDE * FB_H)		/* 0x9E3900 */
 +#define G4_FB_PAGES		((G4_FB_BYTES + 0xfffU) / 0x1000U)	/* 2532 */
 +#define G4_FB_L3S		((G4_FB_PAGES + 511U) / 512U)		/* 5 */
++#define G4_CHECK_BYTES		(((256U * FB_STRIDE) + 0xfffU) & ~0xfffU)	/* CPU view: rows 0..255 */
 +
 +/* ---- registers (a6xx.xml; dword offsets) ---- */
 +#define A6XX_CP_RB_RPTR		0x0806U
@@ -398,10 +399,13 @@
 +	call[5] = GPU_VA_SCR + G4_MARK_OFF;
 +	call[6] = 0;
 +	call[7] = G4_MARK_MAGIC;
-+	/* paint the corner black first, so a visible gradient can only be the GPU's */
-+	volatile uint32_t *fb = (volatile uint32_t *)(scratch);	/* placeholder, replaced below */
-+	(void)fb;
-+	volatile uint32_t *panel = (volatile uint32_t *)ml_io_map(FB_PA, (vm_size_t)G4_FB_BYTES);
++	/*
++	 * Paint the corner black first, so a visible gradient can only be the GPU's.
++	 * The CPU maps only the 256 rows it checks (~1.1 MB): boot 22 panicked in
++	 * kmem_alloc mapping the whole 10 MB panel (KERN_NO_SPACE). The GPU itself
++	 * reaches the whole panel through its own page tables (map_framebuffer).
++	 */
++	volatile uint32_t *panel = (volatile uint32_t *)ml_io_map(FB_PA, (vm_size_t)G4_CHECK_BYTES);
 +	if (panel) {
 +		for (uint32_t y = 0; y < 256; y++)
 +			for (uint32_t x = 0; x < 256; x++)
