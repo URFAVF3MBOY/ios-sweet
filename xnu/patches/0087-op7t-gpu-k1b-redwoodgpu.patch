@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 342b80c..2bcc60b 100644
+index 342b80c..2c71a9b 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -38,6 +38,8 @@
@@ -11,7 +11,44 @@ index 342b80c..2bcc60b 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -521,20 +523,70 @@ static int k1_write_and_check(uint64_t va, uint32_t magic, uint64_t ib_va, volat
+@@ -452,8 +454,19 @@ static int k1_tlb_flush(void)
+ 	return 0;
+ }
+ 
++/*
++ * The GPU's own cache (UCHE) sits before the SMMU and keeps lines by GPU address: after a page
++ * is unmapped (and maybe mapped elsewhere) a line it still holds would be read or written back
++ * where the page used to be. Phone, K1a boot 2026-10-22: page A got the write meant for page B
++ * although the TLB maintenance completed. Linux a6xx_set_pagetable() ends a translation change
++ * with CP_EVENT_WRITE CACHE_INVALIDATE ("be sure there isn't anything lingering"); so does the
++ * next submission here, once after any unmap. (0x31 is the event 0084's blits already use.)
++ */
++static int k1_uche_stale;
++
+ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ {
++	k1_uche_stale = 1;
+ 	for (uint64_t o = 0; o < size; o += 0x1000) {
+ 		uint64_t v = va + o;
+ 		if (v < K1_VA_BASE || v >= K1_VA_BASE + K1_VA_SIZE)
+@@ -469,11 +482,15 @@ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ /* HackiOS redwood_gpu_submit, on 0084's ring: invalidate CCU, the IBs, then the fence (synchronous here) */
+ uint32_t sweet_gpu_submit(const uint64_t *ib_va, const uint32_t *ib_dw, uint32_t count)
+ {
+-	uint32_t dw[4 + 4 * 8 + 4], n = 0;
++	uint32_t dw[2 + 4 + 4 * 8 + 5], n = 0;
+ 	if (count > 8)
+ 		return 0;
+ 	if (++k1_fence == 0)
+ 		k1_fence = 1;
++	if (k1_uche_stale) {
++		dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CACHE_INVALIDATE;
++		k1_uche_stale = 0;
++	}
+ 	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_DEPTH;
+ 	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_COLOR;
+ 	for (uint32_t i = 0; i < count; i++) {
+@@ -521,20 +538,71 @@ static int k1_write_and_check(uint64_t va, uint32_t magic, uint64_t ib_va, volat
  	return sweet_gpu_submit(&ib_va, &n, 1) != 0;
  }
  
@@ -21,8 +58,9 @@ index 342b80c..2bcc60b 100644
 + * 4 GiB faults. The K1a test used scratch pages below 4 GiB; kernel memory for programs
 + * (IOBufferMemoryDescriptor) is anywhere in DRAM (to 0x27fffffff on an 8 GB 7T). HackiOS
 + * writes SMMU_TCR2 = 1 | 1 << 4 | 7 << 15 (36-bit PA, 16-bit ASID, SEP upstream) into the
-+ * same kind of context. Done once, with the ring idle, followed by the TLB maintenance K1a
-+ * proved. Left alone when PASize already allows 36 bits or more.
++ * same kind of context. Done once, with the ring idle, followed by the TLB maintenance.
++ * Always written: the phone (boot 2026-10-22) showed TCR2 = 0x4003c077, an UNKNOWN reset value
++ * (PASize 7 is reserved, TBI0/TBI1 and bits 14/30 set), not something anybody chose.
 + */
 +#define SMMU_CB_TCR2		0x10U
 +#define SMMU_CB_FSR		0x58U
@@ -33,19 +71,19 @@ index 342b80c..2bcc60b 100644
 +{
 +	volatile uint32_t *tcr2 = (volatile uint32_t *)(k1_cb + SMMU_CB_TCR2);
 +	uint32_t was = *tcr2;
-+	if ((was & 7U) >= 1U) {
-+		printf("SWEET K1: TCR2 %#x already gives >= 36-bit PA: left alone\n", was);
++	if (was == K1B_TCR2) {
++		printf("SWEET K1: TCR2 %#x already HackiOS's: left alone\n", was);
 +		return 1;
 +	}
 +	if (grd(A6XX_CP_RB_RPTR) != grd(A6XX_CP_RB_WPTR)) {
-+		printf("SWEET K1: TCR2 %#x (32-bit PA) and the ring is busy: not changed\n", was);
++		printf("SWEET K1: TCR2 %#x and the ring is busy: not changed\n", was);
 +		return 0;
 +	}
 +	*tcr2 = K1B_TCR2;
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	int tlb = k1_tlb_flush();
 +	printf("SWEET K1: TCR2 %#x -> %#x (36-bit PA), TLB %s\n", was, *tcr2, tlb ? "ok" : "TIMEOUT");
-+	return tlb && (*tcr2 & 7U) == 1U;
++	return tlb && *tcr2 == K1B_TCR2;
 +}
 +
 +/* map the K1 slice and the GPU context, start the allocator (once); the PA size when asked (once) */
@@ -89,7 +127,7 @@ index 342b80c..2bcc60b 100644
  	volatile uint32_t *pa_a = (volatile uint32_t *)k1p(K1_TEST_PA);
  	volatile uint32_t *pa_b = (volatile uint32_t *)k1p(K1_TEST_PA + 0x1000);
  	volatile uint32_t *ibp = (volatile uint32_t *)k1p(K1_TEST_PA + 0x2000);
-@@ -565,6 +617,246 @@ static void k1_selftest(void)
+@@ -565,6 +633,252 @@ static void k1_selftest(void)
  	    k1_nfree, k1_free[0].start, k1_free[0].size, grd(A6XX_CP_HW_FAULT));
  }
  
@@ -120,7 +158,7 @@ index 342b80c..2bcc60b 100644
 +uint32_t gpu_log;
 +static int k1b_on;
 +static uint32_t k1b_fence;
-+static uint32_t k1b_ring[4 + 4 * 128 + 8];
++static uint32_t k1b_ring[2 + 4 + 4 * 128 + 8];
 +
 +bool redwood_gpu_ready(void);
 +bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
@@ -242,6 +280,10 @@ index 342b80c..2bcc60b 100644
 +	uint32_t n = 0, w, room = 0;
 +	if (!k1b_on || count == 0 || count > 128)
 +		return 0;
++	int stale = k1_uche_stale;
++	if (stale) {
++		k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CACHE_INVALIDATE;
++	}
 +	k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CCU_INV_DEPTH;
 +	k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CCU_INV_COLOR;
 +	for (uint32_t i = 0; i < count; i++) {
@@ -265,6 +307,8 @@ index 342b80c..2bcc60b 100644
 +	}
 +	if (room < n + 4U)
 +		return 0;
++	if (stale)
++		k1_uche_stale = 0;
 +	for (uint32_t i = 0; i < n; i++)
 +		ring[(w + i) & (K1B_RING_WORDS - 1U)] = k1b_ring[i];
 +	__asm__ volatile("dsb sy" ::: "memory");
@@ -336,7 +380,7 @@ index 342b80c..2bcc60b 100644
  static void sweet_gpu_thread(void *arg, wait_result_t result)
  {
  	unsigned delay_s = 8;
-@@ -678,6 +970,7 @@ static void sweet_gpu_thread(void *arg, wait_result_t result)
+@@ -678,6 +992,7 @@ static void sweet_gpu_thread(void *arg, wait_result_t result)
  	if (drew == 1 && good == G4_CHECK_ROWS * 252U)
  		printf("SWEET GPU4: THE GPU DREW THE PANEL FROM XNU -- gradient in the top-left corner\n");
  	k1_selftest();
@@ -346,10 +390,10 @@ index 342b80c..2bcc60b 100644
  	thread_terminate(current_thread());
 diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
 new file mode 100644
-index 0000000..8537985
+index 0000000..827b5fe
 --- /dev/null
 +++ b/iokit/Kernel/arm/RedwoodGPU.cpp
-@@ -0,0 +1,1289 @@
+@@ -0,0 +1,1306 @@
 +/*
 + * RedwoodGPU: the phone's Adreno for programs to draw with.
 + *
@@ -698,9 +742,17 @@ index 0000000..8537985
 +{
 +	IOService * provider = IOService::getPlatform();
 +	RedwoodGPU * gpu;
-+	uint32_t cached = 0;
++	uint32_t cached = 1;
 +
-+	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
++	/*
++	 * kitty: ordinary (cached) memory by default, HackiOS's gpu_cached=1. A write-combined kernel
++	 * buffer panicked the 7T (boot 2026-10-22, K1b self-test: "phystokv_range: illegal PA
++	 * 0x78778000", a quarter of a real page's address: a 4K/16K page-number mix-up somewhere on
++	 * XNU's cache-mode path, which no kitty driver had used before). gpu_cached=0 asks for
++	 * write-combined buffers again, as on HackiOS, for when that is understood.
++	 */
++	(void) PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
++	gGPUCached = cached != 0;
 +	gGPULock = IOLockAlloc();
 +	gpu = OSTypeAlloc(RedwoodGPU);
 +	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
@@ -1435,6 +1487,14 @@ index 0000000..8537985
 +				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
 +			}
 +		}
++		/*
++		 * kitty (cached buffers): what the GPU wrote is in memory; lines of the buffer this
++		 * processor holds from before are stale. freedreno asks this before it reads a
++		 * buffer (fd_bo_cpu_prep), as Linux's msm syncs a cached buffer for the CPU here.
++		 */
++		if (ret == kIOReturnSuccess && gGPUCached && (b = buffer(r.cpuPrep.handle)) != NULL) {
++			redwood_gpu_to_memory(b->kernel, b->size);
++		}
 +		IOLockUnlock(gGPULock);
 +		slowWait("cpu-prep", waitBegan);
 +		break;
@@ -1514,7 +1574,7 @@ index 0000000..8537985
 + * K1b self-test (boot-arg sweetk1b=2), run by bsd/dev/sweet_gpu.c before the service starts:
 + * what a program's GEM_NEW, SUBMIT and WAIT_FENCE do, from the kernel, since the phone has no
 + * shell to run a test program from yet.
-+ *  - a 1 MiB buffer made as gemNew() makes one (write-combined kernel memory) and entered into
++ *  - a 1 MiB buffer made as gemNew() makes one on kitty (cached kernel memory) and entered into
 + *    the GPU's address space page by page as newBuffer() does; the pages' physical addresses
 + *    are counted above and below 4 GiB, because that is what the TCR2 change (36-bit PA) is for;
 + *  - command buffer 1 (in the buffer itself, page 0) has the GPU write a word into each of the
@@ -1552,8 +1612,8 @@ index 0000000..8537985
 +	uint32_t high = 0, good = 0, n = 0, f1 = 0, f2 = 0, waited = 0;
 +	bool mapped = true, done = false;
 +
-+	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
-+	    kIOMapWriteCombineCache, K1B_TEST_BYTES, PAGE_SIZE);
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    K1B_TEST_BYTES, PAGE_SIZE);
 +	if (memory == NULL) {
 +		IOLog("RedwoodGPU: K1b FAILED: no memory for the test buffer\n");
 +		return 0;
@@ -1598,7 +1658,7 @@ index 0000000..8537985
 +		ib2[2] = (uint32_t) (at >> 32);
 +		ib2[3] = K1B_MAGIC2;
 +	}
-+	redwood_gpu_to_memory(NULL, 0);
++	redwood_gpu_to_memory((void *) k, K1B_TEST_BYTES);     /* the commands and the zeroes out of the cache */
 +	{
 +		uint64_t ib1 = address, ib2 = address + 0x2000;
 +		uint32_t w1 = n, w2 = 4;
@@ -1612,6 +1672,7 @@ index 0000000..8537985
 +		}
 +		IOSleep(1);
 +	}
++	redwood_gpu_to_memory((void *) k, K1B_TEST_BYTES);     /* forget what the cache held: read what the GPU wrote */
 +	for (uint32_t p = 3; p < K1B_TEST_PAGES; p++) {
 +		good += k[p * 1024 + 4] == K1B_MAGIC(p);
 +	}
