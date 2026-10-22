@@ -10,7 +10,7 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
  
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
-@@ -305,8 +307,77 @@
+@@ -305,8 +307,102 @@
  	}
  }
  
@@ -74,6 +74,31 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 +			return ENOPOLICY;
 +		}
 +		printf("SWEET AMFI: dyld policy: DYLD_* allowed for %s\n", me);
++		/*
++		 * U2 probe: can this process reach the inserted library? Looked up with the
++		 * process's own context (symlinks followed), at the three names it has: the
++		 * install path /redwood/lib/..., /var/jb/usr/lib/... and the real preboot path.
++		 * 0 = found; 2 = ENOENT. Tells "dyld skipped a present library" from "path dead".
++		 */
++		{
++			static const char *const where[3] = {
++				"/redwood/lib/libredwood.dylib",
++				"/var/jb/usr/lib/libredwood.dylib",
++				"/private/preboot/jb/procursus/usr/lib/libredwood.dylib",
++			};
++			int found[3];
++
++			for (int i = 0; i < 3; i++) {
++				vnode_t vp = NULLVP;
++
++				found[i] = vnode_lookup(where[i], 0, &vp, vfs_context_current());
++				if (found[i] == 0) {
++					vnode_put(vp);
++				}
++			}
++			printf("SWEET AMFI: %s probe: /redwood/lib %d, /var/jb/usr/lib %d, preboot %d (0 = present)\n",
++			    me, found[0], found[1], found[2]);
++		}
 +	}
 +	error = copyin(arg, &args, sizeof(args));
 +	if (error == 0) {
@@ -88,7 +113,7 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
  };
  
  /*
-@@ -360,7 +431,7 @@
+@@ -360,7 +456,7 @@
  static mac_policy_handle_t sweet_sandbox_mac_handle;
  
  static struct mac_policy_conf sweet_amfi_mac_conf = {
