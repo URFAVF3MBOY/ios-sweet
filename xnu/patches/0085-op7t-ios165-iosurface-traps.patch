@@ -1,0 +1,53 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -53,8 +53,14 @@ enum {
+ 	kSweetSurfaceTrapDecrementUse   = 1,
+ 	kSweetSurfaceTrapLock           = 2,
+ 	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
++	/*
++	 * iOS 16.5 (20F66): trap 4 is "detach" (the client is about to release: forget it
++	 * holds the surface), trap 5 is the release (HackiOS MiniIOSurface.cpp, which runs
++	 * 16.5: kSurfaceTrapDetach = 4, kSurfaceTrapRelease = 5). The iOS 16.7 meaning
++	 * used before (4 release, 5 release-failed) would drop two references per release.
++	 */
++	kSweetSurfaceTrapDetach         = 4,
++	kSweetSurfaceTrapRelease        = 5,
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+@@ -423,6 +429,7 @@ public:
+ 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+@@ -861,13 +868,24 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+ }
+ 
++/* Trap 4 on iOS 16.5: a release follows (trap 5). Nothing is dropped here. */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	unsigned int index;
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	IOLockUnlock(fLock);
++	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
+ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+ IOExternalTrap *
