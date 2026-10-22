@@ -29,7 +29,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,457 @@
 +/*
 + * OnePlus 7T (hotdogb, SM8150) Adreno 640: GPU framebuffer blitting under XNU.
 + *
@@ -79,7 +79,17 @@
 +#define GPU3D_PA		0x02c00000UL
 +#define GPU3D_LEN		0x40000UL
 +#define SCRATCH_PA		0xb0000000UL
-+#define SCRATCH_LEN		0x00600000UL	/* PT + GMU/GPU buffers + IB + our region */
++/*
++ * Boot 22/23: ml_io_map panics (kmem_alloc KERN_NO_SPACE) when the kernel's I/O
++ * map space runs out: a 6 MiB scratch map + a 10 MB, then a 1.1 MB panel map
++ * did. Map only the three small slices of scratch we touch (~0.4 MB):
++ */
++#define SL_PT_PA		(SCRATCH_PA + 0x100000UL)	/* GPU page tables + ring/scratch pages */
++#define SL_PT_LEN		0x30000UL
++#define SL_IB_PA		(SCRATCH_PA + 0x250000UL)	/* our IB (shim IB area + 0x50000) */
++#define SL_IB_LEN		0x1000UL
++#define SL_OWN_PA		(SCRATCH_PA + 0x400000UL)	/* our source image + FB L3 tables */
++#define SL_OWN_LEN		0x30000UL
 +#define FB_PA			0x9c000000UL
 +#define FB_W			1080U
 +#define FB_H			2400U
@@ -98,13 +108,22 @@
 +#define G4_SRC_W		128U
 +#define G4_SRC_H		128U
 +#define G4_SRC_PITCH		512U
-+#define G4_SRC_VA		0x01030000U	/* in the shim's existing L3 (idx 0x30) */
++/*
++ * Source in the shim's L3 at index 0x90.. -- a range the GPU has never used.
++ * (The first version used 0x01030000 = L3 0x30..0x43, which overlaps G3's
++ * source guard and destination pages: the SMMU TLB may still hold those old
++ * translations, and the GPU would read G3's image instead. Shim L3 indices in
++ * use: 0..0x11 SQE/ring/scratch, 0x20..0x33 G3 src, 0x40..0x83 G3 dst,
++ * 0x100..0x1ff IB.)
++ */
++#define G4_SRC_VA		0x01090000U
 +/* whole framebuffer, mapped fresh: VA 0x02000000, L2 entries 16.. (L1[0] exists) */
 +#define G4_FB_VA		0x02000000U
 +#define G4_FB_BYTES		(FB_STRIDE * FB_H)		/* 0x9E3900 */
 +#define G4_FB_PAGES		((G4_FB_BYTES + 0xfffU) / 0x1000U)	/* 2532 */
 +#define G4_FB_L3S		((G4_FB_PAGES + 511U) / 512U)		/* 5 */
-+#define G4_CHECK_BYTES		(((256U * FB_STRIDE) + 0xfffU) & ~0xfffU)	/* CPU view: rows 0..255 */
++#define G4_CHECK_ROWS		64U	/* the CPU paints and checks rows 0..63 of the 256 */
++#define G4_CHECK_BYTES		(((G4_CHECK_ROWS * FB_STRIDE) + 0xfffU) & ~0xfffU)	/* ~0.28 MB */
 +
 +/* ---- registers (a6xx.xml; dword offsets) ---- */
 +#define A6XX_CP_RB_RPTR		0x0806U
@@ -160,7 +179,7 @@
 +#define PTE_TABLE		3ULL
 +#define PTE_ATTR		((1ULL << 2) | (1ULL << 6) | (2ULL << 8) | (1ULL << 10))
 +
-+static vm_offset_t gpu, scratch;	/* kernel mappings */
++static vm_offset_t gpu, sl_pt, sl_ib, sl_own;	/* kernel mappings */
 +static int sweet_gpu_started;
 +static int gpu_sleep_chan;
 +
@@ -177,14 +196,26 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+/* scratch PA -> kernel VA */
++/* scratch PA -> kernel VA, through whichever slice holds it */
++static int sl_bad;
++static vm_offset_t sp(uintptr_t pa)
++{
++	if (pa >= SL_PT_PA && pa < SL_PT_PA + SL_PT_LEN)
++		return sl_pt + (pa - SL_PT_PA);
++	if (pa >= SL_IB_PA && pa < SL_IB_PA + SL_IB_LEN)
++		return sl_ib + (pa - SL_IB_PA);
++	if (pa >= SL_OWN_PA && pa < SL_OWN_PA + SL_OWN_LEN)
++		return sl_own + (pa - SL_OWN_PA);
++	sl_bad++;
++	return sl_own;	/* never used for a real access: callers check sl_bad */
++}
 +static inline volatile uint32_t *sp32(uintptr_t pa)
 +{
-+	return (volatile uint32_t *)(scratch + (pa - SCRATCH_PA));
++	return (volatile uint32_t *)sp(pa);
 +}
 +static inline volatile uint64_t *sp64(uintptr_t pa)
 +{
-+	return (volatile uint64_t *)(scratch + (pa - SCRATCH_PA));
++	return (volatile uint64_t *)sp(pa);
 +}
 +/* ring/scratch GPU VA (0x010xxxxx) -> its scratch PA -> kernel VA */
 +static inline volatile uint32_t *gva32(uint32_t va)
@@ -330,8 +361,10 @@
 +	gpu_wait(delay_s * 1000U);
 +
 +	gpu = ml_io_map(GPU3D_PA, GPU3D_LEN);
-+	scratch = ml_io_map(SCRATCH_PA, SCRATCH_LEN);
-+	if (!gpu || !scratch) {
++	sl_pt = ml_io_map(SL_PT_PA, SL_PT_LEN);
++	sl_ib = ml_io_map(SL_IB_PA, SL_IB_LEN);
++	sl_own = ml_io_map(SL_OWN_PA, SL_OWN_LEN);
++	if (!gpu || !sl_pt || !sl_ib || !sl_own) {
 +		printf("SWEET GPU4: MMIO map failed\n");
 +		goto out;
 +	}
@@ -380,8 +413,8 @@
 +	ib_blit(&b, &s, G4_CCU_BYPASS);
 +	s.dst_va = G4_FB_VA + FB_STRIDE - 32U; s.dx0 = 8U; s.dx1 = 8U + 256U;
 +	ib_blit(&b, &s, G4_CCU_BYPASS);
-+	if (b.n > b.max) {
-+		printf("SWEET GPU4: IB overflow %u/%u\n", b.n, b.max);
++	if (b.n > b.max || sl_bad) {
++		printf("SWEET GPU4: IB overflow %u/%u or slice miss %d\n", b.n, b.max, sl_bad);
 +		goto out;
 +	}
 +	/* copy the IB into GPU memory (reuse the shim IB area), then call it */
@@ -407,7 +440,7 @@
 +	 */
 +	volatile uint32_t *panel = (volatile uint32_t *)ml_io_map(FB_PA, (vm_size_t)G4_CHECK_BYTES);
 +	if (panel) {
-+		for (uint32_t y = 0; y < 256; y++)
++		for (uint32_t y = 0; y < G4_CHECK_ROWS; y++)
 +			for (uint32_t x = 0; x < 256; x++)
 +				panel[y * (FB_STRIDE / 4) + x] = 0xff000000U;
 +		__asm__ volatile("dsb sy" ::: "memory");
@@ -415,7 +448,7 @@
 +	int drew = ring_submit(call, 8, G4_MARK_OFF, G4_MARK_MAGIC);
 +	uint32_t good = 0;
 +	if (panel && drew == 1) {
-+		for (uint32_t y = 0; y < 256; y++)
++		for (uint32_t y = 0; y < G4_CHECK_ROWS; y++)
 +			for (uint32_t x = 2; x < 254; x++) {
 +				uint32_t v = panel[y * (FB_STRIDE / 4) + x];
 +				uint32_t ex0 = x, ex1 = (y >> 1) * 2U;
@@ -428,8 +461,8 @@
 +	}
 +	printf("SWEET GPU4: blit %s mark=%#x hwfault=%#x green=%u/%u\n",
 +	    drew == 1 ? "done" : "MISSING", drew == 1 ? G4_MARK_MAGIC : 0,
-+	    grd(A6XX_CP_HW_FAULT), good, 256U * 252U);
-+	if (drew == 1 && good > 256U * 252U * 9U / 10U)
++	    grd(A6XX_CP_HW_FAULT), good, G4_CHECK_ROWS * 252U);
++	if (drew == 1 && good == G4_CHECK_ROWS * 252U)
 +		printf("SWEET GPU4: THE GPU DREW THE PANEL FROM XNU -- gradient in the top-left corner\n");
 +out:
 +	printf("SWEET GPU4: thread exiting\n");
