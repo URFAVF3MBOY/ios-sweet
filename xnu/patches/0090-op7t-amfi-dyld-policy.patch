@@ -10,7 +10,7 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
  
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
-@@ -305,8 +307,73 @@
+@@ -305,8 +307,77 @@
  	}
  }
  
@@ -56,7 +56,11 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 +		proc_selfname(me, sizeof(me));
 +		mine = strlen(me);
 +		for (at = list; *at != '\0';) {
-+			size_t len = strcspn(at, ",");
++			size_t len = 0;
++
++			while (at[len] != '\0' && at[len] != ',') {	/* no strcspn in the kernel */
++				len++;
++			}
 +			if (len == mine && mine != 0 && strncmp(at, me, len) == 0) {
 +				allowed = 1;
 +				break;
@@ -84,7 +88,7 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
  };
  
  /*
-@@ -360,7 +427,7 @@
+@@ -360,7 +431,7 @@
  static mac_policy_handle_t sweet_sandbox_mac_handle;
  
  static struct mac_policy_conf sweet_amfi_mac_conf = {
