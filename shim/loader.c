@@ -76,6 +76,19 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+const char *loader_cmdline(uintptr_t dtb)
+{
+	uint64_t rd_start, rd_end;
+
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || (rd_start & 7))
+		return 0;
+	const struct payload *p = (const struct payload *)rd_start;
+	if (!magic_ok(p->magic) || p->version != 1 || p->cmdline[BOOT_LINE_LENGTH - 1])
+		return 0;
+	return p->cmdline;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;

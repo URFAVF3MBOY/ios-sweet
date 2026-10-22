@@ -1,0 +1,868 @@
+what claude said
+
+Reviewing OnePlus kernel GPU and clock source files.
+bash
+
+cd /home/claude; rm -rf gpuzip; mkdir gpuzip; cd gpuzip; timeout 120 unzip -q -o /mnt/user-data/uploads/gpu.zip; find . -type f | head -80; echo; find . -type f | wc -l; du -sh .
+Output
+
+./gpu/Makefile
+./gpu/ipu-v3/ipu-prv.h
+./gpu/ipu-v3/ipu-prg.c
+./gpu/ipu-v3/ipu-dc.c
+./gpu/ipu-v3/Makefile
+./gpu/ipu-v3/ipu-cpmem.c
+./gpu/ipu-v3/ipu-di.c
+./gpu/ipu-v3/ipu-image-convert.c
+./gpu/ipu-v3/ipu-smfc.c
+./gpu/ipu-v3/ipu-dmfc.c
+./gpu/ipu-v3/ipu-pre.c
+./gpu/ipu-v3/ipu-csi.c
+./gpu/ipu-v3/ipu-vdi.c
+./gpu/ipu-v3/Kconfig
+./gpu/ipu-v3/ipu-common.c
+./gpu/ipu-v3/ipu-dp.c
+./gpu/ipu-v3/ipu-ic.c
+./gpu/msm/kgsl_sync.h
+./gpu/msm/adreno_a5xx_preempt.c
+./gpu/msm/kgsl_trace.c
+./gpu/msm/adreno_a4xx_preempt.c
+./gpu/msm/adreno_a6xx_preempt.c
+./gpu/msm/adreno_profile.h
+./gpu/msm/kgsl_rgmu.h
+./gpu/msm/kgsl.h
+./gpu/msm/adreno_ringbuffer.h
+./gpu/msm/a4xx_reg.h
+./gpu/msm/kgsl_events.c
+./gpu/msm/adreno_a5xx.c
+./gpu/msm/kgsl_gmu_core.c
+./gpu/msm/a5xx_reg.h
+./gpu/msm/adreno_ringbuffer.c
+./gpu/msm/kgsl_pwrscale.h
+./gpu/msm/adreno_cp_parser.c
+./gpu/msm/adreno_dispatch.c
+./gpu/msm/adreno_drawctxt.c
+./gpu/msm/Makefile
+./gpu/msm/adreno_iommu.h
+./gpu/msm/adreno_a4xx.h
+./gpu/msm/adreno_perfcounter.h
+./gpu/msm/adreno_a3xx_snapshot.c
+./gpu/msm/kgsl_drawobj.c
+./gpu/msm/kgsl_log.h
+./gpu/msm/adreno_a5xx_packets.h
+./gpu/msm/adreno_a6xx_gmu.c
+./gpu/msm/kgsl_compat.c
+./gpu/msm/adreno_trace.c
+./gpu/msm/kgsl_snapshot.h
+./gpu/msm/kgsl_pwrscale.c
+./gpu/msm/adreno_compat.h
+./gpu/msm/kgsl_device.h
+./gpu/msm/adreno_iommu.c
+./gpu/msm/adreno-gpulist.h
+./gpu/msm/adreno_compat.c
+./gpu/msm/adreno_sysfs.c
+./gpu/msm/adreno_debugfs.c
+./gpu/msm/kgsl_hfi.c
+./gpu/msm/kgsl.c
+./gpu/msm/adreno_coresight.c
+./gpu/msm/adreno_a4xx_snapshot.c
+./gpu/msm/kgsl_iommu.c
+./gpu/msm/kgsl_sharedmem.c
+./gpu/msm/adreno_a4xx.c
+./gpu/msm/kgsl_drawobj.h
+./gpu/msm/adreno_a5xx.h
+./gpu/msm/adreno_ioctl.c
+./gpu/msm/kgsl_debugfs.h
+./gpu/msm/adreno_a6xx_snapshot.c
+./gpu/msm/adreno.h
+./gpu/msm/kgsl_mmu.h
+./gpu/msm/kgsl_sharedmem.h
+./gpu/msm/adreno_snapshot.c
+./gpu/msm/kgsl_gmu_core.h
+./gpu/msm/kgsl_pwrctrl.c
+./gpu/msm/adreno_cp_parser.h
+./gpu/msm/kgsl_hfi.h
+./gpu/msm/kgsl_iommu.h
+./gpu/msm/kgsl_gmu.c
+./gpu/msm/adreno_a3xx.c
+./gpu/msm/kgsl_pool.h
+
+4181
+154M	.
+bash
+
+cd /home/claude/gpuzip; ls; ls clk 2>/dev/null | head -5; find . -name "clk-cpu-osm*" -o -name "gpucc-sm8150*" -o -name "gcc-sm8150*" -o -name "osm*" | head; ls clk/qcom 2>/dev/null | grep -i -E "osm|sm8150|gdsc|clk-cpu" | head -20
+Output
+
+clk
+gpu
+Kconfig
+Makefile
+at91
+axis
+axs10x
+./clk/qcom/gcc-sm8150.c
+./clk/qcom/gpucc-sm8150.c
+./clk/qcom/clk-cpu-osm.c
+camcc-sm8150.c
+clk-cpu-osm.c
+clk-cpu-qcs405.c
+clk-cpu-sdxprairie.c
+clk-virt-sm8150.c
+debugcc-sm8150.c
+dispcc-sm8150.c
+gcc-sm8150.c
+gdsc-regulator.c
+gdsc.c
+gdsc.h
+gpucc-sm8150.c
+npucc-sm8150.c
+scc-sm8150.c
+videocc-sm8150.c
+virtio_clk_sm8150.c
+bash
+
+cd /home/claude/gpuzip/clk/qcom; echo "== GCC gpu clocks"; grep -n -B1 -A8 "gcc_gpu_cfg_ahb_clk = \|gcc_gpu_memnoc_gfx_clk = \|gcc_gpu_snoc_dvm_gfx_clk = " gcc-sm8150.c | grep -E "gcc_gpu|halt_reg|enable_reg|\.name" | head -20; echo "== GPUCC gdsc"; grep -n -B2 -A10 "gpu_cx_gdsc = \|gpu_gx_gdsc = " gpucc-sm8150.c | head -40
+Output
+
+== GCC gpu clocks
+2007:static struct clk_branch gcc_gpu_cfg_ahb_clk = {
+2008-	.halt_reg = 0x71004,
+2013-		.enable_reg = 0x71004,
+2070:static struct clk_branch gcc_gpu_memnoc_gfx_clk = {
+2071-	.halt_reg = 0x7100c,
+2074-		.enable_reg = 0x7100c,
+2077-			.name = "gcc_gpu_memnoc_gfx_clk",
+2083:static struct clk_branch gcc_gpu_snoc_dvm_gfx_clk = {
+2084-	.halt_reg = 0x71018,
+2087-		.enable_reg = 0x71018,
+2090-			.name = "gcc_gpu_snoc_dvm_gfx_clk",
+== GPUCC gdsc
+bash
+
+cd /home/claude/gpuzip/clk/qcom; grep -n -i "gdscr\|gdsc" gpucc-sm8150.c | head -20; echo ====; grep -n "0x1[0-9a-f]\{3\}" gpucc-sm8150.c | grep -E "halt_reg|gdscr|\.reg" | head -20; echo ==== gdsc nodes: ; grep -n -A12 "gpu_cx_gdsc\|gpu_gx_gdsc" gpucc-sm8150.c | head -50
+Output
+
+====
+148:	.halt_reg = 0x1078,
+162:	.halt_reg = 0x107c,
+175:	.halt_reg = 0x1088,
+188:	.halt_reg = 0x1098,
+206:	.halt_reg = 0x1080,
+219:	.halt_reg = 0x1094,
+232:	.halt_reg = 0x1084,
+245:	.halt_reg = 0x108c,
+258:	.halt_reg = 0x1004,
+271:	.halt_reg = 0x109c,
+284:	.halt_reg = 0x1064,
+302:	.halt_reg = 0x105c,
+315:	.halt_reg = 0x1058,
+328:	.halt_reg = 0x110c,
+341:	.halt_reg = 0x1090,
+==== gdsc nodes:
+Investigating how GDSC power domains are defined for this clock driver.
+bash
+
+cd /home/claude/in; grep -n -i "gdsc@0x2c9\|gdsc@2c9\|gpu_cx_gdsc\|gpu_gx_gdsc\|gdsc@0x2c91\|gdsc@2c91" live.dts | cut -c1-140 | head; python3 - <<'EOF'
+import re
+t=open('/home/claude/in/live.dts').read().split('\n')
+for i,l in enumerate(t):
+    if re.search(r'qcom,gdsc@0?x?2c9',l,re.I) and l.strip().endswith('{'):
+        print(i+1,'\n'.join(x[:160] for x in t[i:i+8]))
+EOF
+Output
+
+596:    qcom,gdsc@0x2c9106c {
+598:      regulator-name = "gpu_cx_gdsc";
+620:    qcom,gdsc@0x2c9100c {
+622:      regulator-name = "gpu_gx_gdsc";
+28921:    gpu_cx_gdsc = "/soc/qcom,gdsc@0x2c9106c";
+28924:    gpu_gx_gdsc = "/soc/qcom,gdsc@0x2c9100c";
+596     qcom,gdsc@0x2c9106c {
+      compatible = "qcom,gdsc";
+      regulator-name = "gpu_cx_gdsc";
+      reg = <0x2c9106c 0x4>;
+      hw-ctrl-addr = <0x1e>;
+      qcom,skip-disable = ;
+      qcom,gds-timeout = <0x1f4>;
+      qcom,clk-dis-wait-val = <0x8>;
+620     qcom,gdsc@0x2c9100c {
+      compatible = "qcom,gdsc";
+      regulator-name = "gpu_gx_gdsc";
+      reg = <0x2c9100c 0x4>;
+      domain-addr = <0x21>;
+      sw-reset = <0x22>;
+      qcom,reset-aon-logic = ;
+      status = "ok";
+Investigating GPU register offsets within the clock controller.
+Confirming GPU register offsets, now checking CPU OSM registers
+bash
+
+cd /home/claude/gpuzip/clk/qcom; wc -l clk-cpu-osm.c; grep -n -E "^#define" clk-cpu-osm.c | head -90
+Output
+
+1293 clk-cpu-osm.c
+14:#define pr_fmt(fmt) "clk: %s: " fmt, __func__
+42:#define OSM_INIT_RATE			300000000UL
+43:#define XO_RATE				19200000UL
+44:#define OSM_TABLE_SIZE			40
+45:#define OSM_TABLE_REDUCED_SIZE		12
+46:#define SINGLE_CORE_COUNT		1
+47:#define CORE_COUNT_VAL(val)		((val & GENMASK(18, 16)) >> 16)
+49:#define OSM_REG_SIZE			32
+51:#define ENABLE_REG			0x0
+52:#define FREQ_REG			0x110
+53:#define VOLT_REG			0x114
+54:#define CORE_DCVS_CTRL			0xbc
+56:#define DCVS_PERF_STATE_DESIRED_REG_0	0x920
+57:#define DCVS_PERF_STATE_DESIRED_REG(n) \
+60:#define OSM_CYCLE_COUNTER_STATUS_REG_0	0x9c0
+61:#define OSM_CYCLE_COUNTER_STATUS_REG(n) \
+bash
+
+cd /home/claude/gpuzip/clk/qcom; sed -n 40,75p clk-cpu-osm.c; echo -----; grep -n -E "DCVS_PERF_STATE_DESIRED_REG|OSM_CYCLE_COUNTER|FREQ_REG|VOLT_REG|ENABLE_REG|CORE_DCVS_CTRL|OSM_REG_SIZE" clk-cpu-osm.c | sed -n 1,60p
+Output
+
+#include "clk-debug.h"
+
+#define OSM_INIT_RATE			300000000UL
+#define XO_RATE				19200000UL
+#define OSM_TABLE_SIZE			40
+#define OSM_TABLE_REDUCED_SIZE		12
+#define SINGLE_CORE_COUNT		1
+#define CORE_COUNT_VAL(val)		((val & GENMASK(18, 16)) >> 16)
+
+#define OSM_REG_SIZE			32
+
+#define ENABLE_REG			0x0
+#define FREQ_REG			0x110
+#define VOLT_REG			0x114
+#define CORE_DCVS_CTRL			0xbc
+
+#define DCVS_PERF_STATE_DESIRED_REG_0	0x920
+#define DCVS_PERF_STATE_DESIRED_REG(n) \
+	(DCVS_PERF_STATE_DESIRED_REG_0 + 4 * (n))
+
+#define OSM_CYCLE_COUNTER_STATUS_REG_0	0x9c0
+#define OSM_CYCLE_COUNTER_STATUS_REG(n) \
+	(OSM_CYCLE_COUNTER_STATUS_REG_0 + 4 * (n))
+
+struct osm_entry {
+	u16 virtual_corner;
+	u16 open_loop_volt;
+	long frequency;
+};
+
+struct clk_osm {
+	struct clk_hw hw;
+	struct osm_entry osm_table[OSM_TABLE_SIZE];
+	struct dentry *debugfs;
+	void __iomem *vbase;
+	phys_addr_t pbase;
+-----
+49:#define OSM_REG_SIZE			32
+51:#define ENABLE_REG			0x0
+52:#define FREQ_REG			0x110
+53:#define VOLT_REG			0x114
+54:#define CORE_DCVS_CTRL			0xbc
+56:#define DCVS_PERF_STATE_DESIRED_REG_0	0x920
+57:#define DCVS_PERF_STATE_DESIRED_REG(n) \
+58:	(DCVS_PERF_STATE_DESIRED_REG_0 + 4 * (n))
+60:#define OSM_CYCLE_COUNTER_STATUS_REG_0	0x9c0
+61:#define OSM_CYCLE_COUNTER_STATUS_REG(n) \
+62:	(OSM_CYCLE_COUNTER_STATUS_REG_0 + 4 * (n))
+115:	return readl_relaxed_no_log(c->vbase + ENABLE_REG);
+244:	clk_osm_write_reg(cpuclk, index, DCVS_PERF_STATE_DESIRED_REG(0));
+261:	index = clk_osm_read_reg(cpuclk, DCVS_PERF_STATE_DESIRED_REG(0));
+587:	clk_osm_write_reg(c, index, DCVS_PERF_STATE_DESIRED_REG(num));
+631:			DCVS_PERF_STATE_DESIRED_REG(c->core_num));
+665:		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+917:				OSM_CYCLE_COUNTER_STATUS_REG(core_num));
+939:		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+948:		data = clk_osm_read_reg(c, VOLT_REG + i * OSM_REG_SIZE);
+1155:	val = clk_osm_read_reg(&pwrcl_clk, CORE_DCVS_CTRL);
+1159:	val = clk_osm_read_reg(&perfcl_clk, CORE_DCVS_CTRL);
+Mapping out the register layout for frequency settings.
+bash
+
+cd /home/claude/gpuzip/clk/qcom; sed -n 225,275p clk-cpu-osm.c; echo ------LUT; sed -n 655,700p clk-cpu-osm.c; echo -----; sed -n 930,965p clk-cpu-osm.c
+Output
+
+	if (!cpuclk)
+		return -EINVAL;
+
+	r_rate = clk_osm_round_rate(hw, rate, NULL);
+
+	if (rate != r_rate) {
+		pr_err("invalid requested rate=%ld\n", rate);
+		return -EINVAL;
+	}
+
+	/* Convert rate to table index */
+	index = clk_osm_search_table(cpuclk->osm_table,
+				     cpuclk->num_entries, r_rate);
+	if (index < 0) {
+		pr_err("cannot set %s to %lu\n", clk_hw_get_name(hw), rate);
+		return -EINVAL;
+	}
+	pr_debug("rate: %lu --> index %d\n", rate, index);
+
+	clk_osm_write_reg(cpuclk, index, DCVS_PERF_STATE_DESIRED_REG(0));
+
+	/* Make sure the write goes through before proceeding */
+	clk_osm_mb(cpuclk);
+
+	return 0;
+}
+
+static unsigned long l3_clk_recalc_rate(struct clk_hw *hw,
+					unsigned long parent_rate)
+{
+	struct clk_osm *cpuclk = to_clk_osm(hw);
+	int index = 0;
+
+	if (!cpuclk)
+		return -EINVAL;
+
+	index = clk_osm_read_reg(cpuclk, DCVS_PERF_STATE_DESIRED_REG(0));
+
+	pr_debug("%s: Index %d, freq %ld\n", __func__, index,
+				cpuclk->osm_table[index].frequency);
+
+	/* Convert index to frequency */
+	return cpuclk->osm_table[index].frequency;
+}
+
+
+const static struct clk_ops clk_ops_l3_osm = {
+	.round_rate = clk_osm_round_rate,
+	.list_rate = clk_osm_list_rate,
+	.recalc_rate = l3_clk_recalc_rate,
+	.set_rate = l3_clk_set_rate,
+------LUT
+	parent = to_clk_osm(p_hw);
+	c->vbase = parent->vbase;
+
+	table = kcalloc(parent->osm_table_size + 1, sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+
+	for (i = 0; i < parent->osm_table_size; i++) {
+		u32 data, src, div, lval, core_count;
+
+		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+		src = (data & GENMASK(31, 30)) >> 30;
+		div = (data & GENMASK(29, 28)) >> 28;
+		lval = data & GENMASK(7, 0);
+		core_count = CORE_COUNT_VAL(data);
+
+		/* Save the frequencies in terms of KHz */
+		if (!src)
+			table[i].frequency = OSM_INIT_RATE / 1000;
+		else
+			table[i].frequency = (XO_RATE * lval) / 1000;
+		table[i].driver_data = table[i].frequency;
+
+		if (core_count == SINGLE_CORE_COUNT)
+			table[i].frequency = CPUFREQ_ENTRY_INVALID;
+
+		/* Two of the same frequencies means end of table */
+		if (i > 0 && table[i - 1].driver_data == table[i].driver_data) {
+			struct cpufreq_frequency_table *prev = &table[i - 1];
+
+			if (prev->frequency == CPUFREQ_ENTRY_INVALID) {
+				prev->flags = CPUFREQ_BOOST_FREQ;
+				prev->frequency = prev->driver_data;
+			}
+
+			break;
+		}
+	}
+	table[i].frequency = CPUFREQ_TABLE_END;
+
+	ret = cpufreq_table_validate_and_show(policy, table);
+	if (ret) {
+		pr_err("%s: invalid frequency table: %d\n", __func__, ret);
+		goto err;
+	}
+
+-----
+
+	return cycle_counter_ret;
+}
+
+static int clk_osm_read_lut(struct platform_device *pdev, struct clk_osm *c)
+{
+	u32 data, src, lval, i, j = c->osm_table_size;
+
+	for (i = 0; i < c->osm_table_size; i++) {
+		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+		src = ((data & GENMASK(31, 30)) >> 30);
+		lval = (data & GENMASK(7, 0));
+
+		if (!src)
+			c->osm_table[i].frequency = OSM_INIT_RATE;
+		else
+			c->osm_table[i].frequency = XO_RATE * lval;
+
+		data = clk_osm_read_reg(c, VOLT_REG + i * OSM_REG_SIZE);
+		c->osm_table[i].virtual_corner =
+					((data & GENMASK(21, 16)) >> 16);
+		c->osm_table[i].open_loop_volt = (data & GENMASK(11, 0));
+
+		pr_debug("index=%d freq=%ld virtual_corner=%d open_loop_voltage=%u\n",
+			 i, c->osm_table[i].frequency,
+			 c->osm_table[i].virtual_corner,
+			 c->osm_table[i].open_loop_volt);
+
+		if (i > 0 && j == c->osm_table_size &&
+				c->osm_table[i].frequency ==
+				c->osm_table[i - 1].frequency)
+			j = i;
+	}
+
+	osm_clks_init[c->cluster_num].rate_max = devm_kcalloc(&pdev->dev,
+						 j, sizeof(unsigned long),
+Decoding the frequency register bit layout.
+
+Mapping clock and voltage registers across CPU clusters.
+
+bash
+
+cd /home/claude/gpuzip/clk/qcom; sed -n 560,640p clk-cpu-osm.c; echo ----; sed -n 1140,1175p clk-cpu-osm.c; grep -n "core_num\s*=\|cluster_num\s*=\|osm_table_size\s*=" clk-cpu-osm.c | head
+Output
+
+	if (to_clk_osm(c_parent)->per_core_dcvs)
+		return c;
+
+	first = c;
+	/* Find CPUs that share the same clock domain */
+	for_each_possible_cpu(cpu) {
+		n = logical_cpu_to_clk(cpu);
+		if (!n)
+			continue;
+
+		parent = clk_hw_get_parent(&n->hw);
+		if (!parent)
+			return NULL;
+		if (parent != c_parent)
+			continue;
+
+		cpumask_set_cpu(cpu, &c->related_cpus);
+		if (n->core_num == 0)
+			first = n;
+	}
+
+	return first;
+}
+
+static void
+osm_set_index(struct clk_osm *c, unsigned int index, unsigned int num)
+{
+	clk_osm_write_reg(c, index, DCVS_PERF_STATE_DESIRED_REG(num));
+
+	/* Make sure the write goes through before proceeding */
+	clk_osm_mb(c);
+}
+
+static int
+osm_cpufreq_target_index(struct cpufreq_policy *policy, unsigned int index)
+{
+	struct clk_osm *c = policy->driver_data;
+
+	osm_set_index(c, index, c->core_num);
+	arch_set_freq_scale(policy->related_cpus,
+			    policy->freq_table[index].frequency,
+			    policy->cpuinfo.max_freq);
+	return 0;
+}
+
+static unsigned int
+osm_cpufreq_fast_switch(struct cpufreq_policy *policy, unsigned int target_freq)
+{
+	int index;
+
+	index = cpufreq_frequency_table_target(policy, target_freq,
+							CPUFREQ_RELATION_L);
+	if (index < 0)
+		return 0;
+
+	osm_cpufreq_target_index(policy, index);
+
+	return policy->freq_table[index].frequency;
+}
+
+static unsigned int osm_cpufreq_get(unsigned int cpu)
+{
+	struct cpufreq_policy *policy = cpufreq_cpu_get_raw(cpu);
+	struct clk_osm *c;
+	u32 index;
+
+	if (!policy)
+		return 0;
+
+	c = policy->driver_data;
+	index = clk_osm_read_reg(c,
+			DCVS_PERF_STATE_DESIRED_REG(c->core_num));
+	return policy->freq_table[index].frequency;
+}
+
+static int osm_cpufreq_cpu_init(struct cpufreq_policy *policy)
+{
+	struct cpufreq_frequency_table *table;
+	struct clk_osm *c, *parent;
+	struct clk_hw *p_hw;
+	int ret;
+----
+					sizeof(struct clk *)), GFP_KERNEL);
+	if (!clk_data->clks)
+		goto clk_err;
+
+	clk_data->clk_num = num_clks;
+
+	rc = clk_osm_resources_init(pdev);
+	if (rc) {
+		if (rc != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "OSM resources init failed, rc=%d\n",
+				rc);
+		return rc;
+	}
+
+	/* Check if per-core DCVS is enabled/not */
+	val = clk_osm_read_reg(&pwrcl_clk, CORE_DCVS_CTRL);
+	if (val & BIT(0))
+		pwrcl_clk.per_core_dcvs = true;
+
+	val = clk_osm_read_reg(&perfcl_clk, CORE_DCVS_CTRL);
+	if (val & BIT(0))
+		perfcl_clk.per_core_dcvs = true;
+
+	if (!is_trinket) {
+		rc = clk_osm_read_lut(pdev, &l3_clk);
+		if (rc) {
+			dev_err(&pdev->dev, "Unable to read OSM LUT for L3, rc=%d\n",
+				rc);
+			return rc;
+		}
+	}
+
+	rc = clk_osm_read_lut(pdev, &pwrcl_clk);
+	if (rc) {
+		dev_err(&pdev->dev, "Unable to read OSM LUT for power cluster, rc=%d\n",
+			rc);
+307:	.cluster_num = 0,
+308:	.osm_table_size = OSM_TABLE_SIZE,
+319:	.cluster_num = 1,
+320:	.osm_table_size = OSM_TABLE_SIZE,
+325:	.core_num = 0,
+337:	.core_num = 1,
+349:	.core_num = 2,
+361:	.core_num = 3,
+373:	.core_num = 4,
+385:	.core_num = 5,
+Mapping CPU core numbers to their cluster assignments.
+bash
+
+cd /home/claude/gpuzip/clk/qcom; sed -n 296,330p clk-cpu-osm.c; grep -n "perfpcl\|osm_perfpcl_base\|\"osm_" clk-cpu-osm.c | head; sed -n 370,420p clk-cpu-osm.c | grep -n -E "core_num|parent|\.name|cluster" 
+Output
+
+		.ops = &clk_ops_cpu_osm,
+	},
+	[3] = {
+		.name = "perfpcl_clk",
+		.parent_names = (const char *[]){ "bi_tcxo_ao" },
+		.num_parents = 1,
+		.ops = &clk_ops_cpu_osm,
+	},
+};
+
+static struct clk_osm l3_clk = {
+	.cluster_num = 0,
+	.osm_table_size = OSM_TABLE_SIZE,
+	.hw.init = &osm_clks_init[0],
+};
+
+static DEFINE_CLK_VOTER(l3_cluster0_vote_clk, l3_clk, 0);
+static DEFINE_CLK_VOTER(l3_cluster1_vote_clk, l3_clk, 0);
+static DEFINE_CLK_VOTER(l3_cluster2_vote_clk, l3_clk, 0);
+static DEFINE_CLK_VOTER(l3_misc_vote_clk, l3_clk, 0);
+static DEFINE_CLK_VOTER(l3_gpu_vote_clk, l3_clk, 0);
+
+static struct clk_osm pwrcl_clk = {
+	.cluster_num = 1,
+	.osm_table_size = OSM_TABLE_SIZE,
+	.hw.init = &osm_clks_init[1],
+};
+
+static struct clk_osm cpu0_pwrcl_clk = {
+	.core_num = 0,
+	.total_cycle_counter = 0,
+	.prev_cycle_counter = 0,
+	.hw.init = &(struct clk_init_data){
+		.name = "cpu0_pwrcl_clk",
+		.parent_names = (const char *[]){ "pwrcl_clk" },
+299:		.name = "perfpcl_clk",
+450:static struct clk_osm perfpcl_clk = {
+456:static struct clk_osm cpu7_perfpcl_clk = {
+461:		.name = "cpu7_perfpcl_clk",
+462:		.parent_names = (const char *[]){ "perfpcl_clk" },
+484:	[CPU7_PERFPCL_CLK] = &cpu7_perfpcl_clk.hw,
+485:	[PERFPCL_CLK] = &perfpcl_clk.hw,
+499:	&cpu7_perfpcl_clk,
+984:							"osm_l3_base");
+1002:						"osm_pwrcl_base");
+4:	.core_num = 4,
+8:		.name = "cpu4_pwrcl_clk",
+9:		.parent_names = (const char *[]){ "pwrcl_clk" },
+10:		.num_parents = 1,
+16:	.core_num = 5,
+20:		.name = "cpu5_pwrcl_clk",
+21:		.parent_names = (const char *[]){ "pwrcl_clk" },
+22:		.num_parents = 1,
+28:	.cluster_num = 2,
+34:	.core_num = 0,
+38:		.name = "cpu4_perfcl_clk",
+39:		.parent_names = (const char *[]){ "perfcl_clk" },
+40:		.num_parents = 1,
+46:	.core_num = 1,
+50:		.name = "cpu5_perfcl_clk",
+51:		.parent_names = (const char *[]){ "perfcl_clk" },
+Working out the CPU cluster core layout for SM8150.
+
+Designing a register-level probe for each CPU cluster block.
+
+bash
+
+mkdir -p /mnt/user-data/outputs && cat > /mnt/user-data/outputs/sweet_hwprobe.c <<'EOF'
+/*
+ * OP7T stage 0 (v2): read-only hardware probe - CPU speed, CPU DVFS (OSM) tables and state,
+ * Adreno power state.
+ *
+ * Install as bsd/dev/sweet_hwprobe.c.  It never writes a register.  Blocks that could hang
+ * the bus when gated (the GPU clock controller) are read only after a status register in an
+ * always-on block says they are powered and clocked.
+ *
+ * Output: "SWEET HW:" lines on the console / live log / persistent log.
+ * Boot-arg: sweethwprobe=0 disables it (default on).
+ *
+ * Register layout VERIFIED against the OnePlus SM8150 kernel source you supplied:
+ *   clk-cpu-osm.c : ENABLE 0x0, CORE_DCVS_CTRL 0xbc, FREQ_REG 0x110 + i*32 (40 entries),
+ *                   VOLT_REG 0x114 + i*32, DCVS_PERF_STATE_DESIRED_REG(n) 0x920 + 4n,
+ *                   OSM_CYCLE_COUNTER_STATUS_REG(n) 0x9c0 + 4n.
+ *                   FREQ_REG: src = bits 31:30 (0 => 300 MHz), lval = bits 7:0 (x 19.2 MHz),
+ *                   core count = bits 18:16.  VOLT_REG: corner = bits 21:16, volt = bits 11:0.
+ *   gcc-sm8150.c  : GPU_CFG_AHB 0x71004, GPU_MEMNOC_GFX 0x7100c, GPU_SNOC_DVM_GFX 0x71018.
+ *   device tree   : gpu_cx_gdsc 0x02c9106c, gpu_gx_gdsc 0x02c9100c.
+ */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <pexpert/pexpert.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+void sweet_hwprobe(void);
+
+#define GCC_PA              0x00100000
+#define GCC_SIZE            0x00090000
+#define GCC_GPU_CFG_AHB     0x71004
+#define GCC_GPU_MEMNOC_GFX  0x7100c
+#define GCC_GPU_SNOC_DVM    0x71018
+#define CBCR_CLK_OFF        (1u << 31)
+
+#define GPUCC_PA            0x02c90000
+#define GPUCC_SIZE          0x00009000
+#define GPUCC_CX_GDSCR      0x106c
+#define GPUCC_GX_GDSCR      0x100c
+
+#define OSM_SIZE            0x1400
+#define OSM_ENABLE          0x000
+#define OSM_DCVS_CTRL       0x0bc
+#define OSM_FREQ(i)         (0x110 + (i) * 32)
+#define OSM_VOLT(i)         (0x114 + (i) * 32)
+#define OSM_DESIRED(n)      (0x920 + 4 * (n))
+#define OSM_CYCLES(n)       (0x9c0 + 4 * (n))
+#define OSM_TABLE_SIZE      40
+
+static const struct {
+	const char *name;
+	uint32_t    pa;
+	unsigned    ncores;     /* cores that have per-core registers in this block */
+	const char *cpus;
+} osm_blocks[] = {
+	{ "l3",    0x18321000, 1, "L3" },
+	{ "pwr",   0x18323000, 4, "cpu0-3" },
+	{ "perf",  0x18325800, 3, "cpu4-6" },
+	{ "prime", 0x18327800, 1, "cpu7" },
+};
+#define NBLOCKS (sizeof(osm_blocks) / sizeof(osm_blocks[0]))
+
+static vm_offset_t osm_base[NBLOCKS];
+
+static uint32_t
+hw_rd(vm_offset_t base, uint32_t off)
+{
+	uint32_t v = *(volatile uint32_t *)(base + off);
+	__asm__ volatile ("dmb oshld" ::: "memory");
+	return v;
+}
+
+/* Frequency of one LUT word in kHz (same decode as the OnePlus driver). */
+static uint32_t
+osm_khz(uint32_t w)
+{
+	uint32_t src = (w >> 30) & 3, lval = w & 0xff;
+	return src ? 19200 * lval : 300000;
+}
+
+/*
+ * Estimate the boot CPU's clock: a chain of dependent adds retires one add per cycle on both
+ * the A55 and the A76, so cycles = 16 * iterations.  Also samples cpu0's OSM cycle counter
+ * (pwr block, core 0) around the loop as a cross-check.
+ */
+static void
+hw_cpu_mhz(void)
+{
+	uint64_t frq, t0, t1, iters = 12500000ULL, x = 0, n = iters;
+	uint32_t c0 = 0, c1 = 0;
+	vm_offset_t pwr = osm_base[1];
+
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+	if (pwr) {
+		c0 = hw_rd(pwr, OSM_CYCLES(0));
+	}
+	__asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r"(t0) :: "memory");
+	__asm__ volatile (
+		"1:\n\t"
+		"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
+		"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
+		"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
+		"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
+		"subs %1, %1, #1\n\tb.ne 1b"
+		: "+r"(x), "+r"(n) :: "cc");
+	__asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r"(t1) :: "memory");
+	if (pwr) {
+		c1 = hw_rd(pwr, OSM_CYCLES(0));
+	}
+	if (t1 > t0 && frq != 0) {
+		uint64_t ticks = t1 - t0;
+		uint64_t mhz_x10 = ((16ULL * iters * 10ULL) / ticks) * frq / 1000000ULL;
+		printf("SWEET HW: cpu0 dependent-add loop: %llu ticks at %llu Hz timer, ~%llu.%llu MHz, x=%llu\n",
+		    ticks, frq, mhz_x10 / 10, mhz_x10 % 10, x);
+		if (pwr) {
+			uint32_t dc = c1 - c0;
+			uint64_t cmhz_x10 = ((uint64_t)dc * 10ULL / ticks) * frq / 1000000ULL;
+			printf("SWEET HW: cpu0 OSM cycle counter %u -> %u (delta %u), ~%llu.%llu MHz\n",
+			    c0, c1, dc, cmhz_x10 / 10, cmhz_x10 % 10);
+		}
+	} else {
+		printf("SWEET HW: cpu0 speed estimate failed (t0 %llu t1 %llu frq %llu)\n", t0, t1, frq);
+	}
+}
+
+static void
+hw_osm(void)
+{
+	for (unsigned b = 0; b < NBLOCKS; b++) {
+		vm_offset_t base = osm_base[b];
+		uint32_t lut_w[OSM_TABLE_SIZE];
+		unsigned used = 0;
+
+		if (base == 0) {
+			printf("SWEET HW: OSM %s map failed\n", osm_blocks[b].name);
+			continue;
+		}
+		printf("SWEET HW: OSM %s (%s) @0x%08x enable 0x%08x dcvs_ctrl 0x%08x (per-core %s)\n",
+		    osm_blocks[b].name, osm_blocks[b].cpus, osm_blocks[b].pa,
+		    hw_rd(base, OSM_ENABLE), hw_rd(base, OSM_DCVS_CTRL),
+		    (hw_rd(base, OSM_DCVS_CTRL) & 1) ? "yes" : "no");
+		for (unsigned i = 0; i < OSM_TABLE_SIZE; i++) {
+			uint32_t w = hw_rd(base, OSM_FREQ(i));
+			uint32_t v = hw_rd(base, OSM_VOLT(i));
+			lut_w[i] = w;
+			used = i + 1;
+			printf("SWEET HW: OSM %s lut[%2u] freq %7u kHz  raw 0x%08x  corner %2u volt %4u\n",
+			    osm_blocks[b].name, i, osm_khz(w), w, (v >> 16) & 0x3f, v & 0xfff);
+			if (i > 0 && osm_khz(w) == osm_khz(lut_w[i - 1])) {
+				break;          /* two equal entries mark the end of the table */
+			}
+		}
+		for (unsigned n = 0; n < osm_blocks[b].ncores; n++) {
+			uint32_t idx = hw_rd(base, OSM_DESIRED(n));
+			uint32_t khz = (idx < used) ? osm_khz(lut_w[idx]) : 0;
+			printf("SWEET HW: OSM %s core %u desired index %u -> %u kHz, cycle counter 0x%08x\n",
+			    osm_blocks[b].name, n, idx, khz, hw_rd(base, OSM_CYCLES(n)));
+		}
+	}
+}
+
+static void
+hw_gpu(void)
+{
+	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+	if (gcc == 0) {
+		printf("SWEET HW: GCC map failed\n");
+		return;
+	}
+	uint32_t cfg = hw_rd(gcc, GCC_GPU_CFG_AHB);
+	uint32_t mem = hw_rd(gcc, GCC_GPU_MEMNOC_GFX);
+	uint32_t dvm = hw_rd(gcc, GCC_GPU_SNOC_DVM);
+	printf("SWEET HW: GCC gpu_cfg_ahb 0x%08x (%s) memnoc_gfx 0x%08x (%s) snoc_dvm 0x%08x (%s)\n",
+	    cfg, (cfg & CBCR_CLK_OFF) ? "off" : "on",
+	    mem, (mem & CBCR_CLK_OFF) ? "off" : "on",
+	    dvm, (dvm & CBCR_CLK_OFF) ? "off" : "on");
+	if (cfg & CBCR_CLK_OFF) {
+		printf("SWEET HW: gpu_cfg_ahb is off; GPUCC not read (a gated read would hang)\n");
+		return;
+	}
+	vm_offset_t cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
+	if (cc == 0) {
+		printf("SWEET HW: GPUCC map failed\n");
+		return;
+	}
+	uint32_t cx = hw_rd(cc, GPUCC_CX_GDSCR);
+	uint32_t gx = hw_rd(cc, GPUCC_GX_GDSCR);
+	printf("SWEET HW: GPUCC CX_GDSCR 0x%08x (%s) GX_GDSCR 0x%08x (%s)\n",
+	    cx, (cx & (1u << 31)) ? "on" : "off", gx, (gx & (1u << 31)) ? "on" : "off");
+	/* The Adreno register block (0x02c00000) is deliberately not read: it needs CX and GX on. */
+}
+
+void
+sweet_hwprobe(void)
+{
+	int enabled = 1;
+
+	PE_parse_boot_argn("sweethwprobe", &enabled, sizeof(enabled));
+	if (!enabled) {
+		return;
+	}
+	printf("SWEET HW: stage 0 probe v2 start (read-only)\n");
+	for (unsigned b = 0; b < NBLOCKS; b++) {
+		osm_base[b] = ml_io_map(osm_blocks[b].pa, OSM_SIZE);
+	}
+	hw_cpu_mhz();
+	hw_osm();
+	hw_gpu();
+	printf("SWEET HW: stage 0 probe done\n");
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
+EOF
+# quick syntax check of the pure-C parts using host gcc with stubs
+cd /home/claude && cat > stub_test.c <<'EOF'
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef unsigned long vm_offset_t; typedef unsigned long vm_size_t;
+#define ARM64_BOARD_CONFIG_SWEET 1
+#define printf(...) printf(__VA_ARGS__)
+static uint8_t fake[0x2000];
+vm_offset_t ml_io_map(vm_offset_t pa, vm_size_t s){ (void)pa;(void)s; return (vm_offset_t)fake; }
+int PE_parse_boot_argn(const char*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
+EOF
+sed -e 's@#include <sys/param.h>@@' -e 's@#include <sys/systm.h>@@' -e 's@#include <pexpert/pexpert.h>@@' /mnt/user-data/outputs/sweet_hwprobe.c > hw_body.c
+which gcc >/dev/null && echo "host gcc present: $(gcc --version | head -1)"; uname -m
+Output
+
+host gcc present: gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+x86_64
+Tackling cross-platform assembly code on a mismatched host architecture.
+I’m compile-checking the probe on this machine and running its table-decoding code against made-up register data, so a typo doesn’t cost you a CI cycle.
