@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 342b80c..2c71a9b 100644
+index 342b80c..0337000 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -38,6 +38,8 @@
@@ -11,8 +11,120 @@ index 342b80c..2c71a9b 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -452,8 +454,19 @@ static int k1_tlb_flush(void)
- 	return 0;
+@@ -357,6 +359,7 @@ static vm_offset_t sl_k1, k1_cb;
+ static uint32_t k1_l3_live;			/* bit t: pool table t is in the L2 */
+ static struct { uint64_t start, size; } k1_free[64];
+ static unsigned k1_nfree, k1_lost;
++static int k1_va_fresh;			/* no TLB maintenance works: never reuse an address */
+ static uint32_t k1_fence;
+ 
+ static vm_offset_t k1p(uintptr_t pa)		/* K1 slice PA -> kernel VA */
+@@ -387,6 +390,10 @@ void sweet_gpu_address_free(uint64_t a, uint64_t size)
+ {
+ 	unsigned at;
+ 	size = (size + 0xfffULL) & ~0xfffULL;
++	if (k1_va_fresh) {
++		k1_lost += (unsigned)(size >> 12);	/* never handed out again: see k1_tlb_flush_range */
++		return;
++	}
+ 	for (at = 0; at < k1_nfree && k1_free[at].start < a; at++)
+ 		;
+ 	if (at > 0 && k1_free[at - 1].start + k1_free[at - 1].size == a) {
+@@ -436,24 +443,103 @@ void sweet_gpu_mapped(void)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-static int k1_tlb_flush(void)
++/*
++ * TLB maintenance. Phone, 2026-10-22 (twice, the second time with the UCHE invalidate too):
++ * TLBIASID 0 + TLBSYNC completed, yet the GPU kept the old translation of a remapped page. The
++ * SMMU's global registers are the hypervisor's (HackiOS: "the global ones are the hypervisor's
++ * to grant"), so which invalidation reaches the TLBs is found on the phone: the K1a test tries
++ * these in order, each adding to the ones before, and keeps the first that works
++ * (k1_tlb_method). All are architectural SMMUv2 operations (ARM IHI 0062):
++ *   0  CB TLBIASID (ASID 0, what the shim's TTBR0 carries) + CB TLBSYNC   [what HackiOS does]
++ *   1  + CB TLBIASID with the context's number (HackiOS tags TTBR0 with it)
++ *   2  + CB TLBIVA and TLBIVAA for each page (64-bit, VA[55:12] in [43:0], ASID in [63:48])
++ *   3  + global TLBIALLNSNH + TLBGSYNC (every non-secure context: only costs refills)
++ * None works: k1_va_fresh = 1, the allocator never hands an address out twice, so a stale
++ * translation is never used (the 64 MiB window then runs out after 64 MiB of buffers: enough
++ * for the tests, not for Mesa).
++ */
++#define CB_TLBIVA		0x600U
++#define CB_TLBIVAA		0x608U
++#define SMMU_TLBIALLNSNH	0x68U
++#define SMMU_TLBGSYNC		0x70U
++#define SMMU_TLBGSTATUS		0x74U
++static vm_offset_t k1_gr0;
++static uint32_t k1_cb_index;
++static int k1_tlb_method = 3;		/* until the K1a test has chosen: the most thorough */
++
++static inline void k1_cbw(uint32_t off, uint32_t v)
+ {
+-	if (!k1_cb)
+-		return 0;
+-	*(volatile uint32_t *)(k1_cb + CB_TLBIASID) = 0;
++	*(volatile uint32_t *)(k1_cb + off) = v;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(k1_cb + CB_TLBSYNC) = 0;
++}
++static inline void k1_cbw64(uint32_t off, uint64_t v)
++{
++	*(volatile uint64_t *)(k1_cb + off) = v;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	for (unsigned i = 0; i < 100000; i++) {
+-		if (!(*(volatile uint32_t *)(k1_cb + CB_TLBSTATUS) & 1U))
+-			return 1;
++}
++static inline uint32_t k1_cbr(uint32_t off)
++{
++	return *(volatile uint32_t *)(k1_cb + off);
++}
++static inline void k1_gr0w(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(k1_gr0 + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline uint32_t k1_gr0r(uint32_t off)
++{
++	return *(volatile uint32_t *)(k1_gr0 + off);
++}
++
++static int k1_tlb_flush_range(uint64_t va, uint64_t size)
++{
++	int ok = 1;
++	if (!k1_cb)
++		return 0;
++	k1_cbw(CB_TLBIASID, 0);
++	if (k1_tlb_method >= 1)
++		k1_cbw(CB_TLBIASID, k1_cb_index);
++	if (k1_tlb_method >= 2) {
++		for (uint64_t o = 0; o < size && o < (4ULL << 20); o += 0x1000) {
++			k1_cbw64(CB_TLBIVA, ((va + o) >> 12) & 0xfffffffffffULL);
++			k1_cbw64(CB_TLBIVAA, ((va + o) >> 12) & 0xfffffffffffULL);
++		}
++		if (size >= (4ULL << 20))
++			k1_cbw(CB_TLBIASID, 0);
++	}
++	k1_cbw(CB_TLBSYNC, 0);
++	unsigned i;
++	for (i = 0; i < 100000 && (k1_cbr(CB_TLBSTATUS) & 1U); i++)
+ 		delay(1);
++	ok = i < 100000;
++	if (k1_tlb_method >= 3 && k1_gr0) {
++		k1_gr0w(SMMU_TLBIALLNSNH, 0);
++		k1_gr0w(SMMU_TLBGSYNC, 0);
++		for (i = 0; i < 100000 && (k1_gr0r(SMMU_TLBGSTATUS) & 1U); i++)
++			delay(1);
++		ok = ok && i < 100000;
+ 	}
+-	return 0;
++	return ok;
++}
++
++static int k1_tlb_flush(void)
++{
++	return k1_tlb_flush_range(0, 0);
  }
  
 +/*
@@ -31,7 +143,14 @@ index 342b80c..2c71a9b 100644
  	for (uint64_t o = 0; o < size; o += 0x1000) {
  		uint64_t v = va + o;
  		if (v < K1_VA_BASE || v >= K1_VA_BASE + K1_VA_SIZE)
-@@ -469,11 +482,15 @@ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+@@ -463,17 +549,21 @@ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ 			((volatile uint64_t *)k1p(K1_POOL_PA + (uintptr_t)t * 0x1000))[(v >> 12) & 0x1ffU] = 0;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	return k1_tlb_flush();
++	return k1_tlb_flush_range(va, size);
+ }
+ 
  /* HackiOS redwood_gpu_submit, on 0084's ring: invalidate CCU, the IBs, then the fence (synchronous here) */
  uint32_t sweet_gpu_submit(const uint64_t *ib_va, const uint32_t *ib_dw, uint32_t count)
  {
@@ -48,10 +167,25 @@ index 342b80c..2c71a9b 100644
  	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_DEPTH;
  	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_COLOR;
  	for (uint32_t i = 0; i < count; i++) {
-@@ -521,20 +538,71 @@ static int k1_write_and_check(uint64_t va, uint32_t magic, uint64_t ib_va, volat
+@@ -496,11 +586,13 @@ static int k1_find_cb(void)
+ 	vm_offset_t g = ml_io_map(K1_SMMU_PA, 0x1000);
+ 	if (!g)
+ 		return 0;
++	k1_gr0 = g;
+ 	uint32_t idr1 = *(volatile uint32_t *)(g + SMMU_IDR1_OFF);
+ 	uint32_t num_global = 1U << (((idr1 >> 28) & 7U) + 1U);
+ 	for (uint32_t n = 0; n < 32; n++) {
+ 		if (*(volatile uint32_t *)(g + SMMU_SMR_OFF(n)) == K1_GPU_SMR) {
+ 			uint32_t cb = *(volatile uint32_t *)(g + SMMU_S2CR_OFF(n)) & 0xffU;
++			k1_cb_index = cb;
+ 			k1_cb = ml_io_map(K1_SMMU_PA + 0x1000UL * (num_global + cb), 0x1000);
+ 			printf("SWEET K1: GPU context: smr %u cb %u (num_global %u)\n", n, cb, num_global);
+ 			return k1_cb != 0;
+@@ -521,50 +613,391 @@ static int k1_write_and_check(uint64_t va, uint32_t magic, uint64_t ib_va, volat
  	return sweet_gpu_submit(&ib_va, &n, 1) != 0;
  }
  
+-static void k1_selftest(void)
 +/*
 + * K1b: the 3D context's output address size. The shim writes TCR but never TCR2, whose
 + * PASize (bits 2:0) is then whatever the context bank held: 0 = 32 bits, and every page above
@@ -68,13 +202,24 @@ index 342b80c..2c71a9b 100644
 +#define K1B_TCR2		(1U | (1U << 4) | (7U << 15))
 +
 +static int k1_tcr2(void)
-+{
+ {
+-	int on = 0;
+-	(void)PE_parse_boot_argn("sweetk1", &on, sizeof(on));
+-	if (!on)
+-		return;
+-	sl_k1 = ml_io_map(SL_K1_PA, SL_K1_LEN);
+-	if (!sl_k1 || !k1_find_cb()) {
+-		printf("SWEET K1: setup failed (slice %#lx cb %#lx)\n", (unsigned long)sl_k1, (unsigned long)k1_cb);
+-		return;
 +	volatile uint32_t *tcr2 = (volatile uint32_t *)(k1_cb + SMMU_CB_TCR2);
 +	uint32_t was = *tcr2;
-+	if (was == K1B_TCR2) {
++	if ((was & ~0x60U) == K1B_TCR2) {
 +		printf("SWEET K1: TCR2 %#x already HackiOS's: left alone\n", was);
 +		return 1;
-+	}
+ 	}
+-	k1_free[0].start = K1_VA_BASE;
+-	k1_free[0].size = K1_VA_SIZE;
+-	k1_nfree = 1;
 +	if (grd(A6XX_CP_RB_RPTR) != grd(A6XX_CP_RB_WPTR)) {
 +		printf("SWEET K1: TCR2 %#x and the ring is busy: not changed\n", was);
 +		return 0;
@@ -83,7 +228,8 @@ index 342b80c..2c71a9b 100644
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	int tlb = k1_tlb_flush();
 +	printf("SWEET K1: TCR2 %#x -> %#x (36-bit PA), TLB %s\n", was, *tcr2, tlb ? "ok" : "TIMEOUT");
-+	return tlb && *tcr2 == K1B_TCR2;
++	/* the phone reads 0x38071 back: TBI0/TBI1 (bits 5, 6) stay set; what matters is PASize 1 and AS */
++	return tlb && (*tcr2 & 0x1fU) == (K1B_TCR2 & 0x1fU);
 +}
 +
 +/* map the K1 slice and the GPU context, start the allocator (once); the PA size when asked (once) */
@@ -109,28 +255,101 @@ index 342b80c..2c71a9b 100644
 +	return 1;
 +}
 +
- static void k1_selftest(void)
- {
- 	int on = 0;
- 	(void)PE_parse_boot_argn("sweetk1", &on, sizeof(on));
- 	if (!on)
- 		return;
--	sl_k1 = ml_io_map(SL_K1_PA, SL_K1_LEN);
--	if (!sl_k1 || !k1_find_cb()) {
--		printf("SWEET K1: setup failed (slice %#lx cb %#lx)\n", (unsigned long)sl_k1, (unsigned long)k1_cb);
-+	if (!k1_setup(0))
- 		return;
--	}
--	k1_free[0].start = K1_VA_BASE;
--	k1_free[0].size = K1_VA_SIZE;
--	k1_nfree = 1;
++/* the K1a test, which also chooses the TLB maintenance method; K1b runs it if sweetk1 did not */
++static int k1_probed;
++static void k1_probe(void)
++{
++	if (k1_probed || !k1_setup(0))
++		return;
++	k1_probed = 1;
++	/* test pages: A at +0, the IB at +0x2000, P[m] at +0x3000 + m * 0x1000 (m < 13) */
  	volatile uint32_t *pa_a = (volatile uint32_t *)k1p(K1_TEST_PA);
- 	volatile uint32_t *pa_b = (volatile uint32_t *)k1p(K1_TEST_PA + 0x1000);
+-	volatile uint32_t *pa_b = (volatile uint32_t *)k1p(K1_TEST_PA + 0x1000);
  	volatile uint32_t *ibp = (volatile uint32_t *)k1p(K1_TEST_PA + 0x2000);
-@@ -565,6 +633,252 @@ static void k1_selftest(void)
+-	for (unsigned i = 0; i < 0x1000 / 4; i++) {
+-		pa_a[i] = 0;
+-		pa_b[i] = 0;
+-	}
++	for (unsigned i = 0; i < 0x10000 / 4; i++)
++		((volatile uint32_t *)k1p(K1_TEST_PA))[i] = 0;
+ 	uint64_t ibva = sweet_gpu_address(0x1000), v = sweet_gpu_address(0x1000);
+ 	int ok1 = ibva && v && sweet_gpu_map(ibva, K1_TEST_PA + 0x2000, 1) && sweet_gpu_map(v, K1_TEST_PA, 0);
+ 	sweet_gpu_mapped();
+ 	int w1 = ok1 && k1_write_and_check(v, 0x0001a001U, ibva, ibp);
+ 	printf("SWEET K1: map+submit va %#llx ib %#llx: fence %s, page A = %#x (want 0x1a001)\n",
+ 	    v, ibva, w1 ? "ok" : "MISSING", pa_a[4]);
+-	int tlb = sweet_gpu_unmap(v, 0x1000);
+-	printf("SWEET K1: unmap + TLB maintenance on the GPU context: %s\n", tlb ? "ok" : "TIMEOUT");
+-	sweet_gpu_map(v, K1_TEST_PA + 0x1000, 0);
+-	sweet_gpu_mapped();
+-	int w2 = k1_write_and_check(v, 0x0001a002U, ibva, ibp);
+-	printf("SWEET K1: same va on page B: fence %s, B = %#x (want 0x1a002), A = %#x (want 0x1a001)\n",
+-	    w2 ? "ok" : "MISSING", pa_b[4], pa_a[4]);
++	/*
++	 * Remap v to a new page with TLB maintenance method m = 0, 1, 2, 3; the first m whose
++	 * write lands in the new page (and not in the old) is kept, and checked once more.
++	 */
++	volatile uint32_t *prev = pa_a;
++	int chosen = -1, confirmed = 0, m, slot = 0;
++	for (m = 0; w1 && m <= 3 && slot < 12; m++) {
++		uint32_t magic = 0x0001a100U + (uint32_t)m, before = prev[4];
++		volatile uint32_t *next = (volatile uint32_t *)k1p(K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot);
++		k1_tlb_method = m;
++		int tlb = sweet_gpu_unmap(v, 0x1000);
++		sweet_gpu_map(v, K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot, 0);
++		sweet_gpu_mapped();
++		int w = k1_write_and_check(v, magic, ibva, ibp);
++		int good = w && tlb && next[4] == magic && prev[4] == before;
++		printf("SWEET K1: TLB method %d: sync %s, fence %s, new page %#x (want %#x), old page %#x (want %#x): %s\n",
++		    m, tlb ? "ok" : "TIMEOUT", w ? "ok" : "MISSING", next[4], magic, prev[4], before,
++		    good ? "WORKS" : "stale");
++		prev = good ? next : (next[4] == magic ? next : prev);
++		slot++;
++		if (good) {
++			chosen = m;
++			break;
++		}
++	}
++	if (chosen >= 0) {
++		/* once more with the chosen method, to a fresh page */
++		volatile uint32_t *next = (volatile uint32_t *)k1p(K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot);
++		uint32_t before = prev[4];
++		int tlb = sweet_gpu_unmap(v, 0x1000);
++		sweet_gpu_map(v, K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot, 0);
++		sweet_gpu_mapped();
++		int w = k1_write_and_check(v, 0x0001a1ffU, ibva, ibp);
++		confirmed = w && tlb && next[4] == 0x0001a1ffU && prev[4] == before;
++		printf("SWEET K1: TLB method %d again: %s\n", chosen, confirmed ? "WORKS" : "stale (not repeatable)");
++	}
++	if (!confirmed) {
++		k1_tlb_method = 3;
++		k1_va_fresh = 1;
++		printf("SWEET K1: no TLB maintenance works here: GPU addresses are never reused from now on\n");
++	} else {
++		k1_tlb_method = chosen;
++	}
+ 	sweet_gpu_unmap(v, 0x1000);
+ 	sweet_gpu_unmap(ibva, 0x1000);
+ 	sweet_gpu_address_free(v, 0x1000);
+ 	sweet_gpu_address_free(ibva, 0x1000);
+-	int pass = w1 && w2 && tlb && pa_a[4] == 0x0001a001U && pa_b[4] == 0x0001a002U;
+-	printf("SWEET K1: %s (free list %u hole(s), first %#llx size %#llx, hwfault %#x)\n",
+-	    pass ? "K1a PASS -- dynamic GPU maps, TLB maintenance and IB submit work" : "K1a FAILED",
++	printf("SWEET K1: %s (TLB method %d%s, free list %u hole(s), first %#llx size %#llx, hwfault %#x)\n",
++	    confirmed ? "K1a PASS -- dynamic GPU maps, TLB maintenance and IB submit work" :
++	    (w1 ? "K1a PARTIAL -- maps and submit work, TLB maintenance does not (fresh addresses instead)" : "K1a FAILED"),
++	    k1_tlb_method, k1_va_fresh ? ", addresses never reused" : "",
  	    k1_nfree, k1_free[0].start, k1_free[0].size, grd(A6XX_CP_HW_FAULT));
  }
  
++static void k1_selftest(void)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("sweetk1", &on, sizeof(on));
++	if (on)
++		k1_probe();
++}
++
 +/*
 + * ---- K1b (G5): HackiOS's kernel interface for RedwoodGPU.cpp, on K1a ----
 + * iokit/Kernel/arm/RedwoodGPU.cpp is HackiOS's IOKit service + user client (Linux msm DRM
@@ -364,7 +583,8 @@ index 342b80c..2c71a9b 100644
 +	(void)PE_parse_boot_argn("sweetk1b", &on, sizeof(on));
 +	if (!on)
 +		return;
-+	if (!k1_setup(1)) {
++	k1_probe();				/* (no-op when sweetk1=1 ran it) */
++	if (!k1_probed || !k1_setup(1)) {
 +		printf("SWEET K1B: K1 setup failed: no RedwoodGPU\n");
 +		return;
 +	}
@@ -380,7 +600,7 @@ index 342b80c..2c71a9b 100644
  static void sweet_gpu_thread(void *arg, wait_result_t result)
  {
  	unsigned delay_s = 8;
-@@ -678,6 +992,7 @@ static void sweet_gpu_thread(void *arg, wait_result_t result)
+@@ -678,6 +1111,7 @@ static void sweet_gpu_thread(void *arg, wait_result_t result)
  	if (drew == 1 && good == G4_CHECK_ROWS * 252U)
  		printf("SWEET GPU4: THE GPU DREW THE PANEL FROM XNU -- gradient in the top-left corner\n");
  	k1_selftest();
