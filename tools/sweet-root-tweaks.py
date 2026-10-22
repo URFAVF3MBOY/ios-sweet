@@ -29,7 +29,7 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
+BUILD, VERSION = '20F66', '16.5'
 MOBILE = 501
 
 
