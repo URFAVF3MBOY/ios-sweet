@@ -1,0 +1,149 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -90,6 +90,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -104,7 +107,8 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = wrapped ? memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly) :
++		    memory->map(kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -394,6 +398,7 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint64_t      base;         /* pixels in the client: its own address for the wrapper, else data's */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -565,9 +570,15 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	if (s->wrapped && s->clientTask == fTask) {
++		/* (HackiOS returnSurface: the program that wrapped its memory gets that memory, not a second view) */
++		ref->base = s->clientAddress;
++	} else {
++		ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++		ref->base = ref->data != NULL ? ref->data->getAddress() : 0;
++	}
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+-	if (ref->data == NULL || ref->state == NULL) {
++	if (ref->base == 0 || ref->state == NULL) {
+ 		ref->release();
+ 		return kIOReturnVMError;
+ 	}
+@@ -605,7 +616,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->base);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -722,7 +733,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	OSNumber *wrap = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && props->getObject("IOSurfaceAddressRanges") != NULL) {
++		ret = kIOReturnUnsupported;     /* (HackiOS neither: memory in pieces) */
++	} else if (ret == kIOReturnSuccess && wrap != NULL) {
++		/*
++		 * OnePlus 7T, GPU acceleration (0094), as HackiOS's MiniIOSurface.cpp: a surface around
++		 * memory the caller has already. CoreAnimation's OpenGL ES renderer makes these around
++		 * pictures it holds (an icon, a layer's contents) after IOSurfaceWrapClientImage
++		 * (selector 6, unsupported here as there) is refused. The pixels are that memory itself,
++		 * held (wired) for the surface's life, as big as its owner says.
++		 */
++		uint32_t len = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		IOReturn held = kIOReturnNoMemory;
++		IOMemoryDescriptor *client = NULL;
++
++		if (len == 0) {
++			len = s->allocSize;
++		}
++		for (unsigned attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++			OSSafeReleaseNULL(client);
++			client = IOMemoryDescriptor::withAddressRange(wrap->unsigned64BitValue(), len,
++			    attempt == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
++			held = client != NULL ? client->prepare() : kIOReturnNoMemory;
++		}
++		if (held != kIOReturnSuccess) {
++			OSSafeReleaseNULL(client);
++			IOLog("SWEET SURF: memory to wrap (%u bytes at 0x%llx) cannot be held (0x%x)\n", len,
++			    wrap->unsigned64BitValue(), held);
++			ret = kIOReturnVMError;
++		} else {
++			s->memory = client;
++			s->wrapped = true;
++			s->clientTask = fTask;
++			s->clientAddress = wrap->unsigned64BitValue();
++			s->allocSize = len;
++			s->mapCache = kIOMapDefaultCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -798,6 +849,16 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case 6:         /* IOSurfaceWrapClientImage */
++	case 7:         /* IOSurfaceWrapClientMemory */
++		/*
++		 * OnePlus 7T (0094): refused, as HackiOS does. Answering "done" with an empty result
++		 * (the default below) gave CoreAnimation's OpenGL ES renderer a surface at address 0:
++		 * backboardd SIGSEGV at 0x30. Refused, it makes the surface through create with
++		 * IOSurfaceAddress instead.
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	case kSweetSurfaceCreatePort: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		if (s == NULL || args->scalarOutputCount < 1) {
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -871,6 +871,11 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->wrapped) {
++		/* (HackiOS: memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
++		s->release();
++		return kIOReturnUnsupported;
++	}
+ 	size = round_page_64(s->allocSize);
+ 	if (s->memory == NULL || size == 0 || size > GPU_BUFFER_MAX || s->memory->getLength() < size) {
+ 		s->release();
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,9 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      wrapped;      /* 0094: pixels are memory of clientTask's at clientAddress (IOSurfaceAddress) */
++	task_t                    clientTask;   /* (not held: only compared) */
++	uint64_t                  clientAddress;
+ 	uint32_t                  gpuDrawn;     /* the GPU's last submission naming the pixels (RedwoodGPU.cpp), 0: none */
+ 	uint32_t                  gpuSynced;    /* ... the one after which the CPU's cache was last invalidated */
+ 
