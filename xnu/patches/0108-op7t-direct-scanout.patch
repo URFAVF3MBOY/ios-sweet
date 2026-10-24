@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 699be48..a08580b 100644
+index 699be48..e7dd010 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -38,6 +38,7 @@
@@ -31,7 +31,7 @@ index 699be48..a08580b 100644
 +	uint32_t      fScanMode;
 +	uint32_t      fBootAddr, fBootStride, fBootXY0, fBootXY1;
 +	SweetSurface *fScanned;       /* the surface the pipes fetch now (held), NULL: the splash buffer */
-+	uint32_t      fScanFlips;
++	uint32_t      fScanFlips, fScanCopies;
 +
 +	void          scanSetup(void);
 +	void          scanTo(uint32_t addr, uint32_t stride, uint32_t xy0, uint32_t xy1);
@@ -83,7 +83,7 @@ index 699be48..a08580b 100644
  	if (sweet_fps_on) {
  		uint64_t now = mach_absolute_time();
  		sweet_fps_copies++;
-@@ -732,6 +771,119 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -732,6 +771,121 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
  	    kIOUserNotifyOptionCanDrop);
  }
  
@@ -147,7 +147,9 @@ index 699be48..a08580b 100644
 +{
 +	scanTo(fBootAddr, fBootStride, fBootXY0, fBootXY1);
 +	OSSafeReleaseNULL(fScanned);
-+	IOLog("SWEET SCAN: back on the splash buffer after %u flips\n", fScanFlips);
++	if (fScanCopies++ < 8 || (fScanCopies % 500) == 0) {
++		IOLog("SWEET SCAN: a frame copied (%u so far), %u flipped\n", fScanCopies, fScanFlips);
++	}
 +}
 +
 +/* One full-screen layer, from the scanout pool: point the pipes at it. False: copy as before. */
@@ -204,10 +206,10 @@ index 699be48..a08580b 100644
  
  IOReturn
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 9defdd1..ad8756c 100644
+index 9defdd1..3b9c877 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -81,6 +81,61 @@ static uint32_t      sweet_surface_creates_logged;
+@@ -81,6 +81,74 @@ static uint32_t      sweet_surface_creates_logged;
  static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
@@ -217,15 +219,28 @@ index 9defdd1..ad8756c 100644
 + * AppleCLCD can point the display's source pipes straight at them instead of copying every frame
 + * into the splash buffer (topaz patches 0092-0103 do the same on SM6225). The display fetches
 + * 32-bit addresses only; iOS's own memory is all above 4 GiB on the 7T.
-+ * Pool: 0xB1000000.. 8 slots of 0xD40000 (13.25 MiB: one 1125x2436 BGRA surface, 4544 bytes a row,
-+ * IOSurfaceAllocSize 13893632) = 0xB1000000-0xB7A00000. Clear of the GPU's 0xB0000000-0xB0530000,
-+ * USB's 0xB0800000, 0096's modem pool 0xB8000000 and everything in the DT's reserved-memory.
++ * Pool: 14 slots of 0xD40000 (13.25 MiB: one 1125x2436 BGRA surface, 4544 bytes a row,
++ * IOSurfaceAllocSize 13893632): 8 at 0xB1000000-0xB7A00000, 3 at 0xAD000000-0xAF7C0000, 3 at
++ * 0xB9000000-0xBB7C0000 (the low DDR bank ends at 0xBBB00000). Clear of the GPU's
++ * 0xB0000000-0xB0530000, USB's 0xB0800000, 0096's modem pool 0xB8000000-0xB9000000 and everything in
++ * the 7T DT's reserved-memory (mtp_mem ends 0xACE00000). First boot (8 slots): backboardd keeps
++ * about 9 full-screen surfaces in turn, so every 7th frame missed the pool and was copied.
 + * Mapped write-combined everywhere (as the splash surface): no cache upkeep before the display
 + * reads it. A surface that does not fit, or once the pool is full, is made as before.
 + */
-+#define SWEET_SCAN_BASE                 0xB1000000ull
 +#define SWEET_SCAN_SLOT                 0x00D40000ull
-+#define SWEET_SCAN_SLOTS                8
++#define SWEET_SCAN_SLOTS                14
++static uint64_t
++sweet_scan_slot_pa(uint32_t i)
++{
++	if (i < 8) {
++		return 0xB1000000ull + i * SWEET_SCAN_SLOT;
++	}
++	if (i < 11) {
++		return 0xAD000000ull + (i - 8) * SWEET_SCAN_SLOT;
++	}
++	return 0xB9000000ull + (i - 11) * SWEET_SCAN_SLOT;
++}
 +static uint32_t      sweet_scan_mode = ~0u;     /* boot-arg sweetscan, read once */
 +static uint32_t      sweet_scan_used;           /* bit per slot, under sweet_surface_lock */
 +static uint32_t      sweet_scan_logged;
@@ -263,13 +278,13 @@ index 9defdd1..ad8756c 100644
 +uint64_t
 +sweet_surface_scan_phys(SweetSurface *s)
 +{
-+	return (s != NULL && s->scanSlot != 0) ? SWEET_SCAN_BASE + (uint64_t)(s->scanSlot - 1) * SWEET_SCAN_SLOT : 0;
++	return (s != NULL && s->scanSlot != 0) ? sweet_scan_slot_pa(s->scanSlot - 1) : 0;
 +}
 +
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
  
  void
-@@ -94,6 +149,12 @@ SweetSurface::free()
+@@ -94,6 +162,12 @@ SweetSurface::free()
  		memory->complete();
  	}
  	OSSafeReleaseNULL(memory);
@@ -282,7 +297,7 @@ index 9defdd1..ad8756c 100644
  	OSSafeReleaseNULL(state);
  	OSObject::free();
  }
-@@ -731,6 +792,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -731,6 +805,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		props->release();
  		return kIOReturnNoMemory;
  	}
@@ -290,7 +305,7 @@ index 9defdd1..ad8756c 100644
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
  	OSNumber *wrap = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
-@@ -774,21 +836,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -774,21 +849,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			}
  		}
  	} else if (ret == kIOReturnSuccess) {
