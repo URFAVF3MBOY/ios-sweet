@@ -34,10 +34,10 @@ index 90e68bb..e8dbdfa 100644
 +}
 diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
 new file mode 100644
-index 0000000..8f72c0f
+index 0000000..fa57ad4
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetDrop.cpp
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,336 @@
 +/*
 + * OnePlus 7T (kitty 0107 v6): write, delete or move aside files of the iOS root at boot, from the boot payload.
 + * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
@@ -84,6 +84,7 @@ index 0000000..8f72c0f
 +extern "C" int sweet_drop_rmdir(const char *path, vfs_context_t ctx);
 +extern "C" int sweet_drop_rename(const char *from, const char *to, vfs_context_t ctx);
 +extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
++extern "C" vnode_t rootvnode;                   /* bsd/vfs: set once the root file system is mounted */
 +
 +struct drop_file {
 +	const char *path;
@@ -283,6 +284,22 @@ index 0000000..8f72c0f
 +		return;
 +	}
 +	IOLog("SWEET DROP: %d entr%s in the payload at %llx (+%llx), done once the root is mounted\n", n, n == 1 ? "y" : "ies", pa, size);
++	/*
++	 * v7: no path lookup before the root is mounted. AppleCLCD::start runs long before BSD mounts
++	 * it; a vnode_lookup() then panicked ("Taking non-sleepable RW lock with preemption enabled
++	 * @lock_rw.c:1377", boot 2026-10-24 05:49, right after the line above; v1's panic was the same).
++	 */
++	unsigned rooted = 0;
++	while (rootvnode == NULLVP && rooted < 300000) {
++		IOSleep(100);
++		rooted += 100;
++	}
++	if (rootvnode == NULLVP) {
++		IOLog("SWEET DROP: no root after %u ms: nothing done\n", rooted);
++		return;
++	}
++	IOSleep(500);                           /* (and let the mount finish settling) */
++	IOLog("SWEET DROP: root is mounted (after %u ms)\n", rooted);
 +	ctx = vfs_context_create(NULL);
 +	for (int i = 0; i < n; i++) {
 +		char dir[256];
