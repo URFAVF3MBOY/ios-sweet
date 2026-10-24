@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 94dfff0..f7f3a3a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -580,6 +580,32 @@ sweet_fps_draw(uintptr_t px, uint32_t stride, uint32_t width, uint32_t height, u
+ 	}
+ }
+ 
++/*
++ * 0110: once a second, the "SWEET FB: N fps" line; every frame shown, the counter drawn at px
++ * (0: not drawn). Called for copied frames (the splash buffer) and for flipped ones (0108: the
++ * surface shown) -- 0108 only counted on the copy path, so with every frame flipped the line
++ * and the counter went quiet.
++ */
++static void
++sweet_fps_tick(uintptr_t px, uint32_t stride, uint32_t width, uint32_t height)
++{
++	uint64_t now = mach_absolute_time();
++
++	sweet_fps_copies++;
++	if (sweet_fps_t0 == 0) {
++		sweet_fps_t0 = now;
++	} else if (now - sweet_fps_t0 >= sweet_fps_second) {
++		uint64_t el = now - sweet_fps_t0;
++		sweet_fps_last_swaps = (uint32_t)((uint64_t)sweet_fps_swaps * sweet_fps_second / el);
++		sweet_fps_last_copies = (uint32_t)((uint64_t)sweet_fps_copies * sweet_fps_second / el);
++		IOLog("SWEET FB: %u fps (backboardd), %u frames shown/s\n",
++		    sweet_fps_last_swaps, sweet_fps_last_copies);
++		sweet_fps_swaps = sweet_fps_copies = 0;
++		sweet_fps_t0 = now;
++	}
++	sweet_fps_draw(px, stride, width, height, sweet_fps_last_swaps, sweet_fps_last_copies);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -600,8 +626,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 
+ 	if (scanPresent(rec)) {
+-		if (sweet_fps_on) {
+-			sweet_fps_copies++;         /* (counts flips now) */
++		if (sweet_fps_on && fScanned != NULL) {
++			/*
++			 * 0110: the counter on the surface the display now fetches (its panel window: the
++			 * surface is 1125x2436, the panel shows from (fOffX, fOffY)); before, it was drawn
++			 * into the splash buffer, which is not on the screen while frames are flipped.
++			 */
++			uintptr_t px = fScanned->kernelAddress();
++			if (px != 0) {
++				px += (uint64_t)fOffY * fScanned->bytesPerRow + (uint64_t)fOffX * 4;
++			}
++			sweet_fps_tick(px, fScanned->bytesPerRow, fWidth, fHeight);
+ 		}
+ 		return;
+ 	}
+@@ -695,20 +730,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		scanSplash();                   /* 0108: this swap was copied: show the splash buffer again */
+ 	}
+ 	if (sweet_fps_on) {
+-		uint64_t now = mach_absolute_time();
+-		sweet_fps_copies++;
+-		if (sweet_fps_t0 == 0) {
+-			sweet_fps_t0 = now;
+-		} else if (now - sweet_fps_t0 >= sweet_fps_second) {
+-			uint64_t el = now - sweet_fps_t0;
+-			sweet_fps_last_swaps = (uint32_t)((uint64_t)sweet_fps_swaps * sweet_fps_second / el);
+-			sweet_fps_last_copies = (uint32_t)((uint64_t)sweet_fps_copies * sweet_fps_second / el);
+-			IOLog("SWEET FB: %u fps (backboardd), %u panel copies/s\n",
+-			    sweet_fps_last_swaps, sweet_fps_last_copies);
+-			sweet_fps_swaps = sweet_fps_copies = 0;
+-			sweet_fps_t0 = now;
+-		}
+-		sweet_fps_draw(fPixels, fRowBytes, fWidth, fHeight, sweet_fps_last_swaps, sweet_fps_last_copies);
++		sweet_fps_tick(fPixels, fRowBytes, fWidth, fHeight);
+ 	}
+ 	for (uint32_t i = 0; i < nheld; i++) {
+ 		held[i]->release();
