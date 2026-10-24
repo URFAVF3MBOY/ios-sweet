@@ -1,0 +1,258 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -5734,6 +5734,8 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	thread_terminate(current_thread());
+ }
+ 
++extern "C" void sweet_drop_start(void);         /* SweetDrop.cpp (0107): payload files into the root */
++
+ extern "C" void
+ sweet_modem_init(void)
+ {
+@@ -5741,6 +5743,7 @@ sweet_modem_init(void)
+ 	uint32_t on = 0;
+ 	thread_t thread;
+ 
++	sweet_drop_start();
+ 	if (started || !PE_parse_boot_argn("sweetmodem", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetDrop.cpp
+@@ -0,0 +1,225 @@
++/*
++ * OnePlus 7T (kitty 0107): write files carried in the boot payload into the iOS root at boot.
++ * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <libkern/c++/OSData.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++
++/*
++ * Payload drop (kitty 0107) ----------------------------------------------------------------------
++ * Files carried in the boot payload (mkpayload.py --ramdisk OUT.drop, made by tools/mkdrop.py) are
++ * written into the iOS root once it is mounted, before backboardd starts: a new libredwood-gl.dylib
++ * then needs only mkpayload + shim build + fastboot boot, not an image rebuild and userdata reflash.
++ * mkpayload puts the blob after the kernel (never given to the VM) and names it in
++ * /chosen/memory-map "RAMDisk" (IOFindBSDRoot also makes /dev/md0 of it; with rd=ufsroot0 unused).
++ * Only acts on a blob starting with "SWEETDRP"; anything else (no --ramdisk, a real md0 image) is ignored.
++ * Format, little-endian: "SWEETDRP", u32 version 1, u32 count; per file: u32 path_len (with NUL, <= 256),
++ * u32 mode, u32 uid, u32 gid, u64 size, u32 fnv1a, u32 0, path padded to 8, data padded to 8.
++ */
++extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
++
++struct drop_file {
++	const char *path;
++	const uint8_t *data;
++	uint64_t size;
++	uint32_t mode, uid, gid, fnv;
++};
++
++static uint32_t
++drop_fnv1a(const uint8_t *p, uint64_t n)
++{
++	uint32_t h = 2166136261u;
++	for (uint64_t i = 0; i < n; i++) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++/* Parse the blob; fills up to max files, returns how many, or -1 if it is not a valid drop. */
++static int
++drop_parse(const uint8_t *b, uint64_t size, struct drop_file *f, int max)
++{
++	uint32_t ver, count;
++	uint64_t o = 16;
++
++	if (size < 16 || memcmp(b, "SWEETDRP", 8) != 0) {
++		return -1;
++	}
++	memcpy(&ver, b + 8, 4);
++	memcpy(&count, b + 12, 4);
++	if (ver != 1 || count == 0 || count > (uint32_t)max) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t plen, mode, uid, gid, fnv;
++		uint64_t len;
++		if (size - o < 32) {
++			return -1;
++		}
++		memcpy(&plen, b + o, 4);
++		memcpy(&mode, b + o + 4, 4);
++		memcpy(&uid, b + o + 8, 4);
++		memcpy(&gid, b + o + 12, 4);
++		memcpy(&len, b + o + 16, 8);
++		memcpy(&fnv, b + o + 24, 4);
++		o += 32;                                /* + u32 reserved */
++		uint64_t pspan = ((uint64_t)plen + 7) & ~7ULL;
++		if (plen < 3 || plen > 256 || pspan > size - o || b[o + plen - 1] != 0 || b[o] != '/') {
++			return -1;
++		}
++		for (uint32_t k = 0; k + 1 < plen; k++) {
++			if (b[o + k] == 0) {
++				return -1;              /* one string, no NUL inside */
++			}
++		}
++		f[i].path = (const char *)(b + o);
++		o += pspan;
++		uint64_t dspan = (len + 7) & ~7ULL;
++		if (len > size || dspan > size - o) {
++			return -1;
++		}
++		f[i].data = b + o;
++		f[i].size = len;
++		f[i].mode = mode & 07777;
++		f[i].uid = uid;
++		f[i].gid = gid;
++		f[i].fnv = fnv;
++		o += dspan;
++	}
++	return (int)count;
++}
++
++static const uint8_t *drop_blob;
++static uint64_t drop_size;
++
++static int
++drop_write(const struct drop_file *f, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(f->path, O_CREAT | O_TRUNC | FWRITE, (int)f->mode, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	uint64_t done = 0;
++	while (error == 0 && done < f->size) {
++		uint64_t chunk = MIN(f->size - done, (uint64_t)(1 << 20));
++		uio_t uio = uio_create(1, (off_t)done, UIO_SYSSPACE, UIO_WRITE);
++		if (uio == NULL) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(f->data + done), (user_size_t)chunk);
++		error = VNOP_WRITE(vp, uio, 0, ctx);
++		if (error == 0 && uio_resid(uio) != 0) {
++			error = EIO;
++		}
++		uio_free(uio);
++		done += chunk;
++	}
++	if (error == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, (mode_t)f->mode);
++		VATTR_SET(&va, va_uid, (uid_t)f->uid);
++		VATTR_SET(&va, va_gid, (gid_t)f->gid);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error != 0 ? error : close_error;
++}
++
++static void
++drop_thread(void *, wait_result_t)
++{
++	struct drop_file f[8];
++	int n = drop_parse(drop_blob, drop_size, f, 8);
++	vfs_context_t ctx = vfs_context_create(NULL);
++
++	for (int i = 0; i < n; i++) {
++		char dir[256];
++		strlcpy(dir, f[i].path, sizeof(dir));
++		size_t last = 0;
++		for (size_t k = 0; dir[k] != 0; k++) {
++			if (dir[k] == '/') {
++				last = k;
++			}
++		}
++		if (last > 0) {
++			dir[last] = 0;                  /* the parent folder */
++		}
++		/* wait for the iOS root (and the folder) to be there: poll 100 ms, up to 120 s */
++		unsigned waited = 0;
++		for (;; waited += 100) {
++			vnode_t dvp = NULLVP;
++			if (vnode_lookup(dir, 0, &dvp, ctx) == 0) {
++				vnode_put(dvp);
++				break;
++			}
++			if (waited >= 120000) {
++				break;
++			}
++			IOSleep(100);
++		}
++		uint32_t fnv = drop_fnv1a(f[i].data, f[i].size);
++		int error = fnv != f[i].fnv ? EBADMSG : drop_write(&f[i], ctx);
++		IOLog("SWEET DROP: %s: %llu bytes, fnv %08x%s, mode %o uid %u gid %u -> %s (error %d, after %u ms)\n",
++		    f[i].path, f[i].size, fnv, fnv != f[i].fnv ? " (BLOB DAMAGED)" : "", f[i].mode, f[i].uid, f[i].gid,
++		    error == 0 ? "written" : "NOT written", error, waited);
++	}
++	vfs_context_rele(ctx);
++}
++
++/* Called first thing from sweet_modem_init (AppleCLCD::start), modem or not. */
++extern "C" void sweet_drop_start(void);
++extern "C" void
++sweet_drop_start(void)
++{
++	static bool started;
++	struct drop_file f[8];
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	IORegistryEntry *mm = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
++	if (mm == NULL) {
++		return;
++	}
++	OSData *d = OSDynamicCast(OSData, mm->getProperty("RAMDisk"));
++	if (d == NULL || d->getLength() < 16) {
++		mm->release();
++		return;
++	}
++	const uint64_t *rd = (const uint64_t *)d->getBytesNoCopy();
++	uint64_t pa = rd[0], size = rd[1];
++	mm->release();
++	if (pa == 0 || size < 16) {
++		return;
++	}
++	drop_blob = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	drop_size = size;
++	int n = drop_parse(drop_blob, drop_size, f, 8);
++	if (n <= 0) {
++		return;                                 /* not a drop: a real md0 image, or nothing */
++	}
++	IOLog("SWEET DROP: %d file(s) in the payload at %llx (+%llx), written once the root is mounted\n", n, pa, size);
++	if (kernel_thread_start(drop_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else
++extern "C" void sweet_drop_start(void) {}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -22,3 +22,4 @@ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetDrop.cpp                                   optional iokitcpp
