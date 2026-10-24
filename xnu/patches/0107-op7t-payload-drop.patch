@@ -22,7 +22,7 @@ diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetDrop.cpp
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,226 @@
 +/*
 + * OnePlus 7T (kitty 0107): write files carried in the boot payload into the iOS root at boot.
 + * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
@@ -32,6 +32,7 @@ new file mode 100644
 +#if defined(SWEET)
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>                 /* gIODTPlane */
 +#include <libkern/c++/OSData.h>
 +#include <kern/thread.h>
 +#include <pexpert/pexpert.h>
