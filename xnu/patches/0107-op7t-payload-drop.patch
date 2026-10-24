@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetDrop.cpp
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,250 @@
 +/*
 + * OnePlus 7T (kitty 0107): write files carried in the boot payload into the iOS root at boot.
 + * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
@@ -13,6 +13,7 @@ new file mode 100644
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IORegistryEntry.h>
 +#include <IOKit/IODeviceTreeSupport.h>                 /* gIODTPlane */
++#include <pexpert/device_tree.h>                       /* SecureDTLookupEntry / SecureDTGetProperty */
 +#include <libkern/c++/OSData.h>
 +#include <kern/thread.h>
 +#include <pexpert/pexpert.h>
@@ -157,26 +158,41 @@ new file mode 100644
 +	 * path: reading /chosen/memory-map there panicked ("Taking non-sleepable RW lock with
 +	 * preemption enabled @lock_rw.c", boot 2026-10-24), because that early context must not block.
 +	 */
-+	IORegistryEntry *mm = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
-+	if (mm == NULL) {
++	/*
++	 * Read /chosen/memory-map "RAMDisk" from the BOOT device tree (SecureDT), not the IORegistry:
++	 * the registry lookup found nothing on boot dfb9e8 although XNU had just made md0 of the blob
++	 * ("Added memory device md0 ... at FFFFFE0008510000 for 80000"). Every exit says why.
++	 */
++	DTEntry mm;
++	void const *prop = NULL;
++	unsigned int psize = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess) {
++		IOLog("SWEET DROP: no /chosen/memory-map in the device tree\n");
 +		return;
 +	}
-+	OSData *d = OSDynamicCast(OSData, mm->getProperty("RAMDisk"));
-+	if (d == NULL || d->getLength() < 16) {
-+		mm->release();
++	if (SecureDTGetProperty(mm, "RAMDisk", &prop, &psize) != kSuccess || prop == NULL || psize < 16) {
++		IOLog("SWEET DROP: no RAMDisk in the payload (nothing to drop)\n");
 +		return;
 +	}
-+	const uint64_t *rd = (const uint64_t *)d->getBytesNoCopy();
++	uint64_t rd[2];
++	memcpy(rd, prop, sizeof(rd));
 +	uint64_t pa = rd[0], size = rd[1];
-+	mm->release();
 +	if (pa == 0 || size < 16) {
++		IOLog("SWEET DROP: RAMDisk entry empty (%llx +%llx)\n", pa, size);
 +		return;
 +	}
 +	drop_blob = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
 +	drop_size = size;
++	if (drop_blob == NULL) {
++		IOLog("SWEET DROP: RAMDisk at %llx not mapped (ml_static_ptovirt)\n", pa);
++		return;
++	}
 +	int n = drop_parse(drop_blob, drop_size, f, 8);
 +	if (n <= 0) {
-+		return;                                 /* not a drop: a real md0 image, or nothing */
++		IOLog("SWEET DROP: RAMDisk at %llx (+%llx) is not a valid drop (starts %02x%02x%02x%02x%02x%02x%02x%02x)\n",
++		    pa, size, drop_blob[0], drop_blob[1], drop_blob[2], drop_blob[3], drop_blob[4], drop_blob[5],
++		    drop_blob[6], drop_blob[7]);
++		return;
 +	}
 +	IOLog("SWEET DROP: %d file(s) in the payload at %llx (+%llx), writing once the root is mounted\n", n, pa, size);
 +	ctx = vfs_context_create(NULL);
