@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1317,9 +1317,29 @@
+ 		redwood_gpu_worked(&r.worked.microseconds, &r.worked.submissions, r.worked.by);
+ 		IOLockUnlock(gGPULock);
+ 		break;
+-	case kRedwoodSurface:
++	case kRedwoodSurface: {
++		/*
++		 * 0106: say what happens to the IOSurfaces libredwood asks to draw without a copy
++		 * (Mesa's glEGLImageTargetTexture2DOES -> here). The first 16 requests, then every 500th,
++		 * and every failure up to 64: surface ID, result (0 = shared; e00002f0 not found,
++		 * e00002c7 = a "wrapped" surface, refused; e00002bd = no memory / too big) and size.
++		 * If this never prints, Mesa never asks: the copy is decided in user space.
++		 */
++		static uint32_t surface_asked, surface_failed;
++		uint32_t id = r.surface.surface;
++
+ 		ret = surfaceBuffer(&r.surface);
++		surface_asked++;
++		if (ret != kIOReturnSuccess) {
++			surface_failed++;
++		}
++		if (surface_asked <= 16 || (surface_asked % 500) == 0 ||
++		    (ret != kIOReturnSuccess && surface_failed <= 64)) {
++			IOLog("RedwoodGPU: surface %u as a buffer -> %#x, %llu bytes (asked %u, failed %u)\n",
++			    id, ret, (unsigned long long)r.surface.size, surface_asked, surface_failed);
++		}
+ 		break;
++	}
+ 	case kRedwoodShow:
+ 		ret = show(&r.show);
+ 		break;

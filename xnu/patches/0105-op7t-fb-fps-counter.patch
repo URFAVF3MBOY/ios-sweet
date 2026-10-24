@@ -1,0 +1,130 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -173,6 +173,11 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/* FPS counter state used by start()/swap() (sweetfps=1; details at sweet_fps_draw) */
++static uint32_t sweet_fps_on;
++static uint64_t sweet_fps_second;
++static uint32_t sweet_fps_swaps;
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -220,6 +225,11 @@
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	PE_parse_boot_argn("sweetfps", &sweet_fps_on, sizeof(sweet_fps_on));
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sweet_fps_second);
++	if (sweet_fps_on) {
++		IOLog("SWEET FB: FPS counter on (top-left: backboardd fps, panel copies/s)\n");
++	}
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	sweet_fb_threads_start();
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -330,6 +340,9 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	if (sweet_fps_on) {
++		sweet_fps_swaps++;
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -463,6 +476,69 @@
+ 	IOLockUnlock(sweet_fb_job_lock);
+ }
+ 
++
++/*
++ * FPS counter (boot-arg sweetfps=1, default off). Counts the frames backboardd presents (swap()) and the
++ * copies to the panel (present()), logs both once a second as "SWEET FB: N fps (backboardd), M panel
++ * copies/s", and draws them white on black in the top-left corner after every panel copy (a 3x5 digit
++ * font scaled 8x). The backboardd number is the compositor's real frame rate; the panel copy runs at
++ * most sweetfb_hz, so both together show which one limits.
++ */
++static uint64_t sweet_fps_t0;
++static uint32_t sweet_fps_copies, sweet_fps_last_swaps, sweet_fps_last_copies;
++
++/* digit d: 5 rows of 3 bits, top row in bits 14..12 */
++static const uint16_t sweet_fps_font[10] = {
++	0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef, 0x7249, 0x7bef, 0x7bcf,
++};
++
++static void
++sweet_fps_draw(uintptr_t px, uint32_t stride, uint32_t width, uint32_t height, uint32_t a, uint32_t b)
++{
++	const uint32_t S = 8, X0 = 40, Y0 = 120, DW = 4 * S, BW = 9 * DW, BH = 7 * S;
++	char text[12];
++	uint32_t n = 0;
++
++	if (px == 0 || X0 + BW > width || Y0 + BH > height) {
++		return;
++	}
++	/* "aaa bbb" right-aligned in 3 digits each */
++	for (int k = 0; k < 2; k++) {
++		uint32_t v = (k == 0 ? a : b) % 1000;
++		text[n++] = v >= 100 ? (char)('0' + v / 100) : ' ';
++		text[n++] = v >= 10 ? (char)('0' + (v / 10) % 10) : ' ';
++		text[n++] = (char)('0' + v % 10);
++		if (k == 0) {
++			text[n++] = ' ';
++		}
++	}
++	for (uint32_t y = 0; y < BH; y++) {         /* black box */
++		volatile uint32_t *row = (volatile uint32_t *)(px + (uint64_t)(Y0 + y) * stride);
++		for (uint32_t x = 0; x < BW; x++) {
++			row[X0 + x] = 0xff000000u;
++		}
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		if (text[i] < '0' || text[i] > '9') {
++			continue;
++		}
++		uint16_t g = sweet_fps_font[text[i] - '0'];
++		for (uint32_t r = 0; r < 5; r++) {
++			for (uint32_t c = 0; c < 3; c++) {
++				if (!(g & (1u << (14 - (r * 3 + c))))) {
++					continue;
++				}
++				for (uint32_t yy = 0; yy < S; yy++) {
++					volatile uint32_t *row = (volatile uint32_t *)(px + (uint64_t)(Y0 + S + r * S + yy) * stride);
++					for (uint32_t xx = 0; xx < S; xx++) {
++						row[X0 + S / 2 + i * DW + c * S + xx] = 0xffffffffu;
++					}
++				}
++			}
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -567,6 +643,22 @@
+ 		held[nheld++] = s;              /* held until copied */
+ 	}
+ 	sweet_fb_copy();
++	if (sweet_fps_on) {
++		uint64_t now = mach_absolute_time();
++		sweet_fps_copies++;
++		if (sweet_fps_t0 == 0) {
++			sweet_fps_t0 = now;
++		} else if (now - sweet_fps_t0 >= sweet_fps_second) {
++			uint64_t el = now - sweet_fps_t0;
++			sweet_fps_last_swaps = (uint32_t)((uint64_t)sweet_fps_swaps * sweet_fps_second / el);
++			sweet_fps_last_copies = (uint32_t)((uint64_t)sweet_fps_copies * sweet_fps_second / el);
++			IOLog("SWEET FB: %u fps (backboardd), %u panel copies/s\n",
++			    sweet_fps_last_swaps, sweet_fps_last_copies);
++			sweet_fps_swaps = sweet_fps_copies = 0;
++			sweet_fps_t0 = now;
++		}
++		sweet_fps_draw(fPixels, fRowBytes, fWidth, fHeight, sweet_fps_last_swaps, sweet_fps_last_copies);
++	}
+ 	for (uint32_t i = 0; i < nheld; i++) {
+ 		held[i]->release();
+ 	}

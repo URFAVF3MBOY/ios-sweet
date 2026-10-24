@@ -1864,6 +1864,13 @@ static void step9_hfi(void)
 #define BCM_CNOC_ON		0x60000001U	/* commit|valid, y=1 */
 
 static const uint32_t gx_khz[]  = { 0, 257000, 345000, 427000, 499200, 585000 };
+/*
+ * GPU clock: the perf-table index step 11 votes (H2F_MSG_GX_BW_PERF_VOTE). Boot-arg sweetgpufreq=N,
+ * N = 1..5 -> 257 / 345 / 427 / 499.2 / 585 MHz (DT gpu_opp_table_v2, speed bin 0, valid for both
+ * bins). Default 1 = what every passing boot used. Nothing after the shim changes it (no XNU patch
+ * sends a GX perf vote), so this is the GPU's clock for the whole session.
+ */
+static uint32_t gx_freq_idx = 1;
 static const uint32_t gx_vlvl[] = { 0, 64, 128, 192, 224, 256 };
 static const uint32_t cx_khz[]  = { 0, 200000 };
 static const uint32_t cx_vlvl[] = { 0, 48 };
@@ -2242,8 +2249,14 @@ static void step11_gx_power(unsigned level)
 		return;
 	}
 	hfi_put(1);		/* ack_type: DCVS_ACK_BLOCK */
-	hfi_put(1);		/* freq: perf table index 1 */
+	hfi_put(gx_freq_idx);	/* freq: perf table index (sweetgpufreq=, default 1 = 257 MHz) */
 	hfi_put(0xffU);		/* bw: INVALID_DCVS_IDX */
+	{
+		int was_muted = con_mute;               /* shown even when step 11 is muted (sweetgpu >= 12) */
+		con_mute = 0;
+		con_hex2("GX clock", "index=", gx_freq_idx, "kHz=", gx_khz[gx_freq_idx]);
+		con_mute = was_muted;
+	}
 	if (!hfi_finish("HFI gxvote", hdr))
 		return;
 
@@ -3690,12 +3703,96 @@ static void step15_g3_blit(const char *cmdline)
 		note_fail(hwf ? "G3b CP fault" : !got ? "G3b no mark" : "G3b pixels");
 }
 
+
+/*
+ * ---- Clocks: CPU boost (sweetcpufreq=1) and a real GPU clock readout ----
+ * CPU: OSM, the hardware CPU DVFS block (OnePlus clk-cpu-osm.c, offsets verified there): one block per
+ * cluster, frequency table FREQ_REG 0x110 + i*32 (40 entries; src = bits 31:30, 0 -> 300 MHz, else
+ * 19.2 MHz * lval bits 7:0; two equal entries end the table), DCVS_PERF_STATE_DESIRED_REG(n) 0x920 + 4n.
+ * Writing the highest index there is what Linux's cpufreq does for the "performance" governor; OSM itself
+ * sets the voltage (CPR) and LMH still caps for thermals. Done before xnu, from CPU0 (MMU off).
+ * GPU: the GMU programs GPU PLL0 (GPUCC +0x0, a Trion PLL; clk-alpha-pll.c: L at +0x04, alpha at +0x40,
+ * 16-bit) for the voted clock: VCO = 19.2 MHz * (L + alpha / 65536). The core clock is the VCO or an
+ * integer fraction of it (post-divider), so compare boots: it should scale with sweetgpufreq.
+ */
+#define OSM_FREQ_REG(i)		(0x110U + (uint32_t)(i) * 32U)
+#define OSM_DESIRED(n)		(0x920U + 4U * (uint32_t)(n))
+
+static uint32_t osm_khz(uint32_t w)
+{
+	uint32_t src = (w >> 30) & 3U, lval = w & 0xffU;
+	return src ? 19200U * lval : 300000U;
+}
+
+/* highest-frequency index of one cluster's table; *khz gets that frequency */
+static unsigned osm_top(uintptr_t base, uint32_t *khz)
+{
+	uint32_t prev = 0, best_k = 0;
+	unsigned best = 0;
+
+	for (unsigned i = 0; i < 40; i++) {
+		uint32_t k = osm_khz(rd(base + OSM_FREQ_REG(i)));
+		if (i > 0 && k == prev)
+			break;
+		if (k >= best_k) {
+			best_k = k;
+			best = i;
+		}
+		prev = k;
+	}
+	*khz = best_k;
+	return best;
+}
+
+static void osm_boost_one(const char *label, uintptr_t base, unsigned ncores)
+{
+	uint32_t khz = 0, before = rd(base + OSM_DESIRED(0)), bad = 0;
+	unsigned top = osm_top(base, &khz);
+
+	if (khz == 0 || top == 0) {
+		con_hex2(label, "table unreadable top=", top, "kHz=", khz);
+		return;
+	}
+	for (unsigned n = 0; n < ncores; n++) {
+		wr(base + OSM_DESIRED(n), top);
+		if (rd(base + OSM_DESIRED(n)) != top)
+			bad++;
+	}
+	con_hex2(label, "MHz=", khz / 1000U, "index was/now=", (before << 16) | (top & 0xffffU));
+	if (bad)
+		con_hex2(label, "readback mismatch cores=", bad, "of=", ncores);
+}
+
+static void cpu_boost(void)
+{
+	/* L3 0x18321000, little 0x18323000 (cpu0-3), big 0x18325800 (cpu4-6), prime 0x18327800 (cpu7) */
+	osm_boost_one("CPU L3", 0x18321000UL, 1);
+	osm_boost_one("CPU 0-3", 0x18323000UL, 4);
+	osm_boost_one("CPU 4-6", 0x18325800UL, 3);
+	osm_boost_one("CPU 7", 0x18327800UL, 1);
+}
+
+static void gpu_clock_report(void)
+{
+	uint32_t l = rd(GPUCC_BASE + 0x04) & 0xffffU, alpha = rd(GPUCC_BASE + 0x40) & 0xffffU;
+	uint32_t vco_mhz = (uint32_t)(((uint64_t)19200U * ((uint64_t)l * 65536U + alpha)) / 65536U / 1000U);
+
+	con_hex2("GPU clock", "voted MHz=", gx_khz[gx_freq_idx] / 1000U, "PLL0 VCO MHz=", vco_mhz);
+	con_hex2("GPU PLL0", "L=", l, "alpha=", alpha);
+}
+
 void gpu_stage(const char *cmdline)
 {
 	unsigned level = cmdline_uint(cmdline, "sweetgpu=", 0);
 	if (level == 0)
 		return;
 	gpu_level = level;
+	{
+		unsigned f = cmdline_uint(cmdline, "sweetgpufreq=", 1);
+		gx_freq_idx = (f >= 1 && f < N_GX) ? f : 1;     /* 0 = GPU off and out-of-range: keep 257 MHz */
+	}
+	if (cmdline_uint(cmdline, "sweetcpufreq=", 0))
+		cpu_boost();
 
 	n_fail = 0;
 	quiet = level >= 5;
@@ -3808,6 +3905,8 @@ void gpu_stage(const char *cmdline)
 		step15_g3_blit(cmdline);
 	else if (level >= 15)
 		con_str("GPU", "step 15 skipped: earlier step failed");
+	if (gx_on)
+		gpu_clock_report();             /* unmuted: the real GPU clock after the vote */
 	if (n_fail == 0)
 		con_str("GPU OK", "all steps ok");
 	for (int i = 0; i < n_fail && i < 4; i++)
