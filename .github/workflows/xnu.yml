@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      use_ccache:
+        description: compile the kernel through ccache (cached objects from earlier runs)
+        default: "true"
   push:
     branches: [main]
     paths:
@@ -31,6 +34,14 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # ccache: XNU recompiles everything on every run otherwise (~3 min). Objects are cached by
+  # their preprocessed content, so a fresh checkout + patches still hits for unchanged files.
+  USE_CCACHE: ${{ inputs.use_ccache || 'true' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
 
 jobs:
   build:
@@ -55,7 +66,7 @@ jobs:
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
+          brew install jq gum bash cmake ninja ccache
           # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
@@ -66,13 +77,42 @@ jobs:
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
+          # ccache wrappers named clang/clang++ around Xcode's compilers (XNU's make gets them
+          # through MAKEFLAGS in the Build step; the Xcode-built tools never see them)
+          mkdir -p /tmp/ccache-bin
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang)" > /tmp/ccache-bin/clang
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang++)" > /tmp/ccache-bin/clang++
+          chmod +x /tmp/ccache-bin/clang /tmp/ccache-bin/clang++
+          cat /tmp/ccache-bin/clang
+          ccache --version | head -1
+          ccache -z
+
+      - name: Restore ccache
+        if: env.USE_CCACHE == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: xnu-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            xnu-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
 
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
-          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }} ${{ (inputs.use_ccache || 'true') == 'true' && 'CC=/tmp/ccache-bin/clang CXX=/tmp/ccache-bin/clang++' || '' }}
         run: bash build.sh
+
+      - name: ccache statistics
+        if: always() && env.USE_CCACHE == 'true'
+        run: ccache -s
+
+      - name: Save ccache
+        if: always() && env.USE_CCACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: xnu-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
 
       - name: Package build tree for local compiles
         if: always()
