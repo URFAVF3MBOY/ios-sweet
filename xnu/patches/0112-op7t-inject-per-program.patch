@@ -1,0 +1,48 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2057ccb..094fb24 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5578,11 +5578,13 @@ bad:
+  * sweetinject=NAME[,NAME...] (default none: off) starts with
+  * DYLD_INSERT_LIBRARIES=<boot-arg sweetinjectlib, default /redwood/lib/libredwood.dylib>.
+  * dyld honours it because AMFI (0090) allows DYLD_* for the processes in sweetdyld=.
++ * 0112: an entry NAME=LIB gives that program its own library instead of sweetinjectlib
++ * (sweetinject=backboardd,PosterBoard=/redwood/lib/libsweetpb.dylib).
+  */
+ static bool
+ sweet_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+-	char names[96] = "", lib[96] = "/redwood/lib/libredwood.dylib";
++	char names[160] = "", lib[96] = "/redwood/lib/libredwood.dylib";
+ 	const char *name, *at;
+ 	size_t namelen;
+ 
+@@ -5599,12 +5601,25 @@ sweet_inject_env(struct image_params *imgp, char *env, size_t size)
+ 	for (at = names; *at != '\0';) {
+ 		size_t len = 0;
+ 
++		size_t nlen;
++
+ 		while (at[len] != '\0' && at[len] != ',') {
+ 			len++;
+ 		}
+-		if (len == namelen && strncmp(at, name, len) == 0) {
+-			if (strlcpy(env, "DYLD_INSERT_LIBRARIES=", size) >= size ||
+-			    strlcat(env, lib, size) >= size) {
++		for (nlen = 0; nlen < len && at[nlen] != '='; nlen++) {
++		}
++		if (nlen == namelen && strncmp(at, name, nlen) == 0) {
++			if (strlcpy(env, "DYLD_INSERT_LIBRARIES=", size) >= size) {
++				return false;
++			}
++			if (nlen < len) {               /* 0112: NAME=LIB */
++				size_t have = strlen(env), want = len - nlen - 1;
++				if (want == 0 || have + want + 1 > size) {
++					return false;
++				}
++				memcpy(env + have, at + nlen + 1, want);
++				env[have + want] = '\0';
++			} else if (strlcat(env, lib, size) >= size) {
+ 				return false;
+ 			}
+ 			return true;
