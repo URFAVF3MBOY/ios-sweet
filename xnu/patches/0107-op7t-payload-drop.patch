@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetDrop.cpp
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,252 @@
 +/*
 + * OnePlus 7T (kitty 0107): write files carried in the boot payload into the iOS root at boot.
 + * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
@@ -166,12 +166,14 @@ new file mode 100644
 +	DTEntry mm;
 +	void const *prop = NULL;
 +	unsigned int psize = 0;
-+	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess) {
-+		IOLog("SWEET DROP: no /chosen/memory-map in the device tree\n");
++	int lk = SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm);
++	IOLog("SWEET DROP: thread up, memory-map lookup = %d\n", lk);
++	if (lk != kSuccess) {
 +		return;
 +	}
-+	if (SecureDTGetProperty(mm, "RAMDisk", &prop, &psize) != kSuccess || prop == NULL || psize < 16) {
-+		IOLog("SWEET DROP: no RAMDisk in the payload (nothing to drop)\n");
++	int gp = SecureDTGetProperty(mm, "RAMDisk", &prop, &psize);
++	IOLog("SWEET DROP: RAMDisk property = %d, size %u\n", gp, psize);
++	if (gp != kSuccess || prop == NULL || psize < 16) {
 +		return;
 +	}
 +	uint64_t rd[2];
