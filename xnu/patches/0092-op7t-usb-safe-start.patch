@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..91fe5e3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,6 +41,10 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t);
++static vm_offset_t ud_start_dwc;
++static void ud_start_thread(void *arg, wait_result_t wr);
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -117,7 +121,16 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
++		/*
++		 * OnePlus 7T (0092): not here. The probe runs inside the storage driver's init, before the
++		 * persistent log saves anything, and on the 7T the start-up below sent the phone to
++		 * Qualcomm crashdump with no trace. A thread starts it later (sweetusbdelay seconds).
++		 */
++		thread_t starter;
++		ud_start_dwc = dwc;
++		if (kernel_thread_start(ud_start_thread, NULL, &starter) == KERN_SUCCESS) {
++			thread_deallocate(starter);
++		}
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("HOTDOGB USB: ahb2phy clock off; QUSB2 PHY not read\n");
+@@ -251,9 +264,20 @@ dwc_rd(uint32_t off)
+ 	return usb_rd(ud.dwc, off);
+ }
+ 
++/*
++ * OnePlus 7T (0092): sweetusbdma=1 (default) puts the DMA area in low memory the kernel does not
++ * own, mapped non-cacheable: no cache maintenance, and none possible by physical address
++ * (flush_dcache64 with a PA outside the kernel's RAM panics in phystokv_range).
++ */
++static bool ud_dma_low;
++
+ static void
+ ud_sync(uint32_t off, uint32_t len)
+ {
++	if (ud_dma_low) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -848,25 +872,93 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/*
++ * OnePlus 7T (0092): the start-up in numbered steps. Each says what it is about to do and, with
++ * sweetusbslow=1 (default), waits 1.5 s so the persistent log (saved about once a second) has the
++ * line before the step runs: if a step sends the phone to crashdump, the last saved line names it.
++ * sweetusbstep=N stops after step N (default: all).
++ *   1  DMA area      2  network interface    3  controller soft reset    4  event buffer
++ *   5  device config + endpoint 0             6  VBUS override            7  run
++ * 7T facts (boot logs): DWC_usb31 1.10a (GSNPSID 0x33313130; the Redmi's was DWC_usb3 3.20a),
++ * ABL leaves it SuperSpeed-capable with its event buffer at 0xffaf9000, below 4 GiB. The 7T's
++ * kernel RAM is all above 4 GiB (0x1_0000_0000); every Android DMA pool here is below 4 GiB, and
++ * USB (unlike UFS) sits behind the apps SMMU (DT iommus 0x140).
++ */
++#define UD_LOW_PA       0xb0800000ULL   /* scratch RAM below 4 GiB, outside the kernel's (0089 GPU uses +0..+0x530000) */
++static int ud_max_step = 99, ud_slow = 1;
++
++static bool
++ud_step(int n, const char *what)
++{
++	if (n > ud_max_step) {
++		printf("HOTDOGB USB: stopping before step %d (sweetusbstep=%d)\n", n, ud_max_step);
++		return false;
++	}
++	printf("HOTDOGB USB: step %d: %s\n", n, what);
++	if (ud_slow) {
++		delay(1500 * 1000);
++	}
++	return true;
++}
++
++static void
++ud_start_thread(void *arg, wait_result_t wr)
++{
++	int wait_s = 10;
++	(void)arg; (void)wr;
++	PE_parse_boot_argn("sweetusbdelay", &wait_s, sizeof(wait_s));
++	PE_parse_boot_argn("sweetusbstep", &ud_max_step, sizeof(ud_max_step));
++	PE_parse_boot_argn("sweetusbslow", &ud_slow, sizeof(ud_slow));
++	printf("HOTDOGB USB: start-up in %d s\n", wait_s);
++	for (int s = 0; s < wait_s; s++) {
++		delay(1000 * 1000);
++	}
++	sweet_usb_gadget_start(ud_start_dwc);
++	thread_terminate(current_thread());
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+ 	thread_t thread;
++	int lowdma = 1;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("HOTDOGB USB: no DMA memory\n");
++	PE_parse_boot_argn("sweetusbdma", &lowdma, sizeof(lowdma));
++	if (!ud_step(1, lowdma ? "DMA area in low memory 0xb0800000 (non-cacheable)" : "DMA area from kernel memory")) {
+ 		return;
+ 	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
++	if (lowdma) {
++		ud.dma = ml_io_map_wcomb((vm_offset_t)UD_LOW_PA, UD_SIZE);
++		if (ud.dma == 0) {
++			printf("HOTDOGB USB: low DMA map failed\n");
++			return;
++		}
++		ud.dma_pa = UD_LOW_PA;
++		ud_dma_low = true;
++		bzero((void *)ud.dma, UD_SIZE);
++	} else {
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("HOTDOGB USB: no DMA memory\n");
++			return;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
++		ud.dma_pa = ptoa_64(pn);
++	}
++	printf("HOTDOGB USB: DMA area at 0x%llx\n", ud.dma_pa);
++	if (!ud_step(2, "network interface ue0")) {
+ 		return;
+ 	}
+-	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	if (!ud_step(3, "controller soft reset")) {
++		return;
++	}
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -878,12 +970,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	if (!ud_step(4, "event buffer -> DMA area")) {
++		return;
++	}
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
++	if (!ud_step(5, "device config (high speed) + endpoint 0")) {
++		return;
++	}
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+@@ -902,6 +1000,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
++	if (!ud_step(6, "VBUS override in the Qualcomm wrapper")) {
++		return;
++	}
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+@@ -914,6 +1015,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	if (!ud_step(7, "run (the PC should see the device now)")) {
++		return;
++	}
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);

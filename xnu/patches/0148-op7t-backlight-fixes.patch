@@ -1,0 +1,107 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 02:40:00 -0400
+Subject: [PATCH] op7t-0148: brightness: DMA buffer below 4 GiB, CoreBrightness's backlight from boot
+
+0147 on the phone (2026-10-26):
+- every kern.sweetbl level came back "NO DONE": the DSI DMA buffer was at
+  0x1dc0e0000 / 0x1cf774000, above what DMA_BASE (32 bits) reaches. For a
+  single page IOKernelAllocateWithPhysicalRestrict turns the 4 GiB mask
+  into KMA_LOMEM, which arm64 ignores. Now two pages (the contiguous path,
+  which honours the limit), and a buffer that still lands above 4 GiB is
+  refused rather than used. The commands sent from the wrong address turned
+  the panel dark (the UI went on drawing).
+- with kern.sweetbl_svc=1 and backboardd restarted, CoreBrightness took
+  AppleARMBacklight at once (brightness 726 of 1024, backlight-level,
+  brightness-nits, DisplayBrightnessSliderPosition, FadePeriod; 0 with the
+  display off, 726 again on) and backboardd stayed up. So it is published
+  at boot now; boot-arg sweetblsvc=0 leaves it out.
+- CoreBrightness also sets IOMFBBrightnessLevel = 0 at start, which 0147
+  sent on as the dimmest level: now only logged.
+Stub-syntax-checked with g++.
+
+Apply after 0147.
+---
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+index 91759a0..e5dfe46 100644
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -13,15 +13,16 @@
+  * From a root shell:   sysctl kern.sweetbl=512    DBV 512 at once; reading gives the last sent
+  * Boot-args:           sweetbl=N (self-test a few seconds after boot), sweetbldsi=0|1, sweetblcmd=0x51
+  *
+- * From iOS (CoreBrightness, in backboardd). Which way iOS 16 sends the slider here is not known
+- * yet -- its CoreBrightness names both -- so both are taken and logged ("HOTDOGB BL: iOS ..."):
+- *   - IOMFBBrightnessLevel set on the framebuffer (AppleCLCD::setProperties, SweetFramebuffer.cpp):
+- *     taken as nits, 16.16 fixed point when >= 0x10000, and mapped linearly onto DBV with
+- *     kern.sweetbl_nits (default 600) as full scale.
+- *   - an AppleARMBacklight service with IODisplayParameters (brightness min/max/value), which
+- *     is what CoreBrightness's findBacklight looks for by name. Published only on
+- *     `sysctl kern.sweetbl_svc=1` (then restart backboardd): a service CoreBrightness half
+- *     understands could take the window server down with it.
++ * From iOS (CoreBrightness, in backboardd): an AppleARMBacklight service with IODisplayParameters
++ * (brightness min/max/value), which is what CoreBrightness's findBacklight looks for by name.
++ * 0148: on the phone (0147, published by `sysctl kern.sweetbl_svc=1`, backboardd restarted)
++ * CoreBrightness took it at once: brightness 726 of 1024, backlight-level, brightness-nits,
++ * DisplayBrightnessSliderPosition, FadePeriod; brightness 0 with the display off and 726 again
++ * on. So it is published at boot now (boot-arg sweetblsvc=0: not). Every key iOS sets is logged
++ * ("HOTDOGB BL: iOS sets ..."), the first 200.
++ * IOMFBBrightnessLevel on the framebuffer (AppleCLCD::setProperties, SweetFramebuffer.cpp) is
++ * only logged since 0148: CoreBrightness sets it to 0 at start, which 0147 sent on as the
++ * dimmest level. (kern.sweetbl_nits, its full scale for the log, stays.)
+  */
+ #include <libkern/libkern.h>
+ #include <libkern/c++/OSDictionary.h>
+@@ -146,9 +147,21 @@ sweet_bl_map(void)
+ 		sweet_dsi = (volatile uint8_t *)ml_io_map(sweet_bl_which ? DSI1_PA : DSI0_PA, DSI_SIZE);
+ 	}
+ 	if (sweet_dsi_buf == NULL) {
++		/*
++		 * 0148: two pages, not 64 bytes. For one page IOKernelAllocateWithPhysicalRestrict
++		 * (IOLib.cpp) turns a mask below 4 GiB into KMA_LOMEM, which arm64 has no pool for, and
++		 * takes any page: on the phone (0147) the buffer was at 0x1dc0e0000 and DMA_BASE (32
++		 * bits) pointed elsewhere -- "NO DONE" for every level. More than a page goes to
++		 * kmem_alloc_contig with the limit as its highest page.
++		 */
+ 		sweet_dsi_buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 64, 0x00000000fffff000ull);
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 2 * PAGE_SIZE, 0x00000000fffff000ull);
+ 		sweet_dsi_buf_phys = sweet_dsi_buf ? sweet_dsi_buf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++		if (sweet_dsi_buf_phys + 64 > 0x100000000ULL) {
++			LOG("DMA buffer at 0x%llx is above 4 GiB: DSI cannot reach it", (unsigned long long)sweet_dsi_buf_phys);
++			OSSafeReleaseNULL(sweet_dsi_buf);
++			sweet_dsi_buf_phys = 0;
++		}
+ 	}
+ 	if (sweet_dsi == NULL || sweet_dsi_buf == NULL || sweet_dsi_buf_phys == 0) {
+ 		LOG("could not map DSI%u (%p) or get a DMA buffer below 4 GiB (phys 0x%llx)",
+@@ -272,9 +285,8 @@ sweet_bl_take_fb(const OSSymbol *key, OSObject *value)
+ 	uint64_t v = n->unsigned64BitValue(), milli = v >= 0x10000 ? (v * 1000) >> 16 : v * 1000;
+ 	uint32_t dbv = sweet_bl_dbv(milli, (uint64_t)sweet_bl_nits * 1000);
+ 
+-	LOG("iOS: IOMFBBrightnessLevel %llu -> %llu.%03llu nits -> DBV %u (full scale %u nits)",
++	LOG("iOS: IOMFBBrightnessLevel %llu -> %llu.%03llu nits (DBV %u at full scale %u nits; not sent, 0148)",
+ 	    v, milli / 1000, milli % 1000, dbv, sweet_bl_nits);
+-	(void)sweet_backlight_set(dbv);
+ 	return true;
+ }
+ 
+@@ -412,7 +424,7 @@ sweet_bl_selftest(void *arg, wait_result_t)
+ extern "C" void
+ sweet_backlight_init(IOService *fb)
+ {
+-	unsigned level = 0, which = 0, cmd = 0x51;
++	unsigned level = 0, which = 0, cmd = 0x51, svc = 1;
+ 	thread_t t;
+ 
+ 	sweet_bl_fb = fb;
+@@ -423,6 +435,10 @@ sweet_backlight_init(IOService *fb)
+ 	PE_parse_boot_argn("sweetblcmd", &cmd, sizeof(cmd));
+ 	sweet_bl_which = which ? 1 : 0;
+ 	sweet_bl_cmd = cmd & 0xff;
++	PE_parse_boot_argn("sweetblsvc", &svc, sizeof(svc));
++	if (svc != 0) {
++		(void)sweet_backlight_service();        /* 0148: CoreBrightness's backlight, from boot */
++	}
+ 	if (!PE_parse_boot_argn("sweetbl", &level, sizeof(level)) || level == 0) {
+ 		return;         /* no self-test asked for; `sysctl kern.sweetbl=N` still works */
+ 	}

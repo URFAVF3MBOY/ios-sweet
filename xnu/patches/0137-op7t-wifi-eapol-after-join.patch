@@ -1,0 +1,137 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 04:20:00 +0000
+Subject: [PATCH] op7t-0137: answer EAPOL-Key frames after the join (group rekey, message 3 again)
+
+w_eapol_rx dropped every EAPOL-Key frame once the link was up. So the AP's
+group key handshake (most routers rekey the group key every 10-60 minutes)
+went unanswered, and so did a message 3 sent again because our message 4 was
+lost; in both cases the AP retries, gives up and deauthenticates the phone:
+the random Wi-Fi drops of STATE 2026-10-24. Now, while up: group key message 1
+-> unwrap, install the new GTK, send message 2 (protected); message 3 again ->
+message 4 again (protected), keys kept; a new pairwise handshake (PTK rekey)
+is logged as unsupported. Replay counters and MICs are checked as before.
+Log: "wpa: group key rekey: ...", "wpa: message 3 again while up ...".
+The handshake functions were syntax-checked with clang++ -Wall -Wextra.
+
+Apply after 0136.
+---
+ iokit/Kernel/arm/SweetModem.cpp | 78 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 67 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index 742ae44..6231ccc 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -4639,7 +4639,7 @@ w_tx_ether(const uint8_t *e, size_t len, bool clear)
+ static void w_join_end(int result);
+ 
+ static void
+-w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t dlen)
++w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t dlen, bool clear = true)
+ {
+ 	uint8_t e[14 + 4 + 95 + 64] = {}, *k = e + 14 + 4, mic[20];
+ 	memcpy(e, s_bssid, 6);
+@@ -4669,7 +4669,24 @@ w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t
+ 	}
+ 	w_hmac_sha1(s_ptk, 16, e + 14, 4 + body, NULL, 0, NULL, 0, mic);
+ 	memcpy(k + 77, mic, 16);
+-	(void)w_tx_ether(e, 14 + 4 + body, true);
++	(void)w_tx_ether(e, 14 + 4 + body, clear);
++}
++
++/*
++ * 0137: the GTK out of unwrapped EAPOL key data (the GTK KDE: dd len 00-0f-ac 01, key id, 0, key).
++ * Shared by message 3 and the group key handshake.
++ */
++static void
++w_gtk_from(const uint8_t *plain, uint32_t plen, uint8_t gtk[32], uint8_t *gtk_len, uint8_t *gtk_idx)
++{
++	for (uint32_t o = 0; o + 2 <= plen && o + 2 + plain[o + 1] <= plen; o += 2 + plain[o + 1]) {
++		if (plain[o] == 0xDD && plain[o + 1] >= 6 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0F &&
++		    plain[o + 4] == 0xAC && plain[o + 5] == 0x01) {
++			*gtk_idx = plain[o + 6] & 3;
++			*gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
++			memcpy(gtk, plain + o + 8, *gtk_len);
++		}
++	}
+ }
+ 
+ static bool
+@@ -4691,7 +4708,14 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ {
+ 	uint8_t frame[512];
+ 	const uint8_t *src = e + 6;
+-	if (s_state != S_4WAY || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) || memcmp(src, s_bssid, 6) != 0) {
++	/*
++	 * 0137: also once up. Before, every EAPOL-Key after the join was dropped: the AP's group key
++	 * rekey (every 10-60 min on most routers) went unanswered, and so did a message 3 sent again
++	 * because our message 4 was lost; either way the AP gives up and deauthenticates us -- the
++	 * "Wi-Fi drops randomly" of 2026-10-24.
++	 */
++	if ((s_state != S_4WAY && s_state != S_UP) || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) ||
++	    memcmp(src, s_bssid, 6) != 0) {
+ 		return;
+ 	}
+ 	size_t len = elen - 14;
+@@ -4709,6 +4733,45 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ 		return;
+ 	}
+ 	bool pairwise = info & 0x0008, ack = info & 0x0080, has_mic = info & 0x0100, install = info & 0x0040;
++	if (s_state == S_UP) {
++		/* 0137: after the join, with the keys we have */
++		if (!has_mic || !ack || !s_ptk_set) {
++			if (pairwise) {
++				LOG("t=%u ms: wpa: the AP starts a new 4-way handshake while up (rekey): not supported", g_ms);
++			}
++			return;
++		}
++		if (replay <= s_replay) {
++			return;                         /* a copy of one already answered */
++		}
++		if (!w_eapol_mic_ok(frame, len)) {
++			LOG("t=%u ms: wpa: EAPOL-Key while up with a wrong MIC (info %04x): ignored", g_ms, info);
++			return;
++		}
++		s_replay = replay;
++		if (pairwise && install) {
++			/* message 3 again: our message 4 was lost; send it again (now protected), keep the keys */
++			w_eapol_send(0x030A, NULL, NULL, 0, false);
++			LOG("t=%u ms: wpa: message 3 again while up -> message 4 again", g_ms);
++			return;
++		}
++		if (!pairwise && (info & 0x1000)) {
++			/* group key handshake message 1: the new GTK -> install it, answer with message 2 */
++			uint8_t plain[256], gtk[32], gtk_len = 0, gtk_idx = 1;
++			if (dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(s_ptk + 16, k + 95, dlen, plain)) {
++				w_gtk_from(plain, (uint32_t)dlen - 8, gtk, &gtk_len, &gtk_idx);
++			}
++			if (gtk_len != 0) {
++				w_install_key(true, gtk_idx, s_group_cipher == 2 ? WMI_CIPHER_TKIP : WMI_CIPHER_CCMP, gtk, gtk_len);
++			}
++			bzero(gtk, sizeof(gtk));
++			bzero(plain, sizeof(plain));
++			w_eapol_send(0x0302, NULL, NULL, 0, false);     /* MIC | Secure, descriptor version 2 */
++			LOG("t=%u ms: wpa: group key rekey: new group key %s (idx %u), message 2 sent", g_ms,
++			    gtk_len ? "installed" : "NOT found", gtk_idx);
++		}
++		return;
++	}
+ 	if (pairwise && ack && !has_mic) {
+ 		/* message 1: ANonce -> PTK, answer with message 2 */
+ 		if (++s_msg1s > 3) {
+@@ -4742,14 +4805,7 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ 		uint8_t plain[256];
+ 		uint8_t gtk[32], gtk_len = 0, gtk_idx = 1;
+ 		if ((info & 0x1000) && dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(s_ptk + 16, k + 95, dlen, plain)) {
+-			for (uint32_t o = 0; o + 2 <= (uint32_t)dlen - 8 && o + 2 + plain[o + 1] <= (uint32_t)dlen - 8; o += 2 + plain[o + 1]) {
+-				if (plain[o] == 0xDD && plain[o + 1] >= 6 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0F &&
+-				    plain[o + 4] == 0xAC && plain[o + 5] == 0x01) {
+-					gtk_idx = plain[o + 6] & 3;
+-					gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
+-					memcpy(gtk, plain + o + 8, gtk_len);
+-				}
+-			}
++			w_gtk_from(plain, (uint32_t)dlen - 8, gtk, &gtk_len, &gtk_idx);   /* (0137: shared) */
+ 		}
+ 		w_eapol_send(0x030A, NULL, NULL, 0);
+ 		IOSleep(5);                             /* message 4 out in the clear before the keys go in */

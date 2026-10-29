@@ -1,0 +1,130 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 08:00:00 +0000
+Subject: [PATCH] op7t-0139: USB recovers from a bus reset or disconnect
+
+2026-10-25: USB enumerated (0138) and SSH ran over the cable, then the phone
+vanished from the PC mid-session and came back neither on replugging nor on
+the PC's side: the driver only cleared the address on a bus reset and only
+printed on a disconnect, so transfers stayed active on endpoint 0 and the
+data endpoints and endpoint 0's state machine stayed wherever the link left
+it; the next enumeration found no SETUP armed.
+Now, as Linux dwc3 (dwc3_gadget_reset_interrupt / _disconnect_interrupt):
+the transfer resource index of every STARTTRANSFER is kept, XferComplete
+marks the transfer over, and a reset or disconnect ends every active
+transfer (ENDTRANSFER, ForceRM), disables the data endpoints, goes back to
+unconfigured (data path and live log wait for SET_CONFIGURATION), and on a
+reset arms endpoint 0 for a new SETUP. Log: "HOTDOGB USB: bus reset: ...".
+The changed functions were syntax-checked with clang -Wall -Wextra.
+
+Apply after 0138.
+---
+ bsd/dev/sweet_usb.c | 54 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b99a91a..843ff0f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -198,6 +198,8 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_ENDTRANSFER      8               /* 0139 */
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+ #define TRB_HWO         (1u << 0)
+@@ -315,6 +317,13 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	return -1;
+ }
+ 
++/*
++ * 0139: which physical endpoints have a transfer the controller still owns, and its transfer
++ * resource index (DEPCMD[22:16] after STARTTRANSFER), so a bus reset or disconnect can end them.
++ */
++static bool ud_active[8];
++static uint32_t ud_res[8];
++
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+@@ -331,7 +340,10 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep < 8) {
++		ud_res[ep] = (dwc_rd(DEPCMD(ep)) >> 16) & 0x7fu;
++		ud_active[ep] = true;
++	}
+ }
+ 
+ static void
+@@ -730,6 +742,40 @@ ud_if_create(void)
+ 	printf("HOTDOGB USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * 0139: a bus reset or a disconnect, as Linux dwc3 handles them (dwc3_gadget_reset_interrupt,
++ * dwc3_gadget_disconnect_interrupt). Before, only the address was cleared: a transfer still on
++ * endpoint 0 or the data endpoints stayed the controller's, endpoint 0's state machine stayed
++ * wherever the cable left it, and the next enumeration found no SETUP armed -- the phone
++ * vanished from the PC and came back neither on replugging nor on the PC's reset (2026-10-25).
++ * Now: end every active transfer (ForceRM), disable the data endpoints, back to unconfigured
++ * (the data path and the live log wait for SET_CONFIGURATION again), and on a reset arm
++ * endpoint 0 for a new SETUP.
++ */
++static void
++ud_bus_reset(bool rearm, const char *why)
++{
++	static const unsigned eps[] = { 0, 1, EP_RX, EP_TX, EP_INT };
++
++	for (unsigned i = 0; i < sizeof(eps) / sizeof(eps[0]); i++) {
++		unsigned ep = eps[i];
++		if (ud_active[ep]) {
++			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | (ud_res[ep] << 16), 0, 0, 0);
++			ud_active[ep] = false;
++		}
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.tx_busy = false;
++	lck_mtx_unlock(ud.lock);
++	ud.data_alt = 0;
++	if (rearm) {
++		ud_start_setup();
++	}
++	printf("HOTDOGB USB: %s: transfers ended, unconfigured%s\n", why, rearm ? ", endpoint 0 armed for SETUP" : "");
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -738,6 +784,7 @@ ud_event(uint32_t ev)
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("HOTDOGB USB: bus reset\n");
++			ud_bus_reset(true, "bus reset");        /* 0139 */
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -748,6 +795,7 @@ ud_event(uint32_t ev)
+ 			printf("HOTDOGB USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("HOTDOGB USB: disconnect\n");
++			ud_bus_reset(false, "disconnect");      /* 0139 */
+ 		}
+ 		return;
+ 	}
+@@ -755,6 +803,10 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep < 8) {
++		ud_active[ep] = false;          /* 0139: XferComplete (one TRB, LST): the transfer is over */
++	}
++
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;

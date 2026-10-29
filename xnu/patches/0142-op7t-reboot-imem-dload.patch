@@ -1,0 +1,139 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 22:00:00 -0400
+Subject: [PATCH] op7t-0142: reboot into fastboot without crashdump; kern.sweetswipe_ms
+
+kern.sweetreboot=2 (0140) ended in Qualcomm crashdump: it wrote the restart
+reason to 0x146aa65c, the SM7150's IMEM (the shim had it from the Redmi). The
+SM8150's is 0x146bf000 (sm8150.dtsi qcom,msm-imem@146bf000, restart_reason@65c),
+so the write hit other on-chip memory. Now the 7T's address, and first, as
+Android's msm-poweroff.c set_dload_mode(0) before every intended reboot,
+TrustZone's download mode off (SCM SVC_BOOT 0x1 / DLOAD_CMD 0x10, args 0, 0;
+the result is logged: "HOTDOGB REBOOT: ... (download mode off: SCM N)").
+kern.sweetswipe_ms (4..33, default 16): the synthetic finger's step; at 16 ms
+the drag itself paces the UI at ~60 updates/s, so a 120 Hz headroom run needs 8.
+Both files syntax-checked with clang -Wall -Wextra on stubs (arm64 for the smc).
+
+Apply after 0141.
+---
+ bsd/dev/sweet_reboot.c | 33 +++++++++++++++++++++++++++++----
+ bsd/dev/sweet_swipe.c  | 26 ++++++++++++++++++++++++--
+ 2 files changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 57a2868..d69cf38 100755
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -2,8 +2,14 @@
+  * 0140: reboot from a root shell, into fastboot or plainly -- so a test run needs no one at the
+  * buttons: sync; sysctl kern.sweetreboot=2, then `fastboot boot` the next image from the PC.
+  *   sysctl kern.sweetreboot=2   the bootloader's restart reason "bootloader" (0x77665500 in IMEM
+- *                               restart_reason@0x146aa65c, as the shim's reset() writes it), then
+- *                               PSCI SYSTEM_RESET: ABL comes up in fastboot
++ *                               restart_reason, SM8150: 0x146bf000 + 0x65c), then PSCI SYSTEM_RESET:
++ *                               ABL comes up in fastboot
++ * 0142: 0140 wrote the reason to 0x146aa65c -- the SM7150's IMEM (the shim had it from the Redmi);
++ * on the 7T that is other on-chip memory, and the reboot ended in Qualcomm crashdump (2026-10-25).
++ * Now the 7T's address (sm8150.dtsi qcom,msm-imem@146bf000, restart_reason@65c), and first what
++ * Android's msm-poweroff.c does before any intended reboot, set_dload_mode(0): TrustZone's
++ * download mode off (SCM SVC_BOOT 0x1 / DLOAD_CMD 0x10, args 0, 0), so the reset is not taken
++ * for a crash. The SCM result is logged; a refusal only means the call is not there.
+  *   sysctl kern.sweetreboot=1   PSCI SYSTEM_RESET alone
+  * No filesystem sync here: run `sync` first. This kernel has no haltRestart of its own
+  * (SweetPlatformExpert), so this is also the only software reboot it has.
+@@ -16,11 +22,28 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define IMEM_PAGE               0x146aa000u
++#define IMEM_PAGE               0x146bf000u     /* 0142: SM8150 (was the SM7150's 0x146aa000) */
+ #define IMEM_RESTART_REASON     0x65cu
+ #define RESTART_BOOTLOADER      0x77665500u
+ #define PSCI_SYSTEM_RESET       0x84000009ull
+ 
++/*
++ * 0142: Qualcomm SCM through SMCCC, as downstream scm_call2_atomic on arm64: fast call, SMC64,
++ * owner SiP, function (service << 8 | command); x1 = arginfo (2 value arguments).
++ */
++static int64_t
++sweet_scm_dload_off(void)
++{
++	register uint64_t x0 __asm__("x0") = 0xC2000000ull | (0x1u << 8) | 0x10u;
++	register uint64_t x1 __asm__("x1") = 2;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)x0;
++}
++
+ /* SMCCC 1.0, as sweet_psci_cpu_on (0065) */
+ static void
+ sweet_psci_system_reset(void)
+@@ -55,7 +78,9 @@ sysctl_sweetreboot SYSCTL_HANDLER_ARGS
+ 		*(volatile uint32_t *)(imem + IMEM_RESTART_REASON) = RESTART_BOOTLOADER;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+-	printf("HOTDOGB REBOOT: %s\n", value == 2 ? "into fastboot" : "plain");
++	int64_t dload = sweet_scm_dload_off();
++	printf("HOTDOGB REBOOT: %s (download mode off: SCM %lld)\n", value == 2 ? "into fastboot" : "plain",
++	    (long long)dload);
+ 	delay(200 * 1000);                      /* (the line out to the persistent log) */
+ 	sweet_psci_system_reset();
+ 	return EIO;                             /* (only if the firmware refused) */
+diff --git a/bsd/dev/sweet_swipe.c b/bsd/dev/sweet_swipe.c
+index 838b193..5a97d5c 100755
+--- a/bsd/dev/sweet_swipe.c
++++ b/bsd/dev/sweet_swipe.c
+@@ -3,6 +3,9 @@
+  *   sysctl kern.sweetswipe=N    swipe left and right between home-screen pages for N seconds
+  *   sysctl kern.sweetswipe=0    stop after the current swipe
+  *   sysctl kern.sweetswipe      seconds left
++ *   sysctl kern.sweetswipe_ms=8 (0142) ms between the finger's moves (4..33, default 16): at 16 ms
++ *                               the drag itself paces the UI at ~60 updates/s, so a headroom run
++ *                               (kern.sweetvsync_hz=120) needs 8 to show more
+  * The swipes go in where the touch controller's do (sweet_hid_touch, SweetHID.cpp): finger 9
+  * (the controller's own fingers count from 0), panel pixels 1080x2400. One swipe: down, 15 moves
+  * 16 ms apart across 720 px at mid-height, up; 350 ms between swipes; the direction alternates,
+@@ -25,7 +28,7 @@ extern kern_return_t thread_terminate(thread_t);
+ #define SWIPE_RIGHT_X   900
+ #define SWIPE_LEFT_X    180
+ #define SWIPE_STEPS     15
+-#define SWIPE_STEP_MS   16u
++static volatile uint32_t swipe_step_ms = 16;    /* 0142: kern.sweetswipe_ms */
+ #define SWIPE_PAUSE_MS  350u
+ 
+ static volatile uint64_t swipe_deadline;        /* mach absolute time; 0: stop */
+@@ -43,7 +46,7 @@ swipe_thread(__unused void *arg, __unused wait_result_t wr)
+ 
+ 		for (int i = 0; i <= SWIPE_STEPS; i++) {
+ 			sweet_hid_touch(SWIPE_FINGER, 1, from + (to - from) * i / SWIPE_STEPS, SWIPE_Y);
+-			delay_for_interval(SWIPE_STEP_MS, (uint32_t)NSEC_PER_MSEC);
++			delay_for_interval(swipe_step_ms, (uint32_t)NSEC_PER_MSEC);
+ 		}
+ 		sweet_hid_touch(SWIPE_FINGER, 0, to, SWIPE_Y);
+ 		swipe_count++;
+@@ -95,4 +98,23 @@ sysctl_sweetswipe SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetswipe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetswipe, "I",
+     "synthetic home-screen swipes for N seconds (0140)");
++static int
++sysctl_sweetswipe_ms SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)swipe_step_ms, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value < 4 || value > 33) {
++		return EINVAL;
++	}
++	swipe_step_ms = (uint32_t)value;
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetswipe_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetswipe_ms, "I",
++    "ms between the synthetic finger's moves, 4..33 (0142)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

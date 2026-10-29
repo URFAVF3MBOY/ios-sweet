@@ -1,0 +1,126 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sat, 24 Oct 2026 19:30:00 +0000
+Subject: [PATCH] op7t-0126: WLAN join: create the BSS peer before VDEV_START
+
+Boots 2026-10-24 (0124/0125): wifid lists networks and asks to join, but every
+join fails 2 ms in with "VDEV_START_RESP ... status -1", before authentication,
+on every network (open and WPA2) and both bands. Not the passphrase, security or
+channel: the firmware refuses to start the vdev at all.
+
+Decoded in the 7T's own modem_a wlanmdsp.mbn (WLAN.HL.3.2.0.c2-00006): the
+VDEV_START handler (b0039fc8) returns status -1 when the vdev's internal
+BSS-peer field (<vdev>+0xc) is null and the vdev is a station/AP. 0124/0125
+created the AP peer only AFTER a good start, so that field was always null.
+ath10k has the peer in place first.
+
+0126 creates the BSS peer before VDEV_START (w_join_begin), deletes it on
+teardown whatever state the join reached (so retries do not leak it), and skips
+the later duplicate create. Boot-args: sweetwlanpeerfirst=0 restores the old
+order for comparison; sweetwlanselfpeer=1 additionally creates a self-peer
+(own MAC) first, for the case the firmware wants the vdev's own peer.
+
+The VDEV_START_RESP fields are already logged (0125), so the next boot shows
+status 0 (then auth/assoc/4-way proceed) or the new failure point.
+
+Apply after 0125.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -4237,6 +4237,7 @@
+ static uint8_t s_body[768];                     /* the AP's beacon IEs */
+ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s;
+ static bool s_rsn, s_start_resp, s_ptk_set;
++static bool s_peer_made, s_selfpeer_made;       /* 0126: peers already created for this join */
+ static int32_t s_start_status;
+ static uint8_t s_assoc_req[512];
+ static uint32_t s_assoc_req_len;
+@@ -4380,11 +4381,11 @@
+ }
+ 
+ static bool
+-w_peer(uint32_t cmd, uint16_t tag, bool create)
++w_peer_addr(uint32_t cmd, uint16_t tag, const uint8_t *mac, bool create)
+ {
+ 	uint8_t m[4 + 16] = {}, *p = wmi_put_tlv(m, tag, create ? 16 : 12);
+ 	p = w_p32(p, 0);
+-	p = w_pmac(p, s_bssid);
++	p = w_pmac(p, mac);
+ 	if (create) {
+ 		w_p32(p, 0);
+ 	}
+@@ -4392,6 +4393,12 @@
+ }
+ 
+ static bool
++w_peer(uint32_t cmd, uint16_t tag, bool create)
++{
++	return w_peer_addr(cmd, tag, s_bssid, create);
++}
++
++static bool
+ w_peer_param(uint32_t param, uint32_t value)
+ {
+ 	uint8_t m[4 + 20], *p = wmi_put_tlv(m, TAG_PEER_SET_PARAM, 20);
+@@ -4728,11 +4735,16 @@
+ 		if (s_state >= S_4WAY) {
+ 			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+ 		}
+-		if (s_state >= S_AUTH) {
+-			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
+-		}
+ 		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	}
++	if (s_peer_made) {                          /* 0126: the peer can now exist from before start */
++		w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
++		s_peer_made = false;
++	}
++	if (s_selfpeer_made) {
++		w_peer_addr(CMD_PEER_DELETE, TAG_PEER_DELETE, our_mac, false);
++		s_selfpeer_made = false;
++	}
+ 	if (s_state == S_UP) {
+ 		w_link(false);
+ 	}
+@@ -4807,6 +4819,30 @@
+ 	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
+ 	w_ps_off();
++	/*
++	 * 0126: create the BSS peer BEFORE VDEV_START.
++	 * Decoded from the 7T's own wlanmdsp.mbn (WLAN.HL.3.2.0.c2-00006): the firmware's VDEV_START
++	 * handler (b0039fc8) rejects the start with status -1 when the vdev's internal BSS-peer field
++	 * (<vdev>+0xc) is still null and the vdev type is station/AP. 0124/0125 created the AP peer
++	 * only AFTER a successful start, so that field was always null -> "VDEV_START_RESP ... status
++	 * -1" (boots 2026-10-24 14:50 and 15:05, every network, open and WPA2, both bands). ath10k
++	 * has the peer in place before it starts the vdev. Boot-arg sweetwlanpeerfirst=0 restores the
++	 * old order (peer after start) for comparison. sweetwlanselfpeer=1 also makes a self-peer
++	 * (our own MAC) first, in case the firmware wants the vdev's own peer rather than the AP's.
++	 */
++	unsigned peer_first = 1, self_peer = 0;
++	(void)PE_parse_boot_argn("sweetwlanpeerfirst", &peer_first, sizeof(peer_first));
++	(void)PE_parse_boot_argn("sweetwlanselfpeer", &self_peer, sizeof(self_peer));
++	s_peer_made = false;
++	if (self_peer) {
++		s_selfpeer_made = w_peer_addr(CMD_PEER_CREATE, TAG_PEER_CREATE, our_mac, true);
++		LOG("t=%u ms: join: self-peer (own MAC) before start: %s", g_ms, s_selfpeer_made ? "sent" : "FAILED");
++	}
++	if (peer_first) {
++		s_peer_made = w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
++		LOG("t=%u ms: join: BSS peer %02x:%02x:%02x:**:**:** before start: %s", g_ms,
++		    s_bssid[0], s_bssid[1], s_bssid[2], s_peer_made ? "sent" : "FAILED");
++	}
+ 	if (!w_vdev_start(s_freq, bcn, dtim)) {
+ 		w_join_end(EIO);
+ 		return;
+@@ -4913,7 +4949,9 @@
+ 			}
+ 			s_state = S_AUTH;
+ 			s_tries = 1;
+-			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
++			if (!s_peer_made) {                 /* 0126: only if it was not created before start */
++				s_peer_made = w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
++			}
+ 			w_send_auth();
+ 			s_deadline = g_ms + 400;
+ 		} else if (g_ms > s_deadline) {

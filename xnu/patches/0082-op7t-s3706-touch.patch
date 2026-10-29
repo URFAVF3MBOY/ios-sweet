@@ -1,0 +1,615 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,9 +1,27 @@
+ /*
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+- * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * OnePlus 7T (hotdogb, SM8150) bring-up: Synaptics S3706 touch over GENI I2C.
++ * Polled design. Call once after the scheduler is running; one thread.
++ *
++ * Hardware (from the 7T DTB / OnePlus sm8150 kernel sources):
++ *   bus    qupv3 wrapper 2, SE at 0xc80000 (DT i2c@0xc80000), I2C addr 0x20
++ *          pins gpio55/56, TLMM function 1 ("qup17"), 2 mA, no bias
++ *          GCC: S_AHB/M_AHB/S0 votes in 0x52014 (bits 1/2/4),
++ *               halt regs 0x1e008/0x1e004/0x1e144, S0 RCG cmd at 0x1e148
++ *   TLMM   gpio N config = 0x03000000 + SOUTH(0xd00000) + N * 0x1000
++ *          (gpio55/56/80/119/122 are all in the SOUTH tile)
++ *   rails  PM8150 L17 "ldoa17" via sweet_rpmh_vreg_enable (3008 mV),
++ *          gpio119 = 1.8 V enable, gpio80 = reset (active low),
++ *          gpio122 = interrupt (active low, used only as a hint)
++ *   panel  1080x2400
++ * Protocol: Synaptics RMI4. Function bases are read from the PDT
++ * (page 0, 6-byte entries from 0xe9 downward: query, cmd, ctrl, data,
++ * int/ver, function). F12 data+0 holds ten 8-byte finger records:
++ * [0]=type (0 none, 1 finger, 2 stylus, ...) [1..2]=x [3..4]=y [5]=z.
++ * The F12 bit in the F01 interrupt-status byte follows PDT scan order
++ * (F34 b0, F01 b1, F12 b2 = 0x04, same as the vendor driver).
++ * NOTE: the vendor's "attention" register at F12+3 overlaps finger 0's
++ * record in this layout, so presence comes from each record's type byte.
++ * Needs the GENI I2C firmware already loaded in the SE by XBL/TZ.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -22,21 +40,28 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
++#define TOUCH_SE_PA      0x00c80000u
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_TLMM_PA    0x03d00000u /* DT TLMM 0x03000000 + SOUTH 0xd00000 */
++#define TOUCH_TLMM_LEN   0x00080000u /* gpio0..126 */
++#define TOUCH_GCC_VOTE   0x52014u    /* WRAP2: S_AHB b1, M_AHB b2, S0 b4 */
++#define TOUCH_VOTE_MASK  ((1u << 1) | (1u << 2) | (1u << 4))
++#define TOUCH_RCG        0x1e148u    /* gcc_qupv3_wrap2_s0_clk_src */
++#define TOUCH_BR_MAHB    0x1e004u
++#define TOUCH_BR_SAHB    0x1e008u
++#define TOUCH_BR_S0      0x1e144u
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
++
++#define PIN_SDA          55u
++#define PIN_SCL          56u
++#define PIN_RESET        80u
++#define PIN_VIO_EN       119u
++#define PIN_IRQ          122u
++#define RMI_ADDR         0x20u
++#define PANEL_W          1080
++#define PANEL_H          2400
+ 
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+@@ -74,10 +99,12 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
+-	int kind, irq_hint;
++	int irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+-	unsigned sent, got;
++	unsigned sent, got, dumps, quiet;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
++	uint8_t f01_query, f01_ctrl, f01_data, f12_data, f12_irq;
++	int slow, force;
+ } st;
+ static int touch_sleep_chan;
+ 
+@@ -118,6 +145,8 @@
+ 	return false;
+ }
+ 
++/* TLMM: cfg[1:0]=pull (0 none, 3 up), [5:2]=function, [8:6]=drive
++ * ((mA/2)-1), [9]=output enable. io[0]=input level, io[1]=output latch. */
+ static void
+ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
+@@ -136,9 +165,8 @@
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
++	/* Vote only WRAP2 S_AHB, M_AHB and S0, preserving other clock users. */
++	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | TOUCH_VOTE_MASK);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+ 	printf("HOTDOGB TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+@@ -160,13 +188,17 @@
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	/* S_AHB has hardware clock gating (CBCR bit 1): CLK_OFF legitimately reads 1
++	 * while the bus is idle (seen as 0x80000002), so it is not a failure. */
++	const struct { uint32_t reg; bool hwgated; const char *name; } branches[] = {
++		{TOUCH_BR_MAHB, false, "m_ahb"}, {TOUCH_BR_SAHB, true, "s_ahb"},
++		{TOUCH_BR_S0, false, "s0"},
++	};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("HOTDOGB TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
+-		}
++		bool on = touch_wait_clear(st.gcc, branches[i].reg, 1u << 31);
++		printf("HOTDOGB TOUCH: branch %s %#x = %#x%s\n", branches[i].name, branches[i].reg,
++		    touch_rd(st.gcc, branches[i].reg),
++		    on ? "" : (branches[i].hwgated ? " (hw-gated idle, ok)" : " HALTED; continuing"));
+ 	}
+ 	return true;
+ }
+@@ -218,7 +250,7 @@
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
++		st.dead = true; /* no other SE0 owner is supported */
+ 		return EBUSY;
+ 	}
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+@@ -233,7 +265,7 @@
+ 			err = (irq & SE_NACK) ? ENXIO : EIO;
+ 			/* A completed NACK is normal during address probing. Aborting an
+ 			 * idle sequencer may never produce ABORT_DONE. Wait for completion
+-			 * and leave a clean idle engine available for the other IC. */
++			 * and leave a clean idle engine. */
+ 			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+ 				delay(1);
+ 				irq = touch_irq();
+@@ -296,73 +328,104 @@
+ 	st.sent = st.got = 0;
+ 	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+-		printf("HOTDOGB TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		printf("HOTDOGB TOUCH: xfer addr=%#x %s len=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    addr, nr ? "read" : "write", nr ? nr : nt,
+ 		    err, st.irq_last, st.irq_status, st.sent, st.got,
+ 		    touch_rd(st.se, SE_STATUS));
+ 	}
+ 	return err;
+ }
+ 
++/* ---- RMI4 over I2C. All registers used here live on page 0. ---- */
++
+ static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
+ {
+-	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+-	    NULL, 0, true);
++	/* Pointer write with STOP_STRETCH keeps the bus for a repeated START. */
++	int err = touch_msg(RMI_ADDR, &reg, 1, NULL, 0, true);
+ 	if (err) {
+ 		return err;
+ 	}
+-	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
++	return touch_msg(RMI_ADDR, NULL, 0, buf, len, false);
+ }
+ 
+ static int
+-touch_goodix_ack(void)
++rmi_write(uint8_t reg, uint8_t val)
+ {
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
++	const uint8_t tx[2] = {reg, val};
++	return touch_msg(RMI_ADDR, tx, 2, NULL, 0, false);
+ }
+ 
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
+ static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
++rmi_probe(void)
+ {
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("HOTDOGB TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
++	uint8_t e[6];
++	unsigned irq_bit = 0;
++	st.f01_query = st.f01_ctrl = st.f01_data = st.f12_data = st.f12_irq = 0;
++	int err = rmi_write(0xff, 0); /* page 0 */
++	if (err) {
++		printf("HOTDOGB TOUCH: page-select write failed err=%d\n", err);
++		return err;
++	}
++	for (unsigned a = 0xe9; a >= 0x0b; a -= 6) {
++		err = rmi_read((uint8_t)a, e, sizeof(e));
++		if (err) {
++			printf("HOTDOGB TOUCH: PDT read @%#x failed err=%d\n", a, err);
++			return err;
++		}
++		if (e[5] == 0 || e[5] == 0xff) {
++			break;
++		}
++		printf("HOTDOGB TOUCH: PDT @%#x fn=F%02x query=%#x cmd=%#x ctrl=%#x data=%#x\n",
++		    a, e[5], e[0], e[1], e[2], e[3]);
++		if (e[5] == 0x01) {
++			st.f01_query = e[0];
++			st.f01_ctrl = e[2];
++			st.f01_data = e[3];
++		} else if (e[5] == 0x12) {
++			st.f12_data = e[3];
++			if (e[4] & 7u) {
++				st.f12_irq = (uint8_t)(((1u << (e[4] & 7u)) - 1u) << irq_bit);
+ 			}
+-			printf("HOTDOGB TOUCH: probe raw %#x: %s\n", reg + off, line);
+ 		}
++		irq_bit += e[4] & 7u;
+ 	}
+-	return err;
+-}
+-
+-static unsigned
+-touch_be16(const uint8_t *p)
+-{
+-	return ((unsigned)p[0] << 8) | p[1];
++	if (!st.f12_irq) {
++		st.f12_irq = 0x04; /* vendor value */
++	}
++	if (!st.f01_data || !st.f12_data) {
++		printf("HOTDOGB TOUCH: F01/F12 not in PDT (f01 data=%#x f12 data=%#x); IC in bootloader or unpowered?\n",
++		    st.f01_data, st.f12_data);
++		return ENODEV;
++	}
++	uint8_t pid[11] = {0};
++	if (!rmi_read((uint8_t)(st.f01_query + 11u), pid, 10)) {
++		printf("HOTDOGB TOUCH: F01 product id \"%s\"\n", (char *)pid);
++	}
++	printf("HOTDOGB TOUCH: F01 query=%#x ctrl=%#x data=%#x, F12 data=%#x irq-mask=%#x\n",
++	    st.f01_query, st.f01_ctrl, st.f01_data, st.f12_data, st.f12_irq);
++	return 0;
+ }
+ 
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
++static int
++rmi_configure(void)
+ {
+-	if (len < 2) {
+-		return false;
++	uint8_t c0 = 0, s[2] = {0, 0};
++	int err = rmi_read(st.f01_ctrl, &c0, 1);
++	if (err) {
++		return err;
+ 	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
++	/* Normal sleep mode, no-sleep, configured. */
++	err = rmi_write(st.f01_ctrl, (uint8_t)((c0 & ~0x03u) | 0x84u));
++	if (!err) {
++		err = rmi_write((uint8_t)(st.f01_ctrl + 1u), 0x7f); /* all sources, as vendor */
+ 	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
++	if (!err) {
++		err = rmi_read(st.f01_data, s, 2); /* clears pending interrupt bits */
++	}
++	printf("HOTDOGB TOUCH: configure ctrl0 %#x->%#x err=%d status=%#x irq=%#x\n",
++	    c0, (c0 & ~0x03u) | 0x84u, err, s[0], s[1]);
++	return err;
+ }
+ 
+ static void
+@@ -384,104 +447,57 @@
+ }
+ 
+ static int
+-touch_goodix(void)
++touch_s3706(void)
+ {
+-	uint8_t buf[90];
++	uint8_t s[2], buf[8 * TOUCH_MAX];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
++	/* Device status + interrupt status; the read acknowledges them. */
++	int err = rmi_read(st.f01_data, s, 2);
+ 	if (err) {
+ 		return err;
+ 	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
++	if (s[0] & 0x80u) { /* unconfigured: IC reset itself */
++		printf("HOTDOGB TOUCH: IC reports unconfigured (%#x); reconfiguring\n", s[0]);
++		touch_report(0, st.x, st.y);
++		return rmi_configure();
++	}
++	if (s[0] & 0x0fu) {
++		return EIO; /* device status error code */
++	}
++	/* New frame, or a contact is down (a missed release must not stick),
++	 * or sweettouchforce=1 for bring-up when the interrupt bit is doubtful. */
++	if (!(s[1] & st.f12_irq) && !st.active && !st.force) {
++		return 0;
+ 	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
+-	return err;
+-}
+-
+-static int
+-touch_focaltech(void)
+-{
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
++	err = rmi_read(st.f12_data, buf, sizeof(buf));
+ 	if (err) {
+ 		return err;
+ 	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
+-		}
+-		if (seen & (1u << id)) {
+-			return EIO;
+-		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
+-		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
++		const uint8_t *p = buf + 8u * i;
++		/* 1 finger, 2 stylus, 4 unclassified, 6 glove; skip none/palm/hover. */
++		if (!(p[0] == 1 || p[0] == 2 || p[0] == 4 || p[0] == 6)) {
++			continue;
++		}
++		int px = ((p[2] & 0x0f) << 8) | p[1];
++		int py = ((p[4] & 0x0f) << 8) | p[3];
++		if (px >= PANEL_W) {
++			px = PANEL_W - 1;
++		}
++		if (py >= PANEL_H) {
++			py = PANEL_H - 1;
++		}
++		mask |= 1u << i;
++		x[i] = px;
++		y[i] = py;
++	}
++	if (st.dumps < 16 && (mask || st.active)) { /* raw frames for calibration */
++		++st.dumps;
++		printf("HOTDOGB TOUCH: f12 irq=%#x mask=%#x: %02x %02x %02x %02x %02x %02x %02x %02x"
++		    " | %02x %02x %02x %02x %02x %02x %02x %02x\n", s[1], mask,
++		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
++		    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+@@ -492,17 +508,17 @@
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+ 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("HOTDOGB TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	printf("HOTDOGB TOUCH: se0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("HOTDOGB TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
++		printf("HOTDOGB TOUCH: SE0 has no usable I2C firmware / 32-bit FIFOs; probes skipped\n");
+ 		return false;
+ 	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("HOTDOGB TOUCH: SE7 already busy; probes skipped\n");
++		printf("HOTDOGB TOUCH: SE0 already busy; probes skipped\n");
+ 		return false;
+ 	}
+ 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+@@ -516,8 +532,15 @@
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+ 	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	/* Linux geni_i2c_clk_map with the 19.2 MHz XO: 100 kHz = div 7, t_high 10,
++	 * t_low 11, t_cycle 26; 400 kHz = div 2, 5, 12, 24 (SCL = src/div/t_cycle). */
++	if (st.slow) {
++		touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++		touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);
++	} else {
++		touch_wr(st.se, SE_MCLK, (2u << 4) | 1u);
++		touch_wr(st.se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	}
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+ 	touch_wr(st.se, 0x254, 0);
+ 	touch_wr(st.se, 0x260, SE_PACK0);
+@@ -548,74 +571,63 @@
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	unsigned delay_s = 45;
++	unsigned delay_s = 10;
+ 	(void)arg;
+ 	(void)result;
+-	/*
+-	 * Start late (boot-arg sweettouchdelay, seconds): if the bus access
+-	 * below hangs the SoC, the persistent log and the GUI got there first.
+-	 */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+-	printf("HOTDOGB TOUCH: starting in %u s\n", delay_s);
++	printf("HOTDOGB TOUCH: 7T S3706 starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("HOTDOGB TOUCH: mapping GCC/TLMM/SE7\n");
++	printf("HOTDOGB TOUCH: mapping GCC/TLMM/SE0\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.gpio = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_LEN);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("HOTDOGB TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
++	printf("HOTDOGB TOUCH: TLMM sda=%#x scl=%#x reset=%#x irq=%#x vio=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(PIN_SDA)), touch_rd(st.gpio, TOUCH_GPIO_CFG(PIN_SCL)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(PIN_RESET)), touch_rd(st.gpio, TOUCH_GPIO_IO(PIN_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(PIN_VIO_EN)));
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("HOTDOGB TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+-	if (power_error) {
+-		printf("HOTDOGB TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+-		goto out;
+-	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
++	/* Hold the IC in reset while its rails come up; IRQ stays an input. */
++	touch_gpio(PIN_IRQ, 0, 3, 0, false, false);
++	touch_gpio(PIN_RESET, 0, 0, 0, true, false);
++	int perr = sweet_rpmh_vreg_enable("ldoa17", 3008);
++	printf("HOTDOGB TOUCH: L17 (2.8 V) RPMh vote err=%d%s\n", perr,
++	    perr ? " -- rail may be OFF, check sweet_rpmh.c accepts ldoa17" : "");
++	touch_gpio(PIN_VIO_EN, 0, 0, 0, true, true); /* 1.8 V enable */
++	touch_wait(20);
++	touch_gpio(PIN_SDA, 1, 0, 0, false, false); /* qup17, 2 mA, no bias */
++	touch_gpio(PIN_SCL, 1, 0, 0, false, false);
++	touch_gpio(PIN_RESET, 0, 0, 0, true, false);
++	touch_wait(10);
++	touch_gpio(PIN_RESET, 0, 0, 0, true, true); /* release reset */
++	touch_wait(250); /* vendor waits 80 ms; be generous */
+ 	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("HOTDOGB TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("HOTDOGB TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
++	int rerr = ENODEV;
++	for (unsigned tries = 0; tries < 3 && rerr && !st.dead; ++tries) {
++		rerr = rmi_probe();
++		if (rerr) {
++			touch_wait(200);
++		}
++	}
+ 	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		printf("HOTDOGB TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
++	if (rerr || st.dead) {
++		printf("HOTDOGB TOUCH: RMI probe failed (err=%d dead=%d); stopping\n", rerr, st.dead);
+ 		goto out;
+ 	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("HOTDOGB TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
++	(void)rmi_configure();
++	printf("HOTDOGB TOUCH: S3706 ready, %dx%d, poll=10ms irq-hint=%d\n",
++	    PANEL_W, PANEL_H, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
++		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++			int err = touch_s3706();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("HOTDOGB TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+@@ -629,10 +641,9 @@
+ 		}
+ 		touch_wait(10);
+ 	}
+-	touch_report(0, st.x, st.y);
+ out:
+-	(void)thread_terminate(current_thread());
+-	thread_block(THREAD_CONTINUE_NULL);
++	printf("HOTDOGB TOUCH: thread exiting\n");
++	thread_terminate(current_thread());
+ }
+ 
+ void
+@@ -646,6 +657,8 @@
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweettouchslow", &st.slow, sizeof(st.slow));
++	(void)PE_parse_boot_argn("sweettouchforce", &st.force, sizeof(st.force));
+ 	if (!enabled) {
+ 		printf("HOTDOGB TOUCH: disabled (sweettouch=0)\n");
+ 		return;

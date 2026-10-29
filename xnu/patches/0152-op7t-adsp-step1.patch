@@ -1,0 +1,961 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 05:00:00 -0400
+Subject: [PATCH] op7t-0152: audio DSP, step 1: started, GLINK, QRTR hello, APR state
+
+Step 1 of sound on the 7T: start the audio DSP (LPASS Hexagon, "adsp")
+and speak to it as far as APR. Port of hackios-xnu-kernel's
+redwood_adsp.c (POCO X5 Pro) onto SweetModem.cpp's SM8150 helpers
+(TrustZone PIL, the modem partition's FAT where image/adsp.mdt and
+adsp.b00..b14 are, SMEM, AOP mailbox, RPMh), with a second small GLINK of
+its own so the modem's (Wi-Fi) is untouched. 7T numbers from its DT:
+PAS id 1, carveout 0x8BE00000+0x1E00000, SMP2P items 443/429 (pid 2,
+APCS IPC bit 10), GLINK edge pid 2 APCS bit 8, channels IPCRTR and
+apr_audio_svc; AOP load_state adsp, cx.lvl 0x181.
+Sequence: refuse if the DSP has run since power-on (its SMP2P item 429
+exists), load + authenticate, our SMP2P item, wait for slave-kernel READY
+(or FATAL + crash reason, item 423), GLINK version/open/intents, answer
+QRTR HELLO, then AVCS_CMD_ADSP_EVENT_GET_STATE every 500 ms until the
+audio services say up, then AVCS_GET_VERSIONS. Everything logged as
+"SweetModem: adsp: ...".
+Started only from a root shell: sysctl kern.sweetadsp=1 (bsd/dev/
+sweet_adsp.c), once per boot, needs sweetmodem=1; reading it gives the
+stage reached (0..6, negative = stopped there). Polled, no interrupts, no
+LPASS register is touched.
+Stub-compiled with g++ -Wall -Wextra (helpers and kernel calls stubbed).
+
+Apply after 0151.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a8dbd6d..e3fb063 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@ bsd/dev/sweet_swipe.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_vsync.c			standard
+ bsd/dev/sweet_bl.c			standard
++bsd/dev/sweet_adsp.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+new file mode 100644
+index 0000000..a581e77
+--- /dev/null
++++ b/bsd/dev/sweet_adsp.c
+@@ -0,0 +1,36 @@
++/*
++ * 0152: the audio DSP from a root shell (iokit/Kernel/arm/SweetModem.cpp does the work).
++ *   sysctl kern.sweetadsp=1     start it (once per boot; needs sweetmodem=1 for the mappings)
++ *   sysctl kern.sweetadsp       how far it got: 0 not started, 1 mappings, 2 firmware, 3 started,
++ *                               4 up (SMP2P READY), 5 apr_audio_svc open, 6 audio services up;
++ *                               negative: stopped at that stage (the log says why)
++ * Writing needs root.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++extern int sweet_adsp_start(void);
++extern int sweet_adsp_stage(void);
++
++static int
++sysctl_sweetadsp SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = sweet_adsp_stage(), changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != 1) {
++		return EINVAL;
++	}
++	error = sweet_adsp_start();
++	printf("SweetModem: adsp: sysctl kern.sweetadsp=1 -> %d\n", error);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetadsp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetadsp, "I",
++    "1: start the audio DSP (0152); reads how far it got");
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index 6231ccc..b037ff3 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6114,6 +6114,875 @@ sweet_modem_init(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- audio DSP (0152) */
++
++/*
++ * 0152: the audio DSP (LPASS's Hexagon, Android's "adsp"), step 1 of sound on the 7T: started the
++ * way the modem is above, and spoken to as far as APR, the protocol the audio services use. Port
++ * of hackios-xnu-kernel's redwood_adsp.c (POCO X5 Pro) onto this file's SM8150 helpers (TrustZone,
++ * the modem partition's FAT, SMEM, the AOP mailbox, RPMh); a second, smaller GLINK of its own so
++ * that nothing of the modem's (Wi-Fi) changes. The 7T's numbers, from its device tree:
++ *   qcom,lpass@17300000: pas-id 1, firmware "adsp" (modem partition image/adsp.mdt, adsp.b00..b14),
++ *     memory-region pil_adsp_region 0x8BE00000 + 0x1E00000, vdd_cx 0x181, qcom,signal-aop
++ *   qcom,smp2p-adsp@1799000c: SMEM items 443 (ours) and 429 (its), remote pid 2, APCS IPC bit 10
++ *   glink edge "adsp" (label lpass): remote pid 2, APCS IPC bit 8; channels IPCRTR and
++ *     apr_audio_svc (intents 0x200 x 20)
++ * Started only on request, never at boot: `sysctl kern.sweetadsp=1` (bsd/dev/sweet_adsp.c), once
++ * per boot, and only with the modem path's mappings up (sweetmodem=1). Every step logs
++ * "SweetModem: adsp: ...". Polled, no interrupts. Nothing here touches an LPASS register (the
++ * DSP owns that block: reading one from here ends in an external abort, redwood_adsp.c).
++ */
++#define ADSP_PAS_ID         1
++#define ADSP_CARVEOUT       0x8BE00000u
++#define ADSP_CARVEOUT_SIZE  0x01E00000u
++#define ADSP_PID            2
++#define ADSP_ITEM_SMP2P_OUT 443
++#define ADSP_ITEM_SMP2P_IN  429
++#define ADSP_ITEM_CRASH     423
++#define ADSP_SMP2P_BIT      10
++#define ADSP_GLINK_BIT      8
++
++#define ADSP_CHANNELS       2
++#define ADSP_CH_QRTR        0
++#define ADSP_CH_APR         1
++#define ADSP_INTENTS        8
++#define ADSP_INTENT_SIZE    0x800u
++
++#define APR_DOMAIN_ADSP     4
++#define APR_DOMAIN_APPS     5
++#define APR_SVC_ADSP_CORE   3
++#define APR_MSG_TYPE_SEQ_CMD 2
++#define AVCS_GET_VERSIONS   0x00012905u
++#define AVCS_GET_VERSIONS_RSP 0x00012906u
++#define AVCS_GET_STATE      0x0001290cu
++#define AVCS_GET_STATE_RSP  0x0001290du
++#define APR_BASIC_RSP       0x000110e8u
++
++struct apr_hdr {
++	uint16_t field;                 /* message type << 8 | header words << 4 | version */
++	uint16_t size;                  /* whole packet, bytes */
++	uint8_t from_svc, from_domain;
++	uint16_t from_port;
++	uint8_t to_svc, to_domain;
++	uint16_t to_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static struct {
++	struct smem_part_hdr *part;
++	struct smp2p_hdr *out, *in;
++	volatile uint32_t *sk;          /* its "slave-kernel" */
++	volatile uint32_t *desc;
++	uint8_t *tx, *rx;
++	uint32_t rx_len, features, next_intent;
++	struct {
++		const char *name;
++		uint16_t lcid;
++		uint32_t rcid;
++		bool remote_open, open_sent, open_acked, intents_sent;
++		struct { uint32_t id, size; bool used; } ri[32];
++		unsigned ri_count;
++		uint8_t asm_buf[ADSP_INTENT_SIZE];
++		uint32_t asm_len;
++	} ch[ADSP_CHANNELS];
++	uint32_t qrtr_node;
++	bool qrtr_hello_rx, qrtr_hello_sent;
++	unsigned rx_msgs, tx_msgs, apr_in, apr_out, ms;
++	uint32_t apr_token;
++	uint32_t state_rsp;             /* last AVCS_GET_STATE answer + 1 (0: none) */
++	bool versions_rsp, broken;
++	char others[4][24];             /* channels the DSP opened that are not ours */
++	unsigned other_count;
++} adsp;
++static int adsp_stage;                          /* for kern.sweetadsp: how far it got */
++static bool adsp_started;
++
++#define ALOG(fmt, ...)      LOG("adsp: " fmt, ##__VA_ARGS__)
++
++static void
++adsp_kick(unsigned bit)
++{
++	mb();
++	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << bit;
++	mb();
++}
++
++/* modem_boot()'s PIL sequence with the audio DSP's image, id and carveout */
++static bool
++adsp_pil(void)
++{
++	uint8_t *mdt = NULL, *meta;
++	int64_t mdt_size;
++	uint64_t meta_pa = 0, res = 0, st;
++	uint32_t min_a = ~0u, max_a = 0, hash = ~0u;
++	bool relocate = false, ok = false;
++
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, ADSP_PAS_ID, 0, 0, &res);
++	ALOG("PAS id %u supported: ret=%llx res=%llx", ADSP_PAS_ID, st, res);
++	mdt_size = fw_size("adsp.mdt");
++	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
++		ALOG("adsp.mdt: size %lld (not in %s?)", mdt_size, fw_part);
++		return false;
++	}
++	mdt = (uint8_t *)IOMalloc(mdt_size);
++	if (mdt == NULL || fw_read("adsp.mdt", mdt, mdt_size) != mdt_size) {
++		goto out;
++	}
++	{
++		struct elf32_ehdr *eh = (struct elf32_ehdr *)mdt;
++		if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
++		    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > (uint64_t)mdt_size) {
++			ALOG("adsp.mdt: bad ELF header");
++			goto out;
++		}
++		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++				hash = i;
++			}
++			if (!loadable(&ph[i])) {
++				continue;
++			}
++			if (ph[i].p_flags & MDT_RELOCATABLE) {
++				relocate = true;
++			}
++			min_a = MIN(min_a, ph[i].p_paddr);
++			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
++		}
++		ALOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
++		if (hash == ~0u || (!relocate && (min_a < ADSP_CARVEOUT || max_a > ADSP_CARVEOUT + ADSP_CARVEOUT_SIZE)) ||
++		    max_a - min_a > ADSP_CARVEOUT_SIZE) {
++			ALOG("unexpected layout (carveout is %x+%x)", ADSP_CARVEOUT, ADSP_CARVEOUT_SIZE);
++			goto out;
++		}
++		/* a relocatable image goes to the start of the carveout (qcom_mdt_load) */
++		uint32_t reloc = relocate ? ADSP_CARVEOUT - min_a : 0;
++
++		uint64_t hdr = eh->e_phoff + eh->e_phnum * sizeof(struct elf32_phdr);
++		uint64_t meta_size = hdr + ph[hash].p_filesz;
++		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
++		if (meta == NULL) {
++			ALOG("metadata: pool allocation of %llu bytes failed", meta_size);
++			goto out;
++		}
++		memcpy(meta, mdt, hdr);
++		if (ph[hash].p_offset + ph[hash].p_filesz <= (uint64_t)mdt_size) {
++			memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		} else {
++			char hname[16];
++			snprintf(hname, sizeof(hname), "adsp.b%02u", hash);
++			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
++			ALOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
++			if (got != (int64_t)ph[hash].p_filesz) {
++				goto out;
++			}
++		}
++		mb();
++
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), ADSP_PAS_ID, meta_pa, 0, &res);
++		ALOG("init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", st, res, scm_resumes, meta_size, meta_pa);
++		if (st != 0 || res != 0) {
++			goto out;
++		}
++		if (relocate) {
++			st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, ADSP_PAS_ID, ADSP_CARVEOUT,
++			    ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, &res);
++			ALOG("mem_setup: ret=%llx res=%llx", st, res);
++			if (st != 0 || res != 0) {
++				goto shutdown;
++			}
++		}
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			char name[16];
++			if (!loadable(&ph[i])) {
++				continue;
++			}
++			uint32_t at = ph[i].p_paddr + reloc;
++			uint64_t pa = at & ~0x3fffull, off = at - pa;
++			uint64_t len = (off + ph[i].p_memsz + 0x3fff) & ~0x3fffull;
++			IOMemoryMap *m = map_phys(pa, len, true);
++			if (m == NULL) {
++				ALOG("segment %u: cannot map %08x+%x", i, at, ph[i].p_memsz);
++				goto shutdown;
++			}
++			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
++			int64_t got = 0;
++			if (ph[i].p_filesz != 0) {
++				snprintf(name, sizeof(name), "adsp.b%02u", i);
++				got = fw_read(name, dst, ph[i].p_filesz);
++				if (got != (int64_t)ph[i].p_filesz) {
++					ALOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
++					m->release();
++					goto shutdown;
++				}
++			}
++			if (ph[i].p_memsz > got) {
++				bzero(dst + got, ph[i].p_memsz - got);
++			}
++			mb();
++			m->release();
++		}
++		ALOG("segments loaded");
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, ADSP_PAS_ID, 0, 0, &res);
++		ALOG("auth_and_reset: ret=%llx res=%llx resumes=%u", st, res, scm_resumes);
++		if (st != 0 || res != 0) {
++			goto shutdown;
++		}
++		ok = true;
++		goto out;
++	}
++shutdown:
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, ADSP_PAS_ID, 0, 0, &res);
++	ALOG("shutdown after failure: ret=%llx res=%llx", st, res);
++out:
++	if (mdt != NULL) {
++		IOFree(mdt, mdt_size);
++	}
++	return ok;
++}
++
++/* ---- SMP2P with the audio DSP: smp2p_create_out() with its item, pid and doorbell */
++
++static struct smp2p_hdr *
++adsp_smp2p_out(void)
++{
++	struct smp2p_hdr *o = (struct smp2p_hdr *)smem_alloc(adsp.part, ADSP_ITEM_SMP2P_OUT,
++	    sizeof(struct smp2p_hdr) + SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry));
++
++	if (o == NULL || o->version != 0) {
++		return o;
++	}
++	o->magic = SMP2P_MAGIC;
++	o->local_pid = 0;
++	o->remote_pid = ADSP_PID;
++	o->total = SMP2P_MAX_ENTRY;
++	o->valid = 0;
++	o->features[0] = 1;                         /* SSR_ACK */
++	mb();
++	o->version = 1;
++	adsp_kick(ADSP_SMP2P_BIT);
++	return o;
++}
++
++/* ---- GLINK on the audio DSP's edge: the same protocol as the modem's, two channels */
++
++static uint32_t
++adsp_rx_avail(void)
++{
++	uint32_t h = adsp.desc[3], t = adsp.desc[2];
++	return h >= t ? h - t : adsp.rx_len - t + h;
++}
++
++static void
++adsp_rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = adsp.desc[2] + off;
++	if (t >= adsp.rx_len) {
++		t -= adsp.rx_len;
++	}
++	uint32_t n1 = MIN(n, adsp.rx_len - t);
++	memcpy(dst, adsp.rx + t, n1);
++	if (n > n1) {
++		memcpy((uint8_t *)dst + n1, adsp.rx, n - n1);
++	}
++}
++
++static void
++adsp_rx_advance(uint32_t n)
++{
++	uint32_t t = adsp.desc[2] + n;
++	if (t >= adsp.rx_len) {
++		t -= adsp.rx_len;
++	}
++	mb();
++	adsp.desc[2] = t;
++}
++
++static uint32_t
++adsp_tx_put(uint32_t head, const void *src, uint32_t n)
++{
++	uint32_t n1 = MIN(n, GLINK_TX_SIZE - head);
++	memcpy(adsp.tx + head, src, n1);
++	if (n > n1) {
++		memcpy(adsp.tx, (const uint8_t *)src + n1, n - n1);
++	}
++	head += n;
++	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
++}
++
++static bool
++adsp_tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t head = 0, tail = 0, avail = 0;
++	int n;
++
++	for (n = 0; n < 1000; n++) {
++		head = adsp.desc[1];
++		tail = adsp.desc[0];
++		avail = tail <= head ? GLINK_TX_SIZE - head + tail : tail - head;
++		avail = avail < 8 ? 0 : avail - 8;
++		if (avail >= ((hlen + dlen + 7) & ~7u)) {
++			break;
++		}
++		IODelay(100);
++	}
++	if (n == 1000) {
++		ALOG("glink TX FIFO full (head %x tail %x)", head, tail);
++		return false;
++	}
++	head = adsp_tx_put(head, hdr, hlen);
++	if (dlen != 0) {
++		head = adsp_tx_put(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= GLINK_TX_SIZE) {
++		head -= GLINK_TX_SIZE;
++	}
++	mb();
++	adsp.desc[1] = head;
++	adsp_kick(ADSP_GLINK_BIT);
++	adsp.tx_msgs++;
++	return true;
++}
++
++static void
++adsp_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++	adsp_tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static void
++adsp_open(unsigned c)
++{
++	struct { struct glink_msg m; char name[24]; } __attribute__((packed)) req = {};
++	uint32_t len = (uint32_t)strlen(adsp.ch[c].name) + 1;
++
++	req.m.cmd = CMD_OPEN;
++	req.m.p1 = adsp.ch[c].lcid;
++	req.m.p2 = len;
++	memcpy(req.name, adsp.ch[c].name, len);
++	adsp_tx_write(&req, (uint32_t)sizeof(struct glink_msg) + ((len + 7) & ~7u), NULL, 0);
++	adsp.ch[c].open_sent = true;
++}
++
++static void
++adsp_intents(unsigned c, uint32_t count, uint32_t size)
++{
++	struct { struct glink_msg m; uint32_t pair[2 * ADSP_INTENTS]; } __attribute__((packed)) m = {};
++
++	m.m.cmd = CMD_INTENT;
++	m.m.p1 = adsp.ch[c].lcid;
++	m.m.p2 = count;
++	for (uint32_t i = 0; i < count && i < ADSP_INTENTS; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = adsp.next_intent++;
++	}
++	adsp_tx_write(&m, sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
++static bool
++adsp_chan_up(unsigned c)
++{
++	return adsp.ch[c].remote_open && adsp.ch[c].open_acked;
++}
++
++/* one message on channel c, into one of the DSP's intents; false: no intent for it (yet) */
++static bool
++adsp_send(unsigned c, const void *data, uint32_t len)
++{
++	unsigned i;
++
++	if (!adsp_chan_up(c)) {
++		return false;
++	}
++	for (i = 0; i < adsp.ch[c].ri_count; i++) {
++		if (!adsp.ch[c].ri[i].used && adsp.ch[c].ri[i].size >= len) {
++			break;
++		}
++	}
++	if (i == adsp.ch[c].ri_count) {
++		adsp_cmd(CMD_RX_INTENT_REQ, adsp.ch[c].lcid, len);
++		return false;
++	}
++	adsp.ch[c].ri[i].used = true;
++	struct glink_data_hdr h = { { CMD_TX_DATA, adsp.ch[c].lcid, adsp.ch[c].ri[i].id }, len, 0 };
++	return adsp_tx_write(&h, sizeof(h), data, len);
++}
++
++static int
++adsp_chan_of_rcid(uint32_t rcid)
++{
++	for (unsigned c = 0; c < ADSP_CHANNELS; c++) {
++		if (adsp.ch[c].remote_open && adsp.ch[c].rcid == rcid) {
++			return (int)c;
++		}
++	}
++	return -1;
++}
++
++static int
++adsp_chan_of_lcid(uint32_t lcid)
++{
++	for (unsigned c = 0; c < ADSP_CHANNELS; c++) {
++		if (adsp.ch[c].lcid == lcid) {
++			return (int)c;
++		}
++	}
++	return -1;
++}
++
++/* our QRTR hello, once the DSP has said its own and given an intent on IPCRTR (retried from the poll) */
++static void
++adsp_qrtr_hello(void)
++{
++	struct { struct qrtr_hdr_v1 h; struct qrtr_ctrl c; } __attribute__((packed)) m = {};
++
++	if (!adsp.qrtr_hello_rx || adsp.qrtr_hello_sent) {
++		return;
++	}
++	m.h.version = 1;
++	m.h.type = QRTR_TYPE_HELLO;
++	m.h.src_node = QRTR_NODE_APPS;
++	m.h.src_port = QRTR_PORT_CTRL;
++	m.h.size = sizeof(m.c);
++	m.h.dst_node = adsp.qrtr_node;
++	m.h.dst_port = QRTR_PORT_CTRL;
++	m.c.cmd = QRTR_TYPE_HELLO;
++	adsp.qrtr_hello_sent = adsp_send(ADSP_CH_QRTR, &m, sizeof(m));
++	if (adsp.qrtr_hello_sent) {
++		ALOG("t=%u ms: qrtr HELLO back to node %u", adsp.ms, adsp.qrtr_node);
++	}
++}
++
++/* QRTR on IPCRTR: answer the DSP's hello, write down what it says (control messages only) */
++static void
++adsp_qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t type, src_node, size;
++	const uint8_t *payload;
++
++	if (len >= sizeof(struct qrtr_hdr_v1) && p[0] == 1) {
++		const struct qrtr_hdr_v1 *h = (const struct qrtr_hdr_v1 *)p;
++		type = h->type;
++		src_node = h->src_node;
++		size = h->size;
++		payload = p + sizeof(*h);
++	} else if (len >= sizeof(struct qrtr_hdr_v2) && p[0] == 3) {
++		const struct qrtr_hdr_v2 *h = (const struct qrtr_hdr_v2 *)p;
++		type = h->type;
++		src_node = h->src_node;
++		size = h->size;
++		payload = p + sizeof(*h) + h->optlen;
++	} else {
++		ALOG("t=%u ms: qrtr: %u bytes, version %u: not understood", adsp.ms, len, len ? p[0] : 0);
++		return;
++	}
++	(void)size;
++	if (type == QRTR_TYPE_HELLO) {
++		adsp.qrtr_node = src_node;
++		adsp.qrtr_hello_rx = true;
++		ALOG("t=%u ms: qrtr HELLO from node %u", adsp.ms, src_node);
++		adsp_qrtr_hello();
++	} else if (type == QRTR_TYPE_NEW_SERVER) {
++		const struct qrtr_ctrl *c = (const struct qrtr_ctrl *)payload;
++		ALOG("t=%u ms: qrtr: the DSP offers service %u instance %u (node %u port %u)", adsp.ms, c->a, c->b, c->c, c->d);
++	} else {
++		ALOG("t=%u ms: qrtr: type %u from node %u", adsp.ms, type, src_node);
++	}
++}
++
++static void
++adsp_apr_rx(const uint8_t *p, uint32_t len)
++{
++	const struct apr_hdr *h = (const struct apr_hdr *)p;
++
++	adsp.apr_in++;
++	if (len < sizeof(*h)) {
++		return;
++	}
++	const uint32_t *pl = (const uint32_t *)(p + ((h->field >> 4) & 0xf) * 4);
++	uint32_t words = (len - ((h->field >> 4) & 0xf) * 4) / 4;
++	if (h->opcode == AVCS_GET_STATE_RSP && words >= 1) {
++		adsp.state_rsp = pl[0] + 1;
++	} else if (h->opcode == AVCS_GET_VERSIONS_RSP) {
++		adsp.versions_rsp = true;
++		/* build id and the number of services, then (service id, version) pairs */
++		ALOG("t=%u ms: apr: AVCS versions: %u words: %08x %08x %08x %08x %08x %08x %08x %08x", adsp.ms, words,
++		    words > 0 ? pl[0] : 0, words > 1 ? pl[1] : 0, words > 2 ? pl[2] : 0, words > 3 ? pl[3] : 0,
++		    words > 4 ? pl[4] : 0, words > 5 ? pl[5] : 0, words > 6 ? pl[6] : 0, words > 7 ? pl[7] : 0);
++	}
++	if (adsp.apr_in <= 40) {
++		ALOG("t=%u ms: apr IN: svc %u.%u -> %u.%u opcode %08x token %u, %u bytes, first word %08x", adsp.ms,
++		    h->from_domain, h->from_svc, h->to_domain, h->to_svc, h->opcode, h->token, len, words ? pl[0] : 0);
++	}
++}
++
++static bool
++adsp_apr_ask(uint8_t svc, uint32_t opcode)
++{
++	struct apr_hdr h = {};
++
++	h.field = (uint16_t)(APR_MSG_TYPE_SEQ_CMD << 8 | (sizeof(h) / 4) << 4);
++	h.size = sizeof(h);
++	h.from_svc = svc;
++	h.from_domain = APR_DOMAIN_APPS;
++	h.from_port = 0;
++	h.to_svc = svc;
++	h.to_domain = APR_DOMAIN_ADSP;
++	h.to_port = 0;
++	h.token = ++adsp.apr_token;
++	h.opcode = opcode;
++	bool sent = adsp_send(ADSP_CH_APR, &h, sizeof(h));
++	adsp.apr_out += sent;
++	return sent;
++}
++
++static bool
++adsp_rx_one(void)
++{
++	struct glink_msg m;
++	uint32_t avail = adsp_rx_avail(), n;
++	int c;
++
++	if (avail < sizeof(m)) {
++		return false;
++	}
++	adsp_rx_peek(0, &m, sizeof(m));
++	adsp.rx_msgs++;
++	switch (m.cmd) {
++	case CMD_VERSION:
++		adsp_rx_advance(8);
++		ALOG("t=%u ms: glink VERSION %u features %x", adsp.ms, m.p1, m.p2);
++		if (m.p1 != 0) {
++			adsp.features &= m.p2;
++			adsp_cmd(CMD_VERSION_ACK, 1, adsp.features);
++		}
++		break;
++	case CMD_VERSION_ACK:
++		adsp_rx_advance(8);
++		ALOG("t=%u ms: glink VERSION_ACK %u features %x", adsp.ms, m.p1, m.p2);
++		if (m.p1 != 0 && m.p2 != adsp.features) {
++			adsp.features &= m.p2;
++			adsp_cmd(CMD_VERSION, 1, adsp.features);
++		}
++		break;
++	case CMD_OPEN: {
++		char name[33] = {};
++		n = (8 + m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		adsp_rx_peek(8, name, MIN(m.p2, 32u));
++		adsp_rx_advance(n);
++		ALOG("t=%u ms: glink the DSP OPENs \"%s\" rcid %u", adsp.ms, name, m.p1);
++		bool ours = false;
++		for (unsigned i = 0; i < ADSP_CHANNELS; i++) {
++			if (strcmp(name, adsp.ch[i].name) == 0) {
++				adsp.ch[i].rcid = m.p1;
++				adsp.ch[i].remote_open = true;
++				adsp_cmd(CMD_OPEN_ACK, (uint16_t)m.p1, 0);
++				if (!adsp.ch[i].open_sent) {
++					adsp_open(i);
++				}
++				ours = true;
++			}
++		}
++		if (!ours && adsp.other_count < 4) {
++			strlcpy(adsp.others[adsp.other_count++], name, sizeof(adsp.others[0]));
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		adsp_rx_advance(8);
++		ALOG("t=%u ms: glink OPEN_ACK lcid %u", adsp.ms, m.p1);
++		if ((c = adsp_chan_of_lcid(m.p1)) >= 0) {
++			adsp.ch[c].open_acked = true;
++		}
++		break;
++	case CMD_CLOSE:
++		adsp_rx_advance(8);
++		ALOG("t=%u ms: glink the DSP CLOSEs rcid %u", adsp.ms, m.p1);
++		adsp_cmd(CMD_CLOSE_ACK, m.p1, 0);
++		if ((c = adsp_chan_of_rcid(m.p1)) >= 0) {
++			adsp.ch[c].remote_open = false;
++		}
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = adsp_chan_of_rcid(m.p1);
++		for (uint32_t i = 0; i < m.p2; i++) {
++			uint32_t pair[2];
++			adsp_rx_peek(8 + 8 * i, pair, 8);
++			if (c >= 0 && adsp.ch[c].ri_count < sizeof(adsp.ch[c].ri) / sizeof(adsp.ch[c].ri[0])) {
++				adsp.ch[c].ri[adsp.ch[c].ri_count].size = pair[0];
++				adsp.ch[c].ri[adsp.ch[c].ri_count].id = pair[1];
++				adsp.ch[c].ri[adsp.ch[c].ri_count].used = false;
++				adsp.ch[c].ri_count++;
++			}
++		}
++		adsp_rx_advance(n);
++		break;
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		adsp_rx_advance(8);
++		if ((c = adsp_chan_of_rcid(m.p1)) >= 0) {
++			for (unsigned i = 0; i < adsp.ch[c].ri_count; i++) {
++				if (adsp.ch[c].ri[i].id == m.p2) {
++					if (m.cmd == CMD_RX_DONE_W_REUSE) {
++						adsp.ch[c].ri[i].used = false;
++					} else {
++						adsp.ch[c].ri[i] = adsp.ch[c].ri[--adsp.ch[c].ri_count];
++					}
++					break;
++				}
++			}
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		adsp_rx_advance(8);
++		if ((c = adsp_chan_of_rcid(m.p1)) >= 0) {
++			adsp_intents(c, 1, MAX(m.p2, ADSP_INTENT_SIZE));
++			adsp_cmd(CMD_RX_INTENT_REQ_ACK, adsp.ch[c].lcid, 1);
++		}
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++	case CMD_CLOSE_ACK:
++	case CMD_SIGNALS:
++		adsp_rx_advance(8);
++		break;
++	case CMD_READ_NOTIF:
++		adsp_rx_advance(8);
++		adsp_kick(ADSP_GLINK_BIT);
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t hdr[2];
++		if (avail < 16) {
++			return false;
++		}
++		adsp_rx_peek(8, hdr, 8);                /* chunk_size, left_size */
++		n = (16 + hdr[0] + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = adsp_chan_of_rcid(m.p1);
++		if (c >= 0) {
++			if (m.cmd == CMD_TX_DATA) {
++				adsp.ch[c].asm_len = 0;
++			}
++			if (adsp.ch[c].asm_len + hdr[0] <= sizeof(adsp.ch[c].asm_buf)) {
++				adsp_rx_peek(16, adsp.ch[c].asm_buf + adsp.ch[c].asm_len, hdr[0]);
++				adsp.ch[c].asm_len += hdr[0];
++			}
++		}
++		adsp_rx_advance(n);
++		if (hdr[1] == 0 && c >= 0) {
++			if (c == ADSP_CH_QRTR) {
++				adsp_qrtr_rx(adsp.ch[c].asm_buf, adsp.ch[c].asm_len);
++			} else {
++				adsp_apr_rx(adsp.ch[c].asm_buf, adsp.ch[c].asm_len);
++			}
++			if (adsp.features & 1) {
++				adsp_cmd(CMD_RX_DONE_W_REUSE, adsp.ch[c].lcid, m.p2);
++			} else {
++				adsp_cmd(CMD_RX_DONE, adsp.ch[c].lcid, m.p2);
++				adsp_intents(c, 1, ADSP_INTENT_SIZE);
++			}
++		}
++		break;
++	}
++	default:
++		ALOG("t=%u ms: glink unknown cmd %u (%x %x), RX stopped", adsp.ms, m.cmd, m.p1, m.p2);
++		adsp.broken = true;
++		return false;
++	}
++	return true;
++}
++
++static void
++adsp_glink_poll(void)
++{
++	if (adsp.rx == NULL) {
++		uint32_t sz = 0;
++		adsp.rx = (uint8_t *)smem_get(adsp.part, SMEM_GLINK_FIFO_RX, &sz);
++		if (adsp.rx != NULL) {
++			adsp.rx_len = sz;
++			ALOG("t=%u ms: the DSP's GLINK FIFO, %u bytes", adsp.ms, sz);
++		}
++	}
++	for (int i = 0; i < 64 && adsp.rx != NULL && !adsp.broken && adsp_rx_one(); i++) {
++	}
++	adsp_qrtr_hello();
++	for (unsigned c = 0; c < ADSP_CHANNELS; c++) {
++		if (adsp_chan_up(c) && !adsp.ch[c].intents_sent) {
++			adsp_intents(c, ADSP_INTENTS, ADSP_INTENT_SIZE);
++			adsp.ch[c].intents_sent = true;
++			ALOG("t=%u ms: \"%s\" open both ways, %u intents given", adsp.ms, adsp.ch[c].name, ADSP_INTENTS);
++		}
++	}
++}
++
++/* the whole of step 1, on a thread of its own */
++static void
++adsp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t sk_last = ~0u, sz = 0;
++	bool ready = false, glink = false, asked_versions = false;
++	unsigned next_ask = 0, asks = 0;
++
++	adsp_stage = 1;
++	if (!topaz_soc_map()) {
++		ALOG("no SoC mappings / modem partition: not started");
++		adsp_stage = -1;
++		thread_terminate(current_thread());
++		return;
++	}
++	adsp.part = smem_partition(0, ADSP_PID);
++	ALOG("SMEM apps<->adsp partition %p", adsp.part);
++	if (adsp.part == NULL) {
++		adsp_stage = -1;
++		thread_terminate(current_thread());
++		return;
++	}
++	if (smem_get(adsp.part, ADSP_ITEM_SMP2P_IN, NULL) != NULL) {
++		ALOG("its SMP2P item %u is there already: the DSP has run since power-on; not touching it", ADSP_ITEM_SMP2P_IN);
++		adsp_stage = -1;
++		thread_terminate(current_thread());
++		return;
++	}
++	(void)aop_send("{class: image, res: load_state, name: adsp, val: on}");
++	ALOG("rpmh: cx.lvl proxy vote: %d", vote_retry(sweet_rpmh_arc_level, "cx.lvl", 0x181));
++	adsp_stage = 2;
++	if (!adsp_pil()) {
++		adsp_stage = -2;
++		thread_terminate(current_thread());
++		return;
++	}
++	adsp_stage = 3;
++	adsp.out = adsp_smp2p_out();
++	ALOG("our SMP2P item %u: %p", ADSP_ITEM_SMP2P_OUT, adsp.out);
++	adsp.features = GLINK_FEATURES;
++	adsp.next_intent = 1;
++	adsp.ch[ADSP_CH_QRTR].name = "IPCRTR";
++	adsp.ch[ADSP_CH_QRTR].lcid = 1;
++	adsp.ch[ADSP_CH_APR].name = "apr_audio_svc";
++	adsp.ch[ADSP_CH_APR].lcid = 2;
++	for (unsigned ms = 0; ms < 60000 && !adsp.broken; ms++) {
++		adsp.ms = ms;
++		if (adsp.in == NULL && (adsp.in = (struct smp2p_hdr *)smem_get(adsp.part, ADSP_ITEM_SMP2P_IN, &sz)) != NULL) {
++			if (adsp.in->magic != SMP2P_MAGIC) {
++				adsp.in = NULL;
++			} else {
++				ALOG("t=%u ms: its SMP2P item %u is up (v%u, %u entries)", ms, ADSP_ITEM_SMP2P_IN, adsp.in->version,
++				    adsp.in->valid);
++			}
++		}
++		if (adsp.in != NULL && adsp.sk == NULL) {
++			adsp.sk = smp2p_find(adsp.in, "slave-kernel");
++		}
++		if (adsp.sk != NULL && *adsp.sk != sk_last) {
++			sk_last = *adsp.sk;
++			ALOG("t=%u ms: slave-kernel %08x%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "", (sk_last & 2) ? " READY" : "");
++			if (sk_last & 1) {
++				struct smem_part_hdr *gp = smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST);
++				const char *why = (const char *)smem_get(gp, ADSP_ITEM_CRASH, &sz);
++				char buf[128] = {};
++				if (why != NULL) {
++					memcpy(buf, why, MIN(sz, (uint32_t)sizeof(buf) - 1));
++				}
++				ALOG("crash reason: %s", why != NULL ? buf : "(none)");
++				adsp_stage = -3;
++				break;
++			}
++			if ((sk_last & 2) && !ready) {
++				ready = true;
++				adsp_stage = 4;
++				ALOG("t=%u ms: *** the audio DSP is up ***", ms);
++			}
++		}
++		if (ready && !glink) {
++			bool existed = smem_get(adsp.part, SMEM_GLINK_DESC, NULL) != NULL;
++			adsp.desc = (volatile uint32_t *)smem_alloc(adsp.part, SMEM_GLINK_DESC, 32);
++			adsp.tx = (uint8_t *)smem_alloc(adsp.part, SMEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
++			if (adsp.desc == NULL || adsp.tx == NULL) {
++				ALOG("glink: SMEM alloc failed (desc %p tx %p)", adsp.desc, adsp.tx);
++				adsp_stage = -4;
++				break;
++			}
++			ALOG("glink: descriptors %s, our FIFO %u bytes", existed ? "made by the DSP" : "ours", GLINK_TX_SIZE);
++			adsp.desc[2] = 0;
++			adsp.desc[1] = 0;
++			mb();
++			adsp_cmd(CMD_VERSION, 1, adsp.features);
++			glink = true;
++		}
++		if (glink) {
++			adsp_glink_poll();
++			if (adsp_chan_up(ADSP_CH_APR) && adsp_stage < 5) {
++				adsp_stage = 5;
++			}
++			/* ask the core service whether the audio services are up, every 500 ms, as Android does */
++			if (adsp_chan_up(ADSP_CH_APR) && adsp.state_rsp != 2 && ms >= next_ask && asks < 40) {
++				if (adsp_apr_ask(APR_SVC_ADSP_CORE, AVCS_GET_STATE)) {
++					asks++;
++				}
++				next_ask = ms + 500;
++			}
++			if (adsp.state_rsp == 2 && adsp_stage < 6) {
++				adsp_stage = 6;
++				ALOG("t=%u ms: *** the audio services are up (AVCS state 1, after %u asks) ***", ms, asks);
++			}
++			if (adsp_stage == 6 && !asked_versions && adsp_apr_ask(APR_SVC_ADSP_CORE, AVCS_GET_VERSIONS)) {
++				asked_versions = true;
++			}
++			if (ms >= 2000 && !adsp.ch[ADSP_CH_APR].open_sent && adsp.rx != NULL) {
++				ALOG("t=%u ms: the DSP did not open apr_audio_svc: opening it", ms);
++				adsp_open(ADSP_CH_APR);
++			}
++		}
++		if (adsp.versions_rsp && ms > 0 && (ms % 1000) == 0) {
++			break;                          /* everything step 1 wants: stop polling */
++		}
++		IODelay(1000);
++	}
++	ALOG("step 1 over: stage %d; GLINK %u in / %u out; IPCRTR %s, apr_audio_svc %s; qrtr hello %s/%s; APR %u in / %u out, "
++	    "state %d; the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"", adsp_stage, adsp.rx_msgs, adsp.tx_msgs,
++	    adsp_chan_up(ADSP_CH_QRTR) ? "open" : "NOT OPEN", adsp_chan_up(ADSP_CH_APR) ? "open" : "NOT OPEN",
++	    adsp.qrtr_hello_rx ? "in" : "-", adsp.qrtr_hello_sent ? "out" : "-", adsp.apr_in, adsp.apr_out,
++	    (int)adsp.state_rsp - 1, adsp.others[0], adsp.others[1], adsp.others[2], adsp.others[3]);
++	thread_terminate(current_thread());
++}
++
++/* kern.sweetadsp (bsd/dev/sweet_adsp.c): start it (once), and how far it got */
++extern "C" int
++sweet_adsp_start(void)
++{
++	thread_t t;
++
++	if (adsp_started) {
++		return EALREADY;
++	}
++	adsp_started = true;
++	if (kernel_thread_start(adsp_thread, NULL, &t) != KERN_SUCCESS) {
++		adsp_started = false;
++		return ENOMEM;
++	}
++	thread_deallocate(t);
++	return 0;
++}
++
++extern "C" int
++sweet_adsp_stage(void)
++{
++	return adsp_stage;
++}
++
+ #else
+ extern "C" void sweet_modem_init(void) {}
++extern "C" int sweet_adsp_start(void) { return 19; }      /* ENODEV */
++extern "C" int sweet_adsp_stage(void) { return 0; }
+ #endif

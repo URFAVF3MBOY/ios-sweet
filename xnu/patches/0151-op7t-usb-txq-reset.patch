@@ -1,0 +1,61 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 04:00:00 -0400
+Subject: [PATCH] op7t-0151: USB Ethernet: drop the send queue on reset, kick it when configured
+
+Three times on 2026-10-26 the phone stopped sending over USB Ethernet some
+time after boot while the UI went on: no ARP reply, no live log (udp/5140),
+RX 0 packets on the PC; replugging re-enumerated the device but it still
+sent nothing. The send queue (32 frames) fills whenever the host stops
+reading the bulk IN endpoint (usbipd detached from WSL, cable out); then
+ud_if_output drops every new frame without kicking. A bus reset ended the
+transfer (tx_busy false) but left the queue full, and ud_configure never
+kicked it: the phone could never send again. Now a reset or disconnect
+frees the queued frames (logged: "HOTDOGB USB: N queued frames dropped"),
+and configuring the endpoints kicks the queue.
+
+Apply after 0150.
+---
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 843ff0f..522a8ef 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -449,7 +449,10 @@ ud_configure(void)
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	lck_mtx_lock(ud.lock);
+ 	ud.configured = true;
++	ud_tx_kick_locked();                    /* 0151: whatever was queued meanwhile goes now */
++	lck_mtx_unlock(ud.lock);
+ 	ud_rx_arm();
+ 	printf("HOTDOGB USB: ECM endpoints configured\n");
+ }
+@@ -765,10 +768,28 @@ ud_bus_reset(bool rearm, const char *why)
+ 		}
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	/*
++	 * 0151: and the frames queued for the host are dropped. The queue fills whenever the host stops
++	 * reading the IN endpoint (usbipd detached from WSL, cable out): 32 frames, then ud_if_output
++	 * drops every new one and never kicks. A reset ended the transfer (tx_busy false) but left the
++	 * queue full, and ud_configure did not kick it, so after a reset or replug the phone sent
++	 * nothing ever again (2026-10-26, three times: no ARP reply, no live log, RX 0 on the PC) while
++	 * the device itself enumerated fine. Old frames are worth nothing to a new link anyway.
++	 */
+ 	lck_mtx_lock(ud.lock);
+ 	ud.configured = false;
+ 	ud.tx_busy = false;
++	unsigned dropped = ud.txq_count;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq[ud.txq_head] = NULL;
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
+ 	lck_mtx_unlock(ud.lock);
++	if (dropped != 0) {
++		printf("HOTDOGB USB: %u queued frames dropped\n", dropped);
++	}
+ 	ud.data_alt = 0;
+ 	if (rearm) {
+ 		ud_start_setup();

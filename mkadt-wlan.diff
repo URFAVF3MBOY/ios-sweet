@@ -1,0 +1,16 @@
+--- a/tools/mkadt.py
++++ b/tools/mkadt.py
+@@ -167,6 +167,13 @@
+         # otherwise crashes trying to set the PMU boot stage (customer builds
+         # ignore the -wdt_no_pmu boot-arg).
+         node('wdt', [ph(), ('no-pmu', u32(1))]),
++        # 0124: launchd starts wifid only when the device tree has a "wlan" node
++        # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi), as topaz's mkadt does.
++        node('wlan', [
++            ph(),
++            ('device_type', cstr('wlan')),
++            ('compatible', cstr('op7t,wcn3990')),
++        ]),
+         # Main display: IOMobileFramebuffer.framework counts /arm-io children
+         # with this device_type and reads the canvas size from the node
+         # (the presented iPhone X size, see SweetFramebuffer.cpp);

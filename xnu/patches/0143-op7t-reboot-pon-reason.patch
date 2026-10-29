@@ -1,0 +1,147 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 22:45:00 -0400
+Subject: [PATCH] op7t-0143: reboot into fastboot: restart reason in the PMIC, where ABL reads it
+
+0142's kern.sweetreboot=2 reset cleanly (no crashdump: download mode off
+worked) but ABL booted the boot partition instead of fastboot: it takes the
+restart reason from the PMIC, PM8150 PON SOFT_RB_SPARE (SID 0, 0x88f), not
+from IMEM. Now also that register, as qpnp_pon_set_restart_reason():
+PON gen 2, PON_RESTART_REASON_BOOTLOADER 0x02 in bits 7:1 (0x04), bit 0
+kept, read back. Through the SPMI arbiter's read/write channel of the PON
+APID (0x0c600000 + 0x10000 * APID), only when the ownership table gives the
+APID to the apps EE; otherwise nothing is written and it is logged. The only
+PMIC write in the kernel, used only by kern.sweetreboot=2.
+Log: "HOTDOGB SPMI: PON SOFT_RB_SPARE ... -> ... (bootloader)".
+Both files syntax-checked with clang -Wall -Wextra on stubs (arm64).
+
+Apply after 0142.
+---
+ bsd/dev/sweet_reboot.c |  5 ++++
+ bsd/dev/sweet_spmi.c   | 72 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_spmi.h   |  2 ++
+ 3 files changed, 79 insertions(+)
+
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index d69cf38..5fed8fb 100755
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -10,6 +10,8 @@
+  * Android's msm-poweroff.c does before any intended reboot, set_dload_mode(0): TrustZone's
+  * download mode off (SCM SVC_BOOT 0x1 / DLOAD_CMD 0x10, args 0, 0), so the reset is not taken
+  * for a crash. The SCM result is logged; a refusal only means the call is not there.
++ * 0143: 0142 rebooted cleanly but ABL booted the boot partition, not fastboot: ABL takes the
++ * reason from the PMIC (PON SOFT_RB_SPARE), not from IMEM. Now both (sweet_spmi.c).
+  *   sysctl kern.sweetreboot=1   PSCI SYSTEM_RESET alone
+  * No filesystem sync here: run `sync` first. This kernel has no haltRestart of its own
+  * (SweetPlatformExpert), so this is also the only software reboot it has.
+@@ -20,6 +22,8 @@
+ #include <sys/sysctl.h>
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "sweet_spmi.h"
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define IMEM_PAGE               0x146bf000u     /* 0142: SM8150 (was the SM7150's 0x146aa000) */
+@@ -77,6 +81,7 @@ sysctl_sweetreboot SYSCTL_HANDLER_ARGS
+ 		}
+ 		*(volatile uint32_t *)(imem + IMEM_RESTART_REASON) = RESTART_BOOTLOADER;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		(void)sweet_spmi_pon_bootloader();      /* 0143: what ABL reads (logs its result) */
+ 	}
+ 	int64_t dload = sweet_scm_dload_off();
+ 	printf("HOTDOGB REBOOT: %s (download mode off: SCM %lld)\n", value == 2 ? "into fastboot" : "plain",
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 295de93..d97bd9c 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -124,4 +124,76 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * 0143: the one PMIC write there is: the restart reason for the bootloader, PM8150 (SID 0) PON
++ * SOFT_RB_SPARE (0x800 + 0x8f), as Android's qpnp_pon_set_restart_reason() writes it before
++ * "reboot bootloader": PON gen 2, reason in bits 7:1 (PON_RESTART_REASON_BOOTLOADER 0x02 -> 0x04),
++ * bit 0 kept. ABL reads this, not IMEM (2026-10-25: with only IMEM set, the reset booted the
++ * boot partition instead of fastboot). Through the arbiter's read/write channel of the PON APID
++ * (v5: 0x0c600000 + 0x10000 * APID; CMD 0x0, STATUS 0x8, WDATA0 0x10, RDATA0 0x18), and only if
++ * the ownership table gives that APID to the apps processor (EE 0), as Linux's arbiter checks.
++ * Returns the register as read back, or -1.
++ */
++#define SP_CHNLS_PA     0x0c600000u
++#define PON_SPARE_ADDR  0x88fu
++#define SP_OP_EXT_WRITEL 0u
++#define SP_OP_EXT_READL  1u
++
++static int
++sp_rw_cmd(vm_offset_t ch, uint32_t opc, unsigned addr, uint8_t *data)
++{
++	if (opc == SP_OP_EXT_WRITEL) {
++		*(volatile uint32_t *)(ch + 0x10) = *data;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x0) = (opc << 27) | ((addr & 0xffu) << 4);      /* byte count 0: one byte */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return -1;
++			}
++			if (opc == SP_OP_EXT_READL) {
++				*data = (uint8_t)sp_rd(ch, 0x18);
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++int sweet_spmi_pon_bootloader(void);
++
++int
++sweet_spmi_pon_bootloader(void)
++{
++	if (sweet_spmi_init() != 0) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(PON_SPARE_ADDR >> 8);
++	unsigned owner = apid == SP_NO_APID ? 7 : (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u);
++	if (apid == SP_NO_APID || owner != 0) {
++		IOLockUnlock(sp_lock);
++		printf("HOTDOGB SPMI: PON (ppid 0x008) APID %u owner %u: not ours to write\n", apid, owner);
++		return -1;
++	}
++	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	uint8_t before = 0, after = 0, value;
++	int rc = ch == 0 ? -1 : sp_rw_cmd(ch, SP_OP_EXT_READL, PON_SPARE_ADDR, &before);
++	if (rc == 0) {
++		value = (uint8_t)((before & 0x01u) | (0x02u << 1));
++		rc = sp_rw_cmd(ch, SP_OP_EXT_WRITEL, PON_SPARE_ADDR, &value);
++	}
++	if (rc == 0) {
++		rc = sp_rw_cmd(ch, SP_OP_EXT_READL, PON_SPARE_ADDR, &after);
++	}
++	IOLockUnlock(sp_lock);
++	printf("HOTDOGB SPMI: PON SOFT_RB_SPARE (APID %u) %#x -> %#x (%s)\n", apid, before, after,
++	    rc == 0 ? "bootloader" : "FAILED");
++	return rc == 0 ? after : -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..fdcb2c4 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* 0143: PON restart reason "bootloader" for the next reset; the register read back, or -1. */
++int sweet_spmi_pon_bootloader(void);
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,111 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sat, 24 Oct 2026 19:10:00 +0000
+Subject: [PATCH] op7t-0125: WLAN join: set the regulatory domain; log VDEV_START_RESP
+
+Boot 2026-10-24 14:50 (0124): Settings lists networks, wifid asks to join
+(Naja2025, WPA2, 2412 and 5220 MHz), and every join fails 2 ms later with
+"join: failed (5) in state 1": the firmware answered VDEV_START with a non-zero
+status, before authentication even started. Scans keep working.
+
+ath10k sets the regulatory domain (WMI_PDEV_SET_REGDOMAIN) before it starts any
+vdev; this driver never did. Now, right after WMI READY:
+ - the board's domain from SERVICE_READY's HAL_REG_CAPABILITIES (logged) when it
+   names one, else FCC3_FCCA 0x3A (US) with CTL_FCC 0x10;
+ - sweetwlanrd=N forces a domain, sweetwlanrd=0 sends none; sweetwlanctl=N.
+And the VDEV_START_RESP fields are logged, so the status is known either way.
+
+Apply after 0124.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -3292,6 +3292,12 @@
+ 	return htc_wmi_send(m, len + 4);
+ }
+ 
++/* 0125: from SERVICE_READY's HAL_REG_CAPABILITIES (ath10k reads it for its regulatory domain) */
++#define TAG_HAL_REG_CAPS    0x21
++static uint32_t wmi_eeprom_rd = ~0u;
++static bool wmi_rd_sent;
++static void wmi_set_regdomain(void);
++
+ /* walk the TLVs of SERVICE_READY (ath10k_wmi_tlv_svc_rdy_parse) */
+ static void
+ wmi_svc_ready(const uint8_t *p, uint32_t len)
+@@ -3310,6 +3316,12 @@
+ 			memcpy(&a0, v + 4, 4);
+ 			memcpy(&rf, v + 4 + 24 + 8, 4);
+ 			LOG("wmi: fw %08x abi %08x rf_chains %u", fw, a0, rf);
++		} else if (tag == TAG_HAL_REG_CAPS && l >= 36) {
++			uint32_t r[9];
++			memcpy(r, v, sizeof(r));
++			wmi_eeprom_rd = r[0];
++			LOG("wmi: reg caps: eeprom_rd %#x ext %#x cap1 %#x cap2 %#x modes %#x 2g %u-%u 5g %u-%u",
++			    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+ 		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
+ 			wmi_seen_bmap = true;
+ 			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
+@@ -4869,6 +4881,8 @@
+ 	}
+ 	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
+ 	if (id == 0x5001 && l >= 16) {             /* VDEV_START_RESP {vdev, req, type, status} */
++		/* 0125: say what the firmware answered (status 1 bad vdev, 2 unsupported, 3 DFS, 4 regdomain) */
++		LOG("t=%u ms: join: VDEV_START_RESP vdev %u req %u type %u status %d", g_ms, v[0], v[1], v[2], (int32_t)v[3]);
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = true;
+ 	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
+@@ -5134,6 +5148,7 @@
+ 		LOG("t=%u ms: *** WMI READY (fw MAC %02x:%02x:%02x:%02x:%02x:%02x) ***", g_ms, wmi_mac[0], wmi_mac[1],
+ 		    wmi_mac[2], wmi_mac[3], wmi_mac[4], wmi_mac[5]);
+ 		if (wmi_ready) {
++			wmi_set_regdomain();                /* 0125: as ath10k does before any vdev starts */
+ 			htt_start();                        /* the host rx ring first, then the scan */
+ 		}
+ 		break;
+@@ -5152,6 +5167,46 @@
+ 	}
+ }
+ 
++/*
++ * 0125: WMI_PDEV_SET_REGDOMAIN (ath10k_wmi_tlv_op_gen_pdev_set_rd: cmd 0x4001, tag 0x51,
++ * {pdev_id, regd, regd_2ghz, regd_5ghz, conform_limit_2ghz, conform_limit_5ghz}).
++ * Boot 2026-10-24 14:50: every join failed 2 ms after VDEV_START ("failed (5) in state 1": the
++ * firmware's VDEV_START_RESP status was not 0) while scans worked. ath10k always sets the
++ * regulatory domain before it starts a vdev; this driver never did (topaz's firmware/board data
++ * did not need it). Domain: the board's own (eeprom_rd from SERVICE_READY) when it names one,
++ * else FCC3_FCCA (0x3A, United States, ath regd_common.h) with CTL_FCC (0x10) for both bands.
++ * Boot-args: sweetwlanrd=N forces a domain, sweetwlanrd=0 sends nothing; sweetwlanctl=N the CTLs.
++ */
++static void
++wmi_set_regdomain(void)
++{
++	uint32_t rd = 0x3A, ctl = 0x10, forced = ~0u;
++
++	if (wmi_rd_sent) {
++		return;
++	}
++	wmi_rd_sent = true;
++	if (PE_parse_boot_argn("sweetwlanrd", &forced, sizeof(forced))) {
++		if (forced == 0) {
++			LOG("wmi: regulatory domain not sent (sweetwlanrd=0)");
++			return;
++		}
++		rd = forced;
++	} else if (wmi_eeprom_rd != ~0u && (wmi_eeprom_rd & 0xFFFF) != 0 && (wmi_eeprom_rd & 0x8000) == 0) {
++		rd = wmi_eeprom_rd & 0xFFFF;            /* a regulatory domain, not a country code */
++	}
++	(void)PE_parse_boot_argn("sweetwlanctl", &ctl, sizeof(ctl));
++	uint8_t m[4 + 24] = {}, *p = wmi_put_tlv(m, 0x51, 24);
++	p = put32(p, 0);
++	p = put32(p, rd);
++	p = put32(p, rd);
++	p = put32(p, rd);
++	p = put32(p, ctl);
++	put32(p, ctl);
++	bool ok = wmi_send(0x4001, m, sizeof(m));
++	LOG("wmi: regulatory domain %#x (board said %#x), CTL %#x: %s", rd, wmi_eeprom_rd, ctl, ok ? "sent" : "NOT sent");
++}
++
+ /* from the watch loop */
+ static void
+ radio_poll(unsigned ms)

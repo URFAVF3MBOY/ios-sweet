@@ -1,0 +1,110 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 23:20:00 -0400
+Subject: [PATCH] op7t-0144: RedwoodGPU: which surfaces submissions push out of the cache
+
+Swiping the home screen with touch_lat=1 (2026-10-25): 129 of 142 missed
+vsyncs follow a window-server frame over 16.7 ms, and the GPU waits only
+~1 ms of it. The five-second line says every submission pushes ~13 MB out
+of the cache (~0.7 ms, ~285 submissions a second, all inside backboardd's
+frames), and it stays 12.8 MB with sweetgpupush=100000: not 0115's timer
+but a seed that moves or a surface the program mapped.
+Now the five-second line is followed by the surfaces that cost the most
+(up to 6: id, size, a program's memory or not, times, MB, who submitted,
+and how often each reason held). Diagnostic only, behaviour unchanged.
+Log: "RedwoodGPU: pushed out of the cache: surface ...".
+Syntax-checked with g++ -Wall -Wextra on stubs.
+
+Apply after 0143.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 2b9047a..65c8eab 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -54,6 +54,7 @@
+ #include <IOKit/IOSubMemoryDescriptor.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
++#include <sys/proc.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -240,6 +241,53 @@ static struct {
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+ } gGPUStat;
+ 
++/*
++ * 0144: which surfaces the submissions push out of the cache, and why. Swiping the home screen
++ * (2026-10-25, touch_lat=1): ~13 MB pushed at every submission (~0.7 ms each, ~285 a second,
++ * all of it in the window server's frame), and still with sweetgpupush=100000 -- so not 0115's
++ * timer, but a seed that moves or a surface the program has mapped. Logged with the five-second
++ * line: the surfaces that cost the most, who submitted, and how often each reason held.
++ */
++#define GPU_PUSH_TOP    6
++enum { kPushSeed = 0, kPushMapped, kPushTimer, kPushReasons };
++static struct gpu_push {
++	uint32_t surface, width, height, count, why[kPushReasons];
++	uint64_t bytes;
++	bool wrapped;
++	char who[20];
++} gGPUPush[GPU_PUSH_TOP];
++
++static void
++pushNoted(SweetSurface * s, uint64_t bytes, int why)
++{
++	struct gpu_push * p = NULL;
++	char who[20];
++
++	proc_selfname(who, sizeof(who));
++	for (uint32_t i = 0; i < GPU_PUSH_TOP && p == NULL; i++) {
++		if (gGPUPush[i].count != 0 && gGPUPush[i].surface == s->id && strncmp(gGPUPush[i].who, who, sizeof(who)) == 0) {
++			p = &gGPUPush[i];
++		}
++	}
++	if (p == NULL) {                        /* a new one takes the place of the one that cost least */
++		p = &gGPUPush[0];
++		for (uint32_t i = 1; i < GPU_PUSH_TOP; i++) {
++			if (gGPUPush[i].bytes < p->bytes) {
++				p = &gGPUPush[i];
++			}
++		}
++		bzero(p, sizeof(*p));
++		p->surface = s->id;
++		p->width = s->width;
++		p->height = s->height;
++		p->wrapped = s->wrapped;
++		strlcpy(p->who, who, sizeof(p->who));
++	}
++	p->count++;
++	p->bytes += bytes;
++	p->why[why]++;
++}
++
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+ static bool
+ gpuWait(uint32_t fence, uint64_t milliseconds)
+@@ -1069,6 +1117,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 				}
+ 				continue;
+ 			}
++			pushNoted(b->surface, b->size, !clean ? kPushSeed : b->seen ? kPushMapped : kPushTimer);   /* 0144 */
+ 			b->seed = seed;
+ 			b->pushed = began;
+ 			b->surface->cleanSeed = seed;  /* 0116: pushed: nothing of the CPU's left in the cache at this seed */
+@@ -1197,6 +1246,17 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
+ 			    largest >> 20, holes, most, lost >> 10, refused);
+ 		}
++		for (uint32_t i = 0; i < GPU_PUSH_TOP; i++) {   /* 0144 */
++			struct gpu_push * p = &gGPUPush[i];
++
++			if (p->count != 0) {
++				IOLog("RedwoodGPU: pushed out of the cache: surface %u (%ux%u%s) %u times, %llu MB, for %s: "
++				    "%u seed moved, %u mapped by the program, %u again after %u ms\n", p->surface, p->width,
++				    p->height, p->wrapped ? ", a program's memory" : "", p->count, p->bytes >> 20, p->who,
++				    p->why[kPushSeed], p->why[kPushMapped], p->why[kPushTimer], gGPUPushAgainMs);
++			}
++		}
++		bzero(gGPUPush, sizeof(gGPUPush));
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+ 	IOLockUnlock(gGPULock);

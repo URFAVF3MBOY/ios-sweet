@@ -1,0 +1,118 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 03:50:00 +0000
+Subject: [PATCH] op7t-0136: Wi-Fi scan table that keeps up (no more full-at-boot)
+
+SweetModem's table of access points was 64 entries, filled once per boot and
+never emptied: with many networks around it was full after the first scans,
+and any network that came up later -- a phone's or the PC's hotspot
+(2026-10-25: neither ever showed in iOS) -- could never be heard or joined.
+Now 128 entries; when full, a newcomer replaces one not heard for 30 s, else
+the weakest if the newcomer is stronger; the AP joined keeps its place. Joins
+pick the strongest AP with the name among those heard in the last 60 s
+(stale RSSIs could pick a gone AP or the wrong band), else any.
+
+Apply after 0124.
+---
+ iokit/Kernel/arm/SweetModem.cpp | 66 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 57 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index 7c517b3..742ae44 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -3444,7 +3444,18 @@ struct bss {
+ 	uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen;
+ 	uint8_t raw_ssid[32], raw_ssid_len; uint16_t freq, bintval, capab, ie_len; uint32_t last_ms; uint8_t ie[768];
+ };
+-static struct bss bss[64];
++/*
++ * 0136: the table of access points heard. It used to be 64 entries filled once per boot and never
++ * emptied: somewhere with many networks it was full after the first scans, and any network that
++ * came up later (a phone's or the PC's hotspot, 2026-10-25) could never be heard, nor joined. Now
++ * 128 entries, and when full a new network takes the place of one not heard for BSS_STALE_MS, else
++ * of the weakest if the new one is stronger; the network being joined or joined keeps its place.
++ */
++#define NBSS            128u
++#define BSS_STALE_MS    30000u
++#define BSS_FRESH_MS    60000u
++static struct bss bss[NBSS];
++static bool bss_is_joined(const uint8_t bssid[6]);     /* (after s_bssid, below) */
+ static uint32_t nbss, scans, scan_frames;
+ static volatile uint32_t api_scans_done;
+ static bool scan_started, scanning;
+@@ -3807,10 +3818,30 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 		}
+ 	}
+ 	if (b == NULL) {
+-		if (nbss >= 64) {
+-			return;
++		if (nbss < NBSS) {
++			b = &bss[nbss++];
++		} else {
++			/* 0136: full: the longest unheard entry if stale, else the weakest if this one is stronger */
++			int oldest = -1, weakest = -1;
++			for (uint32_t i = 0; i < nbss; i++) {
++				if (bss_is_joined(bss[i].bssid)) {
++					continue;               /* the network joined (or being joined) */
++				}
++				if (oldest < 0 || g_ms - bss[i].last_ms > g_ms - bss[oldest].last_ms) {
++					oldest = (int)i;
++				}
++				if (weakest < 0 || bss[i].rssi < bss[weakest].rssi) {
++					weakest = (int)i;
++				}
++			}
++			if (oldest >= 0 && g_ms - bss[oldest].last_ms > BSS_STALE_MS) {
++				b = &bss[oldest];
++			} else if (weakest >= 0 && rssi > bss[weakest].rssi) {
++				b = &bss[weakest];
++			} else {
++				return;
++			}
+ 		}
+-		b = &bss[nbss++];
+ 		bzero(b, sizeof(*b));
+ 		memcpy(b->bssid, f + 16, 6);
+ 		fresh = true;
+@@ -4234,6 +4265,14 @@ static volatile int s_result;                   /* of the last join: 0 joined, e
+ static volatile bool s_join_asked, s_leave_asked;
+ static volatile uint32_t s_join_done;           /* bumped when a join ends either way */
+ static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
++
++/* 0136: is this the access point joined or being joined (its place in the scan table is kept) */
++static bool
++bss_is_joined(const uint8_t bssid[6])
++{
++	static const uint8_t none[6] = {};
++	return memcmp(s_bssid, none, 6) != 0 && memcmp(bssid, s_bssid, 6) == 0;
++}
+ static uint8_t s_body[768];                     /* the AP's beacon IEs */
+ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s;
+ static bool s_rsn, s_start_resp, s_ptk_set;
+@@ -4782,12 +4821,21 @@ w_join_end(int result)
+ static void
+ w_join_begin(void)
+ {
+-	/* the AP: the strongest one heard with that name (or the BSSID asked for) */
++	/*
++	 * the AP: the strongest one heard with that name (or the BSSID asked for). 0136: among those
++	 * heard in the last BSS_FRESH_MS first -- an entry's RSSI is from when it was last heard, and an
++	 * AP heard strongly minutes ago may be the wrong band or gone -- else any.
++	 */
+ 	int best = -1;
+-	for (uint32_t i = 0; i < nbss; i++) {
+-		if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
+-		    (best < 0 || bss[i].rssi > bss[best].rssi)) {
+-			best = (int)i;
++	for (int pass = 0; pass < 2 && best < 0; pass++) {
++		for (uint32_t i = 0; i < nbss; i++) {
++			if (pass == 0 && g_ms - bss[i].last_ms > BSS_FRESH_MS) {
++				continue;
++			}
++			if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
++			    (best < 0 || bss[i].rssi > bss[best].rssi)) {
++				best = (int)i;
++			}
+ 		}
+ 	}
+ 	bool want_bssid = false;

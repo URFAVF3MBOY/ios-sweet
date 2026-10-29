@@ -1,0 +1,78 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 03:30:00 +0000
+Subject: [PATCH] op7t-0135: tell iOS the Wi-Fi noise floor (scan results, NOISE, link event)
+
+Every scan result went to wifid with noise 0 and SNR 0, and NOISE (17) was
+unanswered, while SweetModem.cpp builds each RSSI as the firmware's SNR - 95.
+So a network at -60 dBm read as 60 dB under the noise: dasd saw wifiQuality 0
+(2026-10-24) while Wi-Fi worked, and wifid's join and keep-or-leave choices
+work from the same numbers. Now: noise -95 dBm (the floor RSSIs already
+assume), SNR = RSSI + 95, in scan results, NOISE and the link-up event.
+
+Apply after 0124.
+---
+ bsd/dev/redwood_apple80211.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..366352f 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -133,6 +133,19 @@ struct apple80211_scan_request {
+ 	uint32_t short_ssid, unused_3;
+ };
+ 
++/*
++ * 0135: the noise floor. SweetModem.cpp makes each RSSI as the firmware's SNR - 95, so -95 dBm is the floor the
++ * numbers already assume; iOS was never told it (noise 0 and SNR 0 in every scan result, NOISE unanswered), so
++ * every network looked 60-90 dB below the noise: wifid's and dasd's link quality read 0 (2026-10-24).
++ */
++#define NOISE_FLOOR_DBM         (-95)
++
++static uint16_t
++snr_of(int rssi)
++{
++	return rssi > NOISE_FLOOR_DBM ? (uint16_t)(rssi - NOISE_FLOOR_DBM) : 0;
++}
++
+ /* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
+ struct apple80211_scan_result {
+ 	uint32_t version;
+@@ -259,6 +272,9 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	result->noise_known = 1;                /* 0135 */
++	result->noise = NOISE_FLOOR_DBM;
++	result->snr = (int16_t)snr_of(bss->rssi);
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -433,6 +449,16 @@ get(struct apple80211req *request)
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 17: {                              /* the noise floor, in the same form (0135) */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR_DBM }, .all = NOISE_FLOOR_DBM,
++			     .each_ext = { NOISE_FLOOR_DBM }, .all_ext = NOISE_FLOOR_DBM };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+@@ -648,6 +674,10 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1) {              /* 0135 */
++				link.snr = snr_of(state->bss.rssi);
++				link.noise = (uint16_t)(int16_t)NOISE_FLOOR_DBM;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);

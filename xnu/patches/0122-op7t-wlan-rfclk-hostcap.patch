@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -13,6 +13,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_arc_level(const char *res, unsigned vlvl);
++int sweet_rpmh_clk_enable(const char *res, unsigned unused);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -436,5 +437,43 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++/*
++ * 0122: an RPMh clock vote (Linux clk-rpmh DEFINE_CLK_RPMH_VRM, sm8150 "rfclka2" = RPMH_RF_CLK2):
++ * a VRM resource in cmd-db, switched on by writing 1 at +4 (CLK_RPMH_VRM_EN_OFFSET). Only the
++ * WCN3990's reference clock; only ever switched on.
++ */
++int
++sweet_rpmh_clk_enable(const char *res, unsigned unused)
++{
++	(void)unused;
++	if (!res || strcmp(res, "rfclka2")) {
++		printf("HOTDOGB RPMH: clock vote only for rfclka2\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("HOTDOGB RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address, NULL, NULL);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {4};
++		const uint32_t values[1] = {1};
++		error = rh_send(address, 1, offsets, values);
++	}
++out:
++	if (error) {
++		printf("HOTDOGB RPMH: %s clock vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2596,7 +2596,18 @@
+ 		}
+ 		LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
+ 		if (wm_new(&m, WLFW_HOST_CAP)) {
+-			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
++			/*
++			 * 0122: daemon_support as ONE byte: mainline sm8150 sets qcom,snoc-host-cap-8bit-quirk
++			 * (ath10k wlfw_host_cap_8bit_req_msg_v01); the 4-byte form is for other SoCs.
++			 * Boot-arg sweethostcap32=1 sends the old 4-byte form.
++			 */
++			unsigned cap32 = 0;
++			(void)PE_parse_boot_argn("sweethostcap32", &cap32, sizeof(cap32));
++			if (cap32) {
++				wm_u32(&m, 0x10, 0);
++			} else {
++				wm_u8(&m, 0x10, 0);         /* daemon_support = 0 */
++			}
+ 			wm_send(&m);
+ 			w_step = "host_cap sent";
+ 		}
+@@ -5651,6 +5662,7 @@
+  */
+ extern "C" int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern "C" int sweet_rpmh_arc_level(const char *res, unsigned vlvl);
++extern "C" int sweet_rpmh_clk_enable(const char *res, unsigned unused);      /* 0122 */
+ 
+ #define AOP_MSGRAM_PA       0x0C300000ull
+ #define AOP_MSGRAM_SIZE     0x1000u
+@@ -5789,6 +5801,22 @@
+ 		e = vote_retry(sweet_rpmh_vreg_enable, wlan_rails[i].res, wlan_rails[i].mv);
+ 		LOG("rpmh: WCN3990 rail %s %u mV: %d", wlan_rails[i].res, wlan_rails[i].mv, e);
+ 	}
++	/*
++	 * 0122: the WCN3990's reference clock. Mainline sm8150.dtsi gives the Wi-Fi node
++	 * clocks = <&rpmhcc RPMH_RF_CLK2> ("cxo_ref_clk_pin"), which ath10k_snoc switches on with the
++	 * rails, before it talks to the firmware. Nothing here did: boot 2026-10-24, the WLAN PD
++	 * took an exception in its real-time thread ("EX:wlan_process:0x1:WLAN RT:0x76:PC=0xb01998b0")
++	 * 14 ms after cal_report, as it brings the radio up -- consistent with a radio without its
++	 * reference clock. Boot-arg sweetwlanclk=0 skips the vote.
++	 */
++	{
++		unsigned clk = 1;
++		(void)PE_parse_boot_argn("sweetwlanclk", &clk, sizeof(clk));
++		if (clk) {
++			e = vote_retry(sweet_rpmh_clk_enable, "rfclka2", 1);
++			LOG("rpmh: WCN3990 reference clock rfclka2 (RPMH_RF_CLK2): %d", e);
++		}
++	}
+ }
+ 
+ static void

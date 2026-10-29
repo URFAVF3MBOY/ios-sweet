@@ -1,0 +1,405 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..e8dbdfa 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14579,3 +14579,29 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++/*
++ * OnePlus 7T (kitty 0107 v6): for iokit/Kernel/arm/SweetDrop.cpp, the payload drop, which deletes or
++ * moves aside paths of the iOS root at boot: the system calls' own code, with kernel paths.
++ */
++int sweet_drop_unlink(const char *path, vfs_context_t ctx);
++int sweet_drop_rmdir(const char *path, vfs_context_t ctx);
++int sweet_drop_rename(const char *from, const char *to, vfs_context_t ctx);
++
++int
++sweet_drop_unlink(const char *path, vfs_context_t ctx)
++{
++	return unlinkat_internal(ctx, AT_FDCWD, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++
++int
++sweet_drop_rmdir(const char *path, vfs_context_t ctx)
++{
++	return rmdirat_internal(ctx, AT_FDCWD, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++
++int
++sweet_drop_rename(const char *from, const char *to, vfs_context_t ctx)
++{
++	return renameat_internal(ctx, AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
+diff --git a/iokit/Kernel/arm/SweetDrop.cpp b/iokit/Kernel/arm/SweetDrop.cpp
+new file mode 100644
+index 0000000..fa57ad4
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetDrop.cpp
+@@ -0,0 +1,336 @@
++/*
++ * OnePlus 7T (kitty 0107 v6): write, delete or move aside files of the iOS root at boot, from the boot payload.
++ * See the comment below; tools/mkdrop.py makes the blob, mkpayload.py --ramdisk carries it.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>                 /* gIODTPlane */
++#include <pexpert/device_tree.h>                       /* SecureDTLookupEntry / SecureDTGetProperty */
++#include <libkern/c++/OSData.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++
++/*
++ * Payload drop (kitty 0107) ----------------------------------------------------------------------
++ * Files carried in the boot payload (mkpayload.py --ramdisk OUT.drop, made by tools/mkdrop.py) are
++ * written into the iOS root once it is mounted, before backboardd starts: a new libredwood-gl.dylib
++ * then needs only mkpayload + shim build + fastboot boot, not an image rebuild and userdata reflash.
++ * mkpayload puts the blob after the kernel (never given to the VM) and names it in
++ * /chosen/memory-map "RAMDisk" (IOFindBSDRoot also makes /dev/md0 of it; with rd=ufsroot0 unused).
++ * Only acts on a blob starting with "HOTDOGBDRP"; anything else (no --ramdisk, a real md0 image) is ignored.
++ * Format, little-endian: "HOTDOGBDRP", u32 version 1 or 2, u32 count; per entry: u32 path_len (with NUL,
++ * <= 256), u32 mode, u32 uid, u32 gid, u64 size, u32 fnv1a, u32 0, path padded to 8, data padded to 8.
++ * v6 (version 2): the top byte of mode says what to do with the path, in the order given:
++ *   0 write the file (as v1); 1 delete it (a file, or an empty folder); 2 move it aside (a file or a
++ *   whole folder, renamed to PATH.sweetdrop-old, or -old2... if that is taken): what iOS keeps there
++ *   is made again from scratch, and the old one is still there to look at. Delete/aside carry no data.
++ * Nothing is done to a path that is not there (logged as such).
++ */
++#define DROP_OP_WRITE   0
++#define DROP_OP_DELETE  1
++#define DROP_OP_ASIDE   2
++
++/* bsd/vfs/vfs_syscalls.c (0107 v6): unlink / rmdir / rename of kernel paths, as the system calls */
++extern "C" int sweet_drop_unlink(const char *path, vfs_context_t ctx);
++extern "C" int sweet_drop_rmdir(const char *path, vfs_context_t ctx);
++extern "C" int sweet_drop_rename(const char *from, const char *to, vfs_context_t ctx);
++extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
++extern "C" vnode_t rootvnode;                   /* bsd/vfs: set once the root file system is mounted */
++
++struct drop_file {
++	const char *path;
++	const uint8_t *data;
++	uint64_t size;
++	uint32_t mode, uid, gid, fnv;
++	uint32_t op;                            /* DROP_OP_* */
++};
++
++static uint32_t
++drop_fnv1a(const uint8_t *p, uint64_t n)
++{
++	uint32_t h = 2166136261u;
++	for (uint64_t i = 0; i < n; i++) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++/* Parse the blob; fills up to max files, returns how many, or -1 if it is not a valid drop. */
++static int
++drop_parse(const uint8_t *b, uint64_t size, struct drop_file *f, int max)
++{
++	uint32_t ver, count;
++	uint64_t o = 16;
++
++	if (size < 16 || memcmp(b, "HOTDOGBDRP", 8) != 0) {
++		return -1;
++	}
++	memcpy(&ver, b + 8, 4);
++	memcpy(&count, b + 12, 4);
++	if ((ver != 1 && ver != 2) || count == 0 || count > (uint32_t)max) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t plen, mode, uid, gid, fnv;
++		uint64_t len;
++		if (size - o < 32) {
++			return -1;
++		}
++		memcpy(&plen, b + o, 4);
++		memcpy(&mode, b + o + 4, 4);
++		memcpy(&uid, b + o + 8, 4);
++		memcpy(&gid, b + o + 12, 4);
++		memcpy(&len, b + o + 16, 8);
++		memcpy(&fnv, b + o + 24, 4);
++		o += 32;                                /* + u32 reserved */
++		uint64_t pspan = ((uint64_t)plen + 7) & ~7ULL;
++		if (plen < 3 || plen > 256 || pspan > size - o || b[o + plen - 1] != 0 || b[o] != '/') {
++			return -1;
++		}
++		for (uint32_t k = 0; k + 1 < plen; k++) {
++			if (b[o + k] == 0) {
++				return -1;              /* one string, no NUL inside */
++			}
++		}
++		f[i].path = (const char *)(b + o);
++		o += pspan;
++		uint64_t dspan = (len + 7) & ~7ULL;
++		if (len > size || dspan > size - o) {
++			return -1;
++		}
++		f[i].data = b + o;
++		f[i].size = len;
++		f[i].mode = mode & 07777;
++		f[i].op = ver == 2 ? mode >> 24 : DROP_OP_WRITE;
++		if (f[i].op > DROP_OP_ASIDE || (f[i].op != DROP_OP_WRITE && len != 0)) {
++			return -1;
++		}
++		f[i].uid = uid;
++		f[i].gid = gid;
++		f[i].fnv = fnv;
++		o += dspan;
++	}
++	return (int)count;
++}
++
++static const uint8_t *drop_blob;
++static uint64_t drop_size;
++
++static int
++drop_write(const struct drop_file *f, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(f->path, O_CREAT | O_TRUNC | FWRITE, (int)f->mode, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	uint64_t done = 0;
++	while (error == 0 && done < f->size) {
++		uint64_t chunk = MIN(f->size - done, (uint64_t)(1 << 20));
++		uio_t uio = uio_create(1, (off_t)done, UIO_SYSSPACE, UIO_WRITE);
++		if (uio == NULL) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(f->data + done), (user_size_t)chunk);
++		error = VNOP_WRITE(vp, uio, 0, ctx);
++		if (error == 0 && uio_resid(uio) != 0) {
++			error = EIO;
++		}
++		uio_free(uio);
++		done += chunk;
++	}
++	if (error == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, (mode_t)f->mode);
++		VATTR_SET(&va, va_uid, (uid_t)f->uid);
++		VATTR_SET(&va, va_gid, (gid_t)f->gid);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error != 0 ? error : close_error;
++}
++
++/* delete: a file, else an empty folder */
++static int
++drop_delete(const char *path, vfs_context_t ctx)
++{
++	int error = sweet_drop_unlink(path, ctx);
++	if (error == EISDIR || error == EPERM) {        /* (unlink of a folder: EPERM on HFS) */
++		error = sweet_drop_rmdir(path, ctx);
++	}
++	return error;
++}
++
++/* move aside: PATH -> PATH.sweetdrop-old (or -oldN when taken) */
++static int
++drop_aside(const char *path, vfs_context_t ctx, char *to, size_t tosize)
++{
++	int error = EEXIST;
++	for (int n = 1; n < 10 && error == EEXIST; n++) {
++		if (n == 1) {
++			snprintf(to, tosize, "%s.sweetdrop-old", path);
++		} else {
++			snprintf(to, tosize, "%s.sweetdrop-old%d", path, n);
++		}
++		vnode_t vp = NULLVP;
++		if (vnode_lookup(to, 0, &vp, ctx) == 0) {
++			vnode_put(vp);                  /* taken: next name */
++			error = EEXIST;
++			continue;
++		}
++		error = sweet_drop_rename(path, to, ctx);
++	}
++	return error;
++}
++
++static void
++drop_thread(void *, wait_result_t)
++{
++	struct drop_file f[16];
++	vfs_context_t ctx;
++
++	/*
++	 * Everything that can sleep runs here, on a real kernel thread, NOT in the AppleCLCD::start
++	 * path: reading /chosen/memory-map there panicked ("Taking non-sleepable RW lock with
++	 * preemption enabled @lock_rw.c", boot 2026-10-24), because that early context must not block.
++	 */
++	/*
++	 * Read /chosen/memory-map "RAMDisk" from the BOOT device tree (SecureDT), not the IORegistry:
++	 * the registry lookup found nothing on boot dfb9e8 although XNU had just made md0 of the blob
++	 * ("Added memory device md0 ... at FFFFFE0008510000 for 80000"). Every exit says why.
++	 */
++	DTEntry mm;
++	void const *prop = NULL;
++	unsigned int psize = 0;
++	int lk = SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm);
++	IOLog("HOTDOGB DROP: thread up, memory-map lookup = %d\n", lk);
++	if (lk != kSuccess) {
++		return;
++	}
++	int gp = SecureDTGetProperty(mm, "RAMDisk", &prop, &psize);
++	IOLog("HOTDOGB DROP: RAMDisk property = %d, size %u\n", gp, psize);
++	if (gp != kSuccess || prop == NULL || psize < 16) {
++		return;
++	}
++	uint64_t rd[2];
++	memcpy(rd, prop, sizeof(rd));
++	uint64_t pa = rd[0], size = rd[1];
++	if (pa == 0 || size < 16) {
++		IOLog("HOTDOGB DROP: RAMDisk entry empty (%llx +%llx)\n", pa, size);
++		return;
++	}
++	drop_blob = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	drop_size = size;
++	if (drop_blob == NULL) {
++		IOLog("HOTDOGB DROP: RAMDisk at %llx not mapped (ml_static_ptovirt)\n", pa);
++		return;
++	}
++	int n = drop_parse(drop_blob, drop_size, f, 16);
++	if (n <= 0) {
++		IOLog("HOTDOGB DROP: RAMDisk at %llx (+%llx) is not a valid drop (starts %02x%02x%02x%02x%02x%02x%02x%02x)\n",
++		    pa, size, drop_blob[0], drop_blob[1], drop_blob[2], drop_blob[3], drop_blob[4], drop_blob[5],
++		    drop_blob[6], drop_blob[7]);
++		return;
++	}
++	IOLog("HOTDOGB DROP: %d entr%s in the payload at %llx (+%llx), done once the root is mounted\n", n, n == 1 ? "y" : "ies", pa, size);
++	/*
++	 * v7: no path lookup before the root is mounted. AppleCLCD::start runs long before BSD mounts
++	 * it; a vnode_lookup() then panicked ("Taking non-sleepable RW lock with preemption enabled
++	 * @lock_rw.c:1377", boot 2026-10-24 05:49, right after the line above; v1's panic was the same).
++	 */
++	unsigned rooted = 0;
++	while (rootvnode == NULLVP && rooted < 300000) {
++		IOSleep(100);
++		rooted += 100;
++	}
++	if (rootvnode == NULLVP) {
++		IOLog("HOTDOGB DROP: no root after %u ms: nothing done\n", rooted);
++		return;
++	}
++	IOSleep(500);                           /* (and let the mount finish settling) */
++	IOLog("HOTDOGB DROP: root is mounted (after %u ms)\n", rooted);
++	ctx = vfs_context_create(NULL);
++	for (int i = 0; i < n; i++) {
++		char dir[256];
++		strlcpy(dir, f[i].path, sizeof(dir));
++		size_t last = 0;
++		for (size_t k = 0; dir[k] != 0; k++) {
++			if (dir[k] == '/') {
++				last = k;
++			}
++		}
++		if (last > 0) {
++			dir[last] = 0;                  /* the parent folder */
++		}
++		/* wait for the iOS root (and the folder) to be there: poll 100 ms, up to 120 s */
++		unsigned waited = 0;
++		for (;; waited += 100) {
++			vnode_t dvp = NULLVP;
++			if (vnode_lookup(dir, 0, &dvp, ctx) == 0) {
++				vnode_put(dvp);
++				break;
++			}
++			if (waited >= 120000) {
++				break;
++			}
++			IOSleep(100);
++		}
++		if (f[i].op != DROP_OP_WRITE) {
++			vnode_t vp = NULLVP;
++			int error = vnode_lookup(f[i].path, 0, &vp, ctx);
++			char to[300] = "";
++			if (error == 0) {
++				vnode_put(vp);
++				error = f[i].op == DROP_OP_DELETE ? drop_delete(f[i].path, ctx) : drop_aside(f[i].path, ctx, to, sizeof(to));
++			}
++			IOLog("HOTDOGB DROP: %s: %s%s%s -> %s (error %d, after %u ms)\n", f[i].path,
++			    f[i].op == DROP_OP_DELETE ? "delete" : "move aside", to[0] ? " to " : "", to,
++			    error == 0 ? "done" : error == ENOENT ? "not there, nothing to do" : "NOT done", error, waited);
++			continue;
++		}
++		uint32_t fnv = drop_fnv1a(f[i].data, f[i].size);
++		int error = fnv != f[i].fnv ? EBADMSG : drop_write(&f[i], ctx);
++		IOLog("HOTDOGB DROP: %s: %llu bytes, fnv %08x%s, mode %o uid %u gid %u -> %s (error %d, after %u ms)\n",
++		    f[i].path, f[i].size, fnv, fnv != f[i].fnv ? " (BLOB DAMAGED)" : "", f[i].mode, f[i].uid, f[i].gid,
++		    error == 0 ? "written" : "NOT written", error, waited);
++	}
++	vfs_context_rele(ctx);
++}
++
++/* v6: called from AppleCLCD::start (SweetFramebuffer.cpp), before sweet_modem_init. Once only. */
++extern "C" void sweet_drop_start(void);
++extern "C" void
++sweet_drop_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	/*
++	 * Called from AppleCLCD::start (early, preemption-sensitive): only spawn the worker. All the
++	 * work -- the registry read, the parse, waiting for the root, the writes -- is in drop_thread.
++	 */
++	if (started) {
++		return;
++	}
++	started = true;
++	/* v6: say it was called at all (v2-v4 never were: nothing called sweet_drop_start) */
++	kern_return_t kr = kernel_thread_start(drop_thread, NULL, &thread);
++	IOLog("HOTDOGB DROP: start called, worker thread %s (kr %d)\n", kr == KERN_SUCCESS ? "started" : "NOT started", kr);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else
++extern "C" void sweet_drop_start(void) {}
++#endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 699be48..ee59dc5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -178,6 +178,8 @@ static uint32_t sweet_fps_on;
+ static uint64_t sweet_fps_second;
+ static uint32_t sweet_fps_swaps;
+ 
++extern "C" void sweet_drop_start(void);        /* iokit/Kernel/arm/SweetDrop.cpp (0107 v6): files from the boot payload */
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -186,6 +188,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	sweet_drop_start();                     /* 0107 v6: before, nothing called it */
+ 	sweet_modem_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -22,3 +22,4 @@ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetDrop.cpp                                   optional iokitcpp
