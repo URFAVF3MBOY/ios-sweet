@@ -1,0 +1,450 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0337000..14a9e83 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -500,12 +500,11 @@ static int k1_tlb_flush_range(uint64_t va, uint64_t size)
+ 	if (k1_tlb_method >= 1)
+ 		k1_cbw(CB_TLBIASID, k1_cb_index);
+ 	if (k1_tlb_method >= 2) {
+-		for (uint64_t o = 0; o < size && o < (4ULL << 20); o += 0x1000) {
++		/* every page: on the 7T TLBIASID does not reach these entries (method 2 is what works) */
++		for (uint64_t o = 0; o < size; o += 0x1000) {
+ 			k1_cbw64(CB_TLBIVA, ((va + o) >> 12) & 0xfffffffffffULL);
+ 			k1_cbw64(CB_TLBIVAA, ((va + o) >> 12) & 0xfffffffffffULL);
+ 		}
+-		if (size >= (4ULL << 20))
+-			k1_cbw(CB_TLBIASID, 0);
+ 	}
+ 	k1_cbw(CB_TLBSYNC, 0);
+ 	unsigned i;
+@@ -808,8 +807,10 @@ bool redwood_gpu_ready(void)
+ bool redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
+ 	switch (which) {
++	case 0x06:			/* GMEM_BASE: 0x100000 off the A650 family (Linux adreno_get_param, from memory: VERIFY); = the shim's UCHE_GMEM_RANGE_MIN */
++		*value = 0x100000;
++		return true;
+ 	case 0x01:			/* GPU_ID: none, the chip ID says it */
+-	case 0x06:			/* GMEM_BASE */
+ 	case 0x08:			/* PP_PGTABLE */
+ 	case 0x09:			/* FAULTS */
+ 	case 0x0a:			/* SUSPENDS */
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 827b5fe..de04037 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -24,7 +24,14 @@
+  * OnePlus 7T (A640) port for kitty, K1b (G5): this file is HackiOS's (oosexgang/hackios-xnu-kernel,
+  * xnu/files/iokit/Kernel/RedwoodGPU.cpp) with the IOSurface parts taken out until K2
+  * (surfaceBuffer, MiniIOSurfaceDrawn, show: their selectors answer kIOReturnUnsupported) and a
+- * kernel self-test added (RedwoodGPUSelfTest, boot-arg sweetk1b=2). The redwood_gpu_* functions
++ * kernel self-test added (RedwoodGPUSelfTest, boot-arg sweetk1b=2).
++ * K2: the IOSurface parts are back, on kitty's SweetSurface (iokit/Kernel/arm/SweetSurface.h)
++ * instead of HackiOS's MiniIOSurface: its pixels are `memory` from byte 0 (HackiOS's start a page
++ * in, after the shared state; kitty keeps the state in a page of its own, `state`, seed at +0xc),
++ * and the display's driver (SweetFramebuffer.cpp, AppleCLCD::present) waits for the GPU through
++ * RedwoodGPUSurfaceDrawn() before it copies a surface to the panel, as HackiOS's
++ * MiniIOMobileFramebuffer does through MiniIOSurfaceDrawn(). kRedwoodShow copies a test's picture
++ * to the panel through SweetFramebufferShow() (HackiOS: MiniIOMobileFramebufferShow). The redwood_gpu_* functions
+  * it calls are in bsd/dev/sweet_gpu.c, on the GPU the shim keeps running. Selectors and
+  * structures are unchanged, so HackiOS's tools/mesa/redwood-drm talks to it as it is.
+  *
+@@ -52,6 +59,7 @@
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
++#include "SweetSurface.h"
+ 
+ extern "C" {
+ /* bsd/dev/sweet_gpu.c (K1b: the A640 the shim keeps on) */
+@@ -261,6 +269,34 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
+ 	return false;
+ }
+ 
++/*
++ * The display's driver (SweetFramebuffer.cpp) before it copies a surface to the panel: the GPU's
++ * last submission that names the surface is to be done (HackiOS MiniIOSurfaceDrawn), and what the
++ * GPU wrote is read from memory, not from this processor's cache (kitty's surfaces are cached
++ * memory): the surface's lines are cleaned and invalidated once per new submission.
++ */
++bool
++RedwoodGPUSurfaceDrawn(SweetSurface * surface, uint64_t milliseconds)
++{
++	uint32_t fence = surface->gpuDrawn;
++	bool done = true;
++
++	if (fence != 0 && gGPULock != NULL) {
++		IOLockLock(gGPULock);
++		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
++		if (done && surface->gpuSynced != fence) {
++			uintptr_t pixels = surface->kernelAddress();
++
++			if (pixels != 0) {
++				redwood_gpu_to_memory((void *) pixels, surface->allocSize);
++			}
++			surface->gpuSynced = fence;
++		}
++		IOLockUnlock(gGPULock);
++	}
++	return done;
++}
++
+ /*
+  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
+  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
+@@ -385,9 +421,12 @@ RedwoodGPUStop(void)
+ struct gpu_buffer {
+ 	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
+ 	uint8_t *                       kernel;         /* where it is in the kernel */
++	SweetSurface *                  surface;        /* whose memory it is, when not its own */
+ 	uint64_t                        address;        /* the GPU's for it */
+ 	uint64_t                        size;
+ 	uint32_t                        flags;
++	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
++	uint64_t                        pushed;         /* ... and when that was */
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+ };
+@@ -401,6 +440,7 @@ struct gpu_buffer {
+  */
+ struct gpu_left {
+ 	IOMemoryDescriptor *            memory;
++	SweetSurface *                  surface;
+ 	uint64_t                        address, size;
+ 	uint32_t                        fence, flags;
+ };
+@@ -454,7 +494,9 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	void dropKept(struct gpu_kept * k);
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
++	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn show(const struct redwood_show * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 
+ public:
+@@ -506,6 +548,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		struct gpu_left * left = &fLeft[fLeftCount++];
+ 
+ 		left->memory = b->memory;
++		left->surface = b->surface;
+ 		left->address = b->address;
+ 		left->size = b->size;
+ 		left->fence = b->fence;
+@@ -514,11 +557,15 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		if (busy) {
+ 			static uint32_t said;
+ 
+-			b->memory->retain();
++			if (b->surface == NULL) {
++				b->memory->retain();
++			} else {
++				b->surface->memory->retain();
++			}
+ 			if (said++ < 8) {
+ 				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
+ 			}
+-		} else if (redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->size);
+@@ -527,8 +574,12 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		if (b->memory != NULL) {
+ 			b->memory->release();
+ 		}
++		if (b->surface != NULL) {
++			b->surface->release();
++		}
+ 	}
+ 	b->memory = NULL;
++	b->surface = NULL;
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+ }
+@@ -544,7 +595,7 @@ RedwoodGPUUserClient::reap(void)
+ 			i++;
+ 			continue;
+ 		}
+-		if (redwood_gpu_ready() &&
++		if (left->surface == NULL && redwood_gpu_ready() &&
+ 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+@@ -554,6 +605,9 @@ RedwoodGPUUserClient::reap(void)
+ 		if (left->memory != NULL) {
+ 			left->memory->release();
+ 		}
++		if (left->surface != NULL) {
++			left->surface->release();
++		}
+ 		*left = fLeft[--fLeftCount];
+ 	}
+ }
+@@ -649,8 +703,11 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	}
+ 	b->size = size;
+ 	b->flags = flags;
++	b->seed = 0;
++	b->pushed = 0;
+ 	b->seen = false;
+ 	b->fence = 0;
++	b->surface = NULL;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	return b;
+@@ -789,6 +846,75 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* kitty's IOSurface seed: a u32 in the surface's state page (SweetSurface.cpp SWEET_SURFACE_STATE_SEED) */
++#define SWEET_SURFACE_SEED_AT   0xc
++
++static uint32_t
++surfaceSeed(SweetSurface * s)
++{
++	return s->state != NULL ? *(volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + SWEET_SURFACE_SEED_AT) : 0;
++}
++
++/*
++ * The memory of an IOSurface as a buffer (HackiOS's surfaceBuffer, on SweetSurface): its pixels,
++ * from byte 0 of the surface's memory. The surface is held for as long as the buffer is there. A
++ * surface that is a buffer of this client's already is that buffer again, as with Linux's handles.
++ * Asked only to describe (kRedwoodDescribe), no buffer is made.
++ */
++IOReturn
++RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	struct gpu_buffer * b = NULL;
++	uint64_t size, began = mach_absolute_time();
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = round_page_64(s->allocSize);
++	if (s->memory == NULL || size == 0 || size > GPU_BUFFER_MAX || s->memory->getLength() < size) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kRedwoodDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		s->release();
++	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle)) != NULL) {
++		s->memory->retain();
++		b->memory = s->memory;
++		b->kernel = (uint8_t *) s->kernelAddress();
++		b->surface = s;
++		gGPUStat.surfaces++;
++	}
++	gGPUStat.taking += mach_absolute_time() - began;
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ {
+@@ -841,7 +967,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+ 	uint64_t addresses[GPU_SUBMIT_CMDS];
+ 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
+-	uint64_t began, nanos;
++	uint64_t began, nanos, again;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+@@ -861,8 +987,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	}
+ 	IOLockLock(gGPULock);
+ 	/*
+-	 * (K1b: no IOSurfaces yet, so only buffers of ordinary memory, gpu_cached=1, are pushed out.)
+- * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
++	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
+ 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
+ 	 * draw into it again) goes out of the cache now: when the surface is said to have changed
+ 	 * (its seed: who writes one is to lock it, and so does a program that has had the GPU draw
+@@ -873,13 +998,22 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	 * ordinary memory (gpu_cached=1).
+ 	 */
+ 	began = mach_absolute_time();
++	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
+ 
+ 		if (b == NULL) {
+ 			continue;
+ 		}
+-		if (!b->seen || !gGPUCached) {
++		if (b->surface != NULL) {
++			uint32_t seed = surfaceSeed(b->surface);
++
++			if (b->kernel == NULL || (seed == b->seed && !b->seen && began - b->pushed < again)) {
++				continue;
++			}
++			b->seed = seed;
++			b->pushed = began;
++		} else if (!b->seen || !gGPUCached) {
+ 			continue;
+ 		}
+ 		redwood_gpu_to_memory(b->kernel, b->size);
+@@ -948,6 +1082,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 
+ 		if (b != NULL) {
+ 			b->fence = request->fence;
++			if (b->surface != NULL) {
++				b->surface->gpuDrawn = request->fence;
++			}
+ 		}
+ 	}
+ 	reap();
+@@ -1154,9 +1291,11 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		redwood_gpu_worked(&r.worked.microseconds, &r.worked.submissions, r.worked.by);
+ 		IOLockUnlock(gGPULock);
+ 		break;
+-	case kRedwoodSurface:                           /* K2 */
++	case kRedwoodSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
+ 	case kRedwoodShow:
+-		ret = kIOReturnUnsupported;
++		ret = show(&r.show);
+ 		break;
+ 	default:
+ 		IOLog("RedwoodGPU: request %#x (%zu bytes) is not known here\n", selector, size);
+@@ -1172,6 +1311,31 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++/* Pixels of the caller's (32 bits each, blue first) copied to the panel: for a test to show what it has drawn. */
++IOReturn
++RedwoodGPUUserClient::show(const struct redwood_show * request)
++{
++	uint64_t size = (uint64_t) request->rowBytes * request->height;
++	uint8_t * pixels;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (request->width == 0 || request->width > 4096 || request->height == 0 || request->height > 4096 ||
++	    request->rowBytes < 4 * request->width) {
++		return kIOReturnBadArgument;
++	}
++	pixels = (uint8_t *) IOMallocData(size);
++	if (pixels == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (copyin((user_addr_t) request->pixels, pixels, size) != 0) {
++		ret = kIOReturnVMError;
++	} else {
++		SweetFramebufferShow(pixels, request->width, request->height, request->rowBytes);
++	}
++	IOFreeData(pixels, size);
++	return ret;
++}
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..4a7f219 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -126,6 +126,28 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * K2: HackiOS's MiniIOMobileFramebufferShow, for RedwoodGPU's kRedwoodShow: a test program's
++ * pixels (32 bits each, blue first) copied to the top-left of the panel, to see what it drew.
++ * The window server's next swap draws over it.
++ */
++static AppleCLCD *sweet_fb_instance;
++
++void
++SweetFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t rowBytes)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++
++	if (fb == NULL || fb->fPixels == 0 || fb->fPowerOff) {
++		return;
++	}
++	uint32_t w = width < fb->fWidth ? width : fb->fWidth;
++	uint32_t h = height < fb->fHeight ? height : fb->fHeight;
++	for (uint32_t y = 0; y < h; y++) {
++		memcpy((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), pixels + (uint64_t)y * rowBytes, (size_t)w * 4);
++	}
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -187,6 +209,7 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	sweet_fb_instance = this;
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("HOTDOGB FB: no vsync timer\n");
+@@ -347,6 +370,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		/* K2: a surface the GPU draws into is copied once the GPU is done (at most 100 ms) */
++		(void)RedwoodGPUSurfaceDrawn(s, 100);
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..2d3bd02 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,8 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  gpuDrawn;     /* the GPU's last submission naming the pixels (RedwoodGPU.cpp), 0: none */
++	uint32_t                  gpuSynced;    /* ... the one after which the CPU's cache was last invalidated */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -58,6 +60,16 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * K2: true once the GPU is done with every submission that names the surface (waiting at most
++ * so long), with the CPU's cache of the pixels invalidated (RedwoodGPU.cpp). Immediately true
++ * for a surface the GPU never drew into.
++ */
++bool RedwoodGPUSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
++
++/* K2: a test's pixels onto the panel (SweetFramebuffer.cpp; RedwoodGPU's kRedwoodShow) */
++void SweetFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 

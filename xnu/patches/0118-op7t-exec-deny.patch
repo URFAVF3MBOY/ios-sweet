@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -451,6 +451,49 @@
+  */
+ #define EXECUTABLE_KEY "executable_path="
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0118 (from ios-sailfish 0182): boot-arg sweetdeny=WORD[,WORD...]: an exec of any file whose name
++ * contains one of the words fails with EACCES before the point of no return (a later failure would
++ * SIGKILL the spawner). Without the boot-arg, the default list below: app extensions that only ever
++ * crash on this phone (abort(), 2026-10-24: each ~13 times in 5 minutes, every crash a launch plus
++ * ReportCrash's report, all of it CPU taken from the apps the user opens). sweetdeny=- : nothing
++ * denied. Words shorter than 4 characters are ignored (a word cut short by the 607-character
++ * boot-args limit must not match everything).
++ */
++static const char sweet_deny_default[] = "AegirPoster,SiriTTSSynthesizerAU,MacinTalkAUSP,KonaSynthesizer";
++
++static bool
++sweet_exec_denied(const char *name)
++{
++	static char list[256];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++
++	if (state == 0) {
++		if (!PE_parse_boot_argn("sweetdeny", list, sizeof(list))) {
++			strlcpy(list, sweet_deny_default, sizeof(list));
++		}
++		state = (list[0] != '\0' && list[0] != '-') ? 2 : 1;
++	}
++	for (const char *w = list; state == 2 && *w;) {
++		size_t n = 0;
++		while (w[n] && w[n] != ',') {
++			n++;
++		}
++		char word[64];
++		if (n >= 4 && n < sizeof(word)) {
++			memcpy(word, w, n);
++			word[n] = '\0';
++			if (strnstr(name, word, strlen(name) + 1) != NULL) {
++				return true;
++			}
++		}
++		w += n + (w[n] == ',');
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * exec_save_path
+  *
+@@ -2197,6 +2240,25 @@
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == 0) {      /* 0118: sweetdeny= (sweet_exec_denied) */
++		const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *base = path;
++
++		for (const char *c = path; *c; c++) {
++			if (*c == '/') {
++				base = c + 1;
++			}
++		}
++		if (sweet_exec_denied(base)) {
++			static uint32_t sweet_denied_logged;
++
++			if (sweet_denied_logged++ < 32) {
++				printf("exec %s denied (sweetdeny)\n", base);
++			}
++			error = EACCES;
++		}
++	}
++#endif
+ 	if (error) {
+ 		goto bad;
+ 	}

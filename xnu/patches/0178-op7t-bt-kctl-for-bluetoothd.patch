@@ -1,0 +1,330 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 13:00:00 -0500
+Subject: [PATCH] op7t-0178: Bluetooth: the kernel control bluetoothd's H4 driver opens
+
+With the ADT's /arm-io/bluetooth transport-encoding 1 (H4) and the
+BlueTool stand-in answering (tools/bluetool_stub.py), bluetoothd got to
+its transport and stopped (2026-11-11): "ioctl(CTLIOCGINFO,
+com.apple.uart.sk.bluetooth) failed (ENOENT)" -> "Failed to initialize
+driver POSIX" -> "Failed to initialize transport H4" -> "Bluetooth fatal
+error - crashing { reason=1201 }". iOS 16.5's POSIX HCI driver does not
+open a tty: it connects a PF_SYSTEM/SOCK_STREAM socket to a kernel control
+(by default Apple's com.apple.uart.sk.bluetooth), getsockopt(TIOCGETA) /
+setsockopt(TIOCSETA) a 72-byte termios, then speaks plain H4 on it
+(found by HackiOS, vayu_bt.c "com.vayu.bt.uart").
+
+Now, when kern.sweetbt=1 reaches stage 6: a kernel control of that name
+(stream, not privileged, one client; termios stored, not applied: the
+UART stays at 115200, the NVM says so since 0176) and a kernel thread
+"sweet-bt-io" that from then on owns the UART: client TX ring (16 KB) ->
+uart_tx, uart_rx -> ctl_enqueuedata, or to kern.sweetbtio's buffer when
+no client is connected (pipe reads wait up to 20 ms on it; writes still
+go straight out). kern.sweetbt=2 answers EBUSY once the thread runs.
+Logged: "sweet_bt: kctl ...: registered", connect/disconnect with pid,
+termios speed/cflag, unhandled get/setopt names.
+
+Apply after 0177.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index bd012b9..cc14694 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -41,6 +41,10 @@
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/termios.h>
++#include <sys/proc.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+@@ -1053,6 +1057,251 @@ sweet_bt_after_firmware(void)
+ 	return bt_stage;
+ }
+ 
++/*
++ * ---- 0178: bluetoothd's transport, the kernel control "com.apple.uart.sk.bluetooth" ----
++ *
++ * With the ADT's transport-encoding 1 (H4), iOS 16.5's bluetoothd does not open a tty: its POSIX HCI
++ * driver makes socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL), looks the kernel control up by name
++ * (CTLIOCGINFO; with no BT_HCI_TRANSPORT=H4:POSIX:<name>,<baud> the name is com.apple.uart.sk.bluetooth,
++ * Apple's AppleSerial Skywalk UART), connects, getsockopt(TIOCGETA) / setsockopt(TIOCSETA) a 72-byte
++ * termios, then reads and writes plain H4 on the socket. On 0177 it failed "ioctl(CTLIOCGINFO,
++ * com.apple.uart.sk.bluetooth) failed (ENOENT)" -> "Failed to initialize transport H4" -> abort
++ * (2026-11-11). This is that control. After HackiOS's vayu_bt.c (hakios-sm8150, its "com.vayu.bt.uart"
++ * control): stream, no CTL_FLAG_PRIVILEGED (bluetoothd runs as mobile), one client at a time, the
++ * termios answered and stored, never applied (the UART stays at 115200: the NVM was set so, 0176).
++ *
++ * From stage 6 one kernel thread owns the UART: it sends what the client (or kern.sweetbtio) queued
++ * and passes what the chip says to the client, or, with no client, to kern.sweetbtio's buffer. Polled
++ * (no interrupt yet): about every 2 ms when idle.
++ */
++#define BT_KCTL_NAME            "com.apple.uart.sk.bluetooth"
++#define BT_KCTL_TX_SIZE         (16 * 1024)
++#define BT_KCTL_TIOCGETA        0x40487413u
++#define BT_KCTL_TIOCSETA        0x80487414u
++#define BT_KCTL_TIOCSETAW       0x80487415u
++#define BT_KCTL_TIOCSETAF       0x80487416u
++_Static_assert(sizeof(struct termios) == 72, "the TIOCGETA answer is 72 bytes");
++
++static LCK_GRP_DECLARE(bt_kctl_group, "sweet-bt-kctl");
++static LCK_MTX_DECLARE(bt_kctl_lock, &bt_kctl_group);
++static kern_ctl_ref bt_kctl_registered, bt_kctl_ref;
++static uint32_t bt_kctl_unit;
++static bool bt_kctl_connected, bt_io_running;
++static struct termios bt_kctl_termios = {
++	.c_cflag = CS8 | CREAD | CLOCAL, .c_ispeed = 115200, .c_ospeed = 115200,
++};
++static uint8_t bt_kctl_tx[BT_KCTL_TX_SIZE];
++static uint32_t bt_kctl_tx_head, bt_kctl_tx_count;
++static uint64_t bt_kctl_tx_dropped, bt_kctl_rx_lost, bt_kctl_tx_bytes, bt_kctl_rx_bytes;
++
++static errno_t
++bt_kctl_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	char name[32] = "";
++
++	*unitinfo = NULL;
++	lck_mtx_lock(&bt_kctl_lock);
++	if (bt_kctl_connected && !(bt_kctl_ref == ref && bt_kctl_unit == sac->sc_unit)) {
++		lck_mtx_unlock(&bt_kctl_lock);
++		printf("sweet_bt: kctl: connect unit %u refused: a client is there\n", sac->sc_unit);
++		return EBUSY;
++	}
++	bt_kctl_ref = ref;
++	bt_kctl_unit = sac->sc_unit;
++	bt_kctl_connected = true;
++	bt_kctl_tx_head = bt_kctl_tx_count = 0;
++	lck_mtx_unlock(&bt_kctl_lock);
++	proc_selfname(name, sizeof(name));
++	printf("sweet_bt: kctl: %s (pid %d) connected, unit %u\n", name, proc_selfpid(), sac->sc_unit);
++	return 0;
++}
++
++static errno_t
++bt_kctl_disconnect(kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
++{
++	bool ours;
++
++	lck_mtx_lock(&bt_kctl_lock);
++	ours = bt_kctl_connected && bt_kctl_ref == ref && bt_kctl_unit == unit;
++	if (ours) {
++		bt_kctl_connected = false;
++		bt_kctl_ref = NULL;
++		bt_kctl_tx_head = bt_kctl_tx_count = 0;
++	}
++	lck_mtx_unlock(&bt_kctl_lock);
++	if (ours) {
++		printf("sweet_bt: kctl: unit %u disconnected (%llu bytes sent, %llu received so far)\n", unit,
++		    bt_kctl_tx_bytes, bt_kctl_rx_bytes);
++	}
++	return 0;
++}
++
++/* the client's bytes into the TX ring; the io thread sends them (the callback owns the mbuf chain) */
++static errno_t
++bt_kctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	lck_mtx_lock(&bt_kctl_lock);
++	for (mbuf_t n = m; n != NULL && bt_kctl_connected && bt_kctl_unit == unit; n = mbuf_next(n)) {
++		const uint8_t *data = mbuf_data(n);
++		uint32_t len = (uint32_t)mbuf_len(n);
++
++		for (uint32_t i = 0; data != NULL && i < len; i++) {
++			if (bt_kctl_tx_count == BT_KCTL_TX_SIZE) {
++				bt_kctl_tx_dropped += len - i;
++				break;
++			}
++			bt_kctl_tx[(bt_kctl_tx_head + bt_kctl_tx_count++) % BT_KCTL_TX_SIZE] = data[i];
++		}
++	}
++	lck_mtx_unlock(&bt_kctl_lock);
++	if (m != NULL) {
++		mbuf_freem(m);
++	}
++	return 0;
++}
++
++static errno_t
++bt_kctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
++{
++	static unsigned said;
++
++	if ((uint32_t)opt != BT_KCTL_TIOCGETA) {
++		if (said++ < 8) {
++			printf("sweet_bt: kctl: getopt %#x not handled\n", (uint32_t)opt);
++		}
++		return ENOPROTOOPT;
++	}
++	if (len == NULL) {
++		return EINVAL;
++	}
++	if (data == NULL || *len < sizeof(struct termios)) {
++		*len = sizeof(struct termios);
++		return data == NULL ? 0 : EINVAL;
++	}
++	lck_mtx_lock(&bt_kctl_lock);
++	memcpy(data, &bt_kctl_termios, sizeof(struct termios));
++	lck_mtx_unlock(&bt_kctl_lock);
++	*len = sizeof(struct termios);
++	return 0;
++}
++
++static errno_t
++bt_kctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t len)
++{
++	static unsigned said;
++	uint32_t o = (uint32_t)opt;
++
++	if (o != BT_KCTL_TIOCSETA && o != BT_KCTL_TIOCSETAW && o != BT_KCTL_TIOCSETAF) {
++		if (said++ < 8) {
++			printf("sweet_bt: kctl: setopt %#x not handled\n", o);
++		}
++		return ENOPROTOOPT;
++	}
++	if (data == NULL || len < sizeof(struct termios)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&bt_kctl_lock);
++	memcpy(&bt_kctl_termios, data, sizeof(struct termios));
++	lck_mtx_unlock(&bt_kctl_lock);
++	printf("sweet_bt: kctl: termios speed %llu cflag %#llx (kept; the UART stays at 115200)\n",
++	    (unsigned long long)bt_kctl_termios.c_ospeed, (unsigned long long)bt_kctl_termios.c_cflag);
++	return 0;
++}
++
++static void
++bt_kctl_register(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t error;
++
++	if (bt_kctl_registered != NULL) {
++		return;
++	}
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, BT_KCTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
++	reg.ctl_sendsize = 16 * 1024;
++	reg.ctl_recvsize = 16 * 1024;
++	reg.ctl_connect = bt_kctl_connect;
++	reg.ctl_disconnect = bt_kctl_disconnect;
++	reg.ctl_send = bt_kctl_send;
++	reg.ctl_getopt = bt_kctl_getopt;
++	reg.ctl_setopt = bt_kctl_setopt;
++	error = ctl_register(&reg, &bt_kctl_registered);
++	printf("sweet_bt: kctl %s: %s (%d)\n", BT_KCTL_NAME, error == 0 ? "registered" : "NOT registered", error);
++}
++
++static void
++bt_io_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t tx[256], rx[512];
++
++	for (;;) {
++		uint32_t ntx = 0;
++		unsigned nrx;
++		bool client;
++
++		lck_mtx_lock(&bt_kctl_lock);
++		while (ntx < sizeof(tx) && bt_kctl_tx_count != 0) {
++			tx[ntx++] = bt_kctl_tx[bt_kctl_tx_head];
++			bt_kctl_tx_head = (bt_kctl_tx_head + 1) % BT_KCTL_TX_SIZE;
++			bt_kctl_tx_count--;
++		}
++		lck_mtx_unlock(&bt_kctl_lock);
++
++		lck_mtx_lock(&bt_io_lock);
++		if (ntx != 0 && uart_tx(tx, ntx, 200000)) {
++			bt_kctl_tx_bytes += ntx;
++		}
++		nrx = uart_rx(rx, sizeof(rx), 500, 200);
++		lck_mtx_unlock(&bt_io_lock);
++
++		if (nrx != 0) {
++			lck_mtx_lock(&bt_kctl_lock);
++			client = bt_kctl_connected;
++			if (client) {
++				if (ctl_enqueuedata(bt_kctl_ref, bt_kctl_unit, rx, nrx, 0) == 0) {
++					bt_kctl_rx_bytes += nrx;
++				} else {
++					bt_kctl_rx_lost += nrx;
++				}
++			}
++			lck_mtx_unlock(&bt_kctl_lock);
++			if (!client) {
++				lck_mtx_lock(&bt_io_lock);
++				if (io_rx_len + nrx > sizeof(io_rx)) {
++					size_t drop = io_rx_len + nrx - sizeof(io_rx);
++
++					memmove(io_rx, io_rx + drop, io_rx_len - drop);
++					io_rx_len -= drop;
++				}
++				memcpy(io_rx + io_rx_len, rx, nrx);
++				io_rx_len += nrx;
++				lck_mtx_unlock(&bt_io_lock);
++			}
++		} else if (ntx == 0) {
++			delay(2000);
++		}
++	}
++}
++
++static void
++bt_io_start(void)
++{
++	thread_t t;
++
++	bt_kctl_register();
++	if (bt_io_running) {
++		return;
++	}
++	if (kernel_thread_start(bt_io_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_set_thread_name(t, "sweet-bt-io");
++		thread_deallocate(t);
++		bt_io_running = true;
++	}
++	printf("sweet_bt: io thread %s\n", bt_io_running ? "running" : "NOT started");
++}
++
+ static int
+ sysctl_sweetbt SYSCTL_HANDLER_ARGS
+ {
+@@ -1067,6 +1316,9 @@ sysctl_sweetbt SYSCTL_HANDLER_ARGS
+ 		if (bt_stage != 6) {
+ 			return EAGAIN;
+ 		}
++		if (bt_io_running) {
++			return EBUSY;           /* (0178: the io thread owns the UART; use kern.sweetbtio) */
++		}
+ 		lck_mtx_lock(&bt_io_lock);
+ 		bt_stage = sweet_bt_after_firmware();
+ 		lck_mtx_unlock(&bt_io_lock);
+@@ -1090,6 +1342,9 @@ sysctl_sweetbt SYSCTL_HANDLER_ARGS
+ 		rx_kept = 0;
+ 	}
+ 	lck_mtx_unlock(&bt_io_lock);
++	if (bt_stage == 6) {
++		bt_io_start();          /* 0178 */
++	}
+ 	printf("sweet_bt: sysctl kern.sweetbt=1 -> %d\n", bt_stage);
+ 	return bt_stage < 0 ? EIO : 0;
+ }
+@@ -1128,7 +1383,14 @@ sysctl_sweetbtio SYSCTL_HANDLER_ARGS
+ 	if (error == 0 && req->oldptr != USER_ADDR_NULL) {
+ 		size_t want = req->oldlen < sizeof(io_rx) ? req->oldlen : sizeof(io_rx);
+ 
+-		if (io_rx_len < want) {
++		if (bt_io_running) {
++			/* 0178: the io thread fills io_rx; wait for it a little */
++			for (unsigned t = 0; t < 20 && io_rx_len == 0; t++) {
++				lck_mtx_unlock(&bt_io_lock);
++				delay(1000);
++				lck_mtx_lock(&bt_io_lock);
++			}
++		} else if (io_rx_len < want) {
+ 			io_rx_len += uart_rx(io_rx + io_rx_len, (unsigned)(want - io_rx_len), io_rx_len == 0 ? 20000 : 1, 300);
+ 		}
+ 		size_t give = io_rx_len < want ? io_rx_len : want;

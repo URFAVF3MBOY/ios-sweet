@@ -1,0 +1,186 @@
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -29,10 +29,13 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include <libkern/libkern.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define LOG(fmt, ...)       IOLog("SweetModem: " fmt "\n", ##__VA_ARGS__)
++/* 0157: the join path also goes to printf: its IOLog lines never showed up in dmesg (printf lines do) */
++#define JLOG(fmt, ...)      do { LOG(fmt, ##__VA_ARGS__); printf("SweetModem: " fmt "\n", ##__VA_ARGS__); } while (0)
+ 
+ #define PAS_ID_MODEM        4
+ #define MODEM_CARVEOUT      0x8DC00000u         /* 7T DT modem_region */
+@@ -3534,7 +3537,7 @@
+ 	memcpy(c, our_mac, 6);
+ 	bool b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
+ 	scanning = scan_send_start();
+-	LOG("t=%u ms: scan: chan list (%u ch) %s, vdev %s, passive scan %s", g_ms, NFREQ, a ? "ok" : "FAILED",
++	JLOG("t=%u ms: scan: chan list (%u ch) %s, vdev %s, passive scan %s", g_ms, NFREQ, a ? "ok" : "FAILED",
+ 	    b ? "ok" : "FAILED", scanning ? "requested" : "FAILED");
+ }
+ 
+@@ -3744,12 +3747,12 @@
+ 		return;                                 /* foreign channel / exit / bss channel */
+ 	}
+ 	if (e[0] == 0x001) {
+-		LOG("t=%u ms: scan: STARTED", g_ms);
++		JLOG("t=%u ms: scan: STARTED", g_ms);
+ 	}
+ 	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
+ 		scanning = false;
+ 		scans++;
+-		LOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", g_ms, scans, e[0], nbss, scan_frames, htt_msdus);
++		JLOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", g_ms, scans, e[0], nbss, scan_frames, htt_msdus);
+ 		next_scan_ms = scans < 3 ? g_ms + 10000 : 0;
+ 		api_scans_done++;
+ 	}
+@@ -4850,7 +4853,7 @@
+ 	if (started) {
+ 		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	}
+-	LOG("t=%u ms: join: torn down (was state %u)", g_ms, s_state);
++	JLOG("t=%u ms: join: torn down (was state %u)", g_ms, s_state);
+ 	if (s_state == S_UP) {
+ 		w_link(false);
+ 	}
+@@ -4862,11 +4865,11 @@
+ w_join_end(int result)
+ {
+ 	if (result != 0) {
+-		LOG("t=%u ms: join: failed (%d) in state %u", g_ms, result, s_state);
++		JLOG("t=%u ms: join: failed (%d) in state %u", g_ms, result, s_state);
+ 		w_teardown();
+ 	} else {
+ 		s_state = S_UP;
+-		LOG("t=%u ms: *** joined %.*s ***", g_ms, (int)s_ssid_len, s_ssid);
++		JLOG("t=%u ms: *** joined %.*s ***", g_ms, (int)s_ssid_len, s_ssid);
+ 		w_link(true);
+ 	}
+ 	bzero(s_pmk, sizeof(s_pmk));
+@@ -4906,7 +4909,7 @@
+ 		}
+ 	}
+ 	if (best < 0) {
+-		LOG("join: no such network heard");
++		JLOG("join: no such network heard");
+ 		w_join_end(ENOENT);
+ 		return;
+ 	}
+@@ -4931,7 +4934,7 @@
+ 	}
+ 	s_msg1s = 0;
+ 	s_start_resp = false;
+-	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
++	JLOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
+ 	w_ps_off();
+ 	/*
+@@ -4951,11 +4954,11 @@
+ 	s_peer_made = false;
+ 	if (self_peer) {
+ 		s_selfpeer_made = w_peer_addr(CMD_PEER_CREATE, TAG_PEER_CREATE, our_mac, true);
+-		LOG("t=%u ms: join: self-peer (own MAC) before start: %s", g_ms, s_selfpeer_made ? "sent" : "FAILED");
++		JLOG("t=%u ms: join: self-peer (own MAC) before start: %s", g_ms, s_selfpeer_made ? "sent" : "FAILED");
+ 	}
+ 	if (peer_first) {
+ 		s_peer_made = w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
+-		LOG("t=%u ms: join: BSS peer %02x:%02x:%02x:**:**:** before start: %s", g_ms,
++		JLOG("t=%u ms: join: BSS peer %02x:%02x:%02x:**:**:** before start: %s", g_ms,
+ 		    s_bssid[0], s_bssid[1], s_bssid[2], s_peer_made ? "sent" : "FAILED");
+ 	}
+ 	if (!w_vdev_start(s_freq, bcn, dtim)) {
+@@ -4976,7 +4979,7 @@
+ 	uint16_t v = (uint16_t)(f[24] | f[25] << 8);
+ 	if (fc == FC_AUTH && s_state == S_AUTH && len >= 30 && f[26] == 2) {
+ 		v = (uint16_t)(f[28] | f[29] << 8);
+-		LOG("t=%u ms: join: auth reply status %u", g_ms, v);
++		JLOG("t=%u ms: join: auth reply status %u", g_ms, v);
+ 		if (v != 0) {
+ 			w_join_end(ECONNREFUSED);
+ 			return;
+@@ -4989,7 +4992,7 @@
+ 	} else if (fc == FC_ASSOC_RESP && s_state == S_ASSOC && len >= 30) {
+ 		v = (uint16_t)(f[26] | f[27] << 8);
+ 		s_aid = (uint32_t)(f[28] | f[29] << 8) & 0x3FFF;
+-		LOG("t=%u ms: join: assoc reply status %u aid %u", g_ms, v, s_aid);
++		JLOG("t=%u ms: join: assoc reply status %u aid %u", g_ms, v, s_aid);
+ 		if (v != 0) {
+ 			w_join_end(ECONNREFUSED);
+ 			return;
+@@ -5007,10 +5010,10 @@
+ 		} else {
+ 			s_state = S_4WAY;
+ 			s_deadline = g_ms + 8000;
+-			LOG("t=%u ms: join: associated, waiting for the 4-way handshake", g_ms);
++			JLOG("t=%u ms: join: associated, waiting for the 4-way handshake", g_ms);
+ 		}
+ 	} else if (fc == FC_DEAUTH || fc == FC_DISASSOC) {
+-		LOG("t=%u ms: join: the AP ended the link, reason %u (state %u)", g_ms, v, s_state);
++		JLOG("t=%u ms: join: the AP ended the link, reason %u (state %u)", g_ms, v, s_state);
+ 		if (s_state == S_UP) {
+ 			w_teardown();
+ 		} else {
+@@ -5033,11 +5036,11 @@
+ 	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
+ 	if (id == 0x5001 && l >= 16) {             /* VDEV_START_RESP {vdev, req, type, status} */
+ 		/* 0125: say what the firmware answered (status 1 bad vdev, 2 unsupported, 3 DFS, 4 regdomain) */
+-		LOG("t=%u ms: join: VDEV_START_RESP vdev %u req %u type %u status %d", g_ms, v[0], v[1], v[2], (int32_t)v[3]);
++		JLOG("t=%u ms: join: VDEV_START_RESP vdev %u req %u type %u status %d", g_ms, v[0], v[1], v[2], (int32_t)v[3]);
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = true;
+ 	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
+-		LOG("t=%u ms: join: peer kickout", g_ms);
++		JLOG("t=%u ms: join: peer kickout", g_ms);
+ 		w_teardown();
+ 	}
+ }
+@@ -5056,8 +5059,16 @@
+ 		w_join_begin();
+ 		return;
+ 	}
++	if (s_join_asked && scanning) {
++		static uint32_t waited_log;
++		if (g_ms - waited_log >= 2000) {
++			waited_log = g_ms;
++			JLOG("t=%u ms: join: asked but a scan is still running, not starting yet (nbss %u)", g_ms, nbss);
++		}
++	}
+ 	if (s_state == S_START) {
+ 		if (s_start_resp) {
++			JLOG("t=%u ms: join: vdev start response, status %d", g_ms, s_start_status);
+ 			if (s_start_status != 0) {
+ 				w_join_end(EIO);
+ 				return;
+@@ -5085,7 +5096,7 @@
+ 			s_deadline = g_ms + 400;
+ 		}
+ 	} else if (s_state == S_4WAY && g_ms > s_deadline) {
+-		LOG("t=%u ms: join: no 4-way handshake (%u message 1s)", g_ms, s_msg1s);
++		JLOG("t=%u ms: join: no 4-way handshake (%u message 1s)", g_ms, s_msg1s);
+ 		w_join_end(s_msg1s != 0 ? EAUTH : ETIMEDOUT);
+ 	}
+ }
+@@ -5190,6 +5201,10 @@
+ 	for (int i = 0; i < 300 && s_join_done == before; i++) {   /* 30 s */
+ 		IOSleep(100);
+ 	}
++	if (s_join_done == before) {
++		JLOG("t=%u ms: join: gave up after 30 s: state %u, still asked %d, scanning %d, nbss %u", g_ms, s_state,
++		    (int)s_join_asked, (int)scanning, nbss);
++	}
+ 	return s_join_done != before ? s_result : ETIMEDOUT;
+ }
+ 
+@@ -5399,7 +5414,7 @@
+ 	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
+ 		next_scan_ms = 0;
+ 		scanning = scan_send_start();
+-		LOG("t=%u ms: scan: passive scan %u %s", g_ms, scans + 1, scanning ? "requested" : "FAILED");
++		JLOG("t=%u ms: scan: passive scan %u %s", g_ms, scans + 1, scanning ? "requested" : "FAILED");
+ 	}
+ }
+ 

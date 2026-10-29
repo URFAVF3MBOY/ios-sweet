@@ -1,0 +1,154 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 -0500
+Subject: [PATCH] op7t-0177: Sandbox stand-in: container path of a process (op 4)
+
+TrollStore Lite's "Install IPA File" ended in "Internal error: couldn't
+communicate with helper application" (2026-11-11): the system file
+picker com.apple.DocumentManager.Service aborted at launch, in PlugInKit
+before its own code: "plugin has invalid sandbox or container: error %d
+path %s" after sandbox_container_path_for_pid(getpid(), buf, 1024) =
+__mac_syscall("Sandbox", 4), which the stand-in (0050) answers ENOENT.
+Every app extension asks it at start.
+
+Port of HackiOS's minisandbox_container_path (kern_minimac.c, vayu
+branch): the starter of a program in a container (RunningBoard, pkd)
+passes the container from containermanagerd as CFFIXED_USER_HOME, so it
+is read from the strings exec left at the top of the process's stack (as
+sysctl_procargsx) and copied out; a process without it gets success and
+an untouched buffer. The first 20 answers are logged ("HOTDOGB Sandbox:
+container of pid N: PATH").
+
+Apply after 0176.
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index dda4e38..2fa42da 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -38,6 +38,10 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ #include <libkern/OSAtomic.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <vm/vm_map.h>
++#include <vm/vm_kern.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -305,6 +309,106 @@ static uint64_t sweet_sandbox_seen;
+  */
+ #define SWEET_SANDBOX_TOKEN_MAX	2048
+ 
++/*
++ * 0177: op 4, "container path of a process" (sandbox_container_path_for_pid / _for_audit_token).
++ * Every app extension asks it at start: PlugInKit (-[PKService checkEnvironment:]) calls
++ * sandbox_container_path_for_pid(getpid(), buf, 1024) and raises "plugin has invalid sandbox or
++ * container" unless a path comes back. With ENOENT here the system file picker
++ * (com.apple.DocumentManager.Service) aborted at launch, and TrollStore's "Install IPA File" said
++ * "couldn't communicate with helper application" (2026-11-11).
++ * Port of HackiOS's minisandbox_container_path (xnu/files/bsd/kern/kern_minimac.c, vayu branch):
++ * whoever starts a program in a container (RunningBoard an app, pkd an extension) passes the path
++ * from containermanagerd in the environment as CFFIXED_USER_HOME, so it is looked up among the
++ * strings exec left at the top of the process's stack, as sysctl_procargsx() reads them. A process
++ * without the variable gets success and an untouched buffer.
++ * Argument: { pid, pid version, buffer, its size, compare the version }.
++ */
++#define SWEET_SANDBOX_CONTAINER_VARIABLE	"CFFIXED_USER_HOME="
++
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	const size_t prefix_len = sizeof(SWEET_SANDBOX_CONTAINER_VARIABLE) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error;
++	static unsigned said;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	p = proc_find((int)args.pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (args.check_pidversion && (uint64_t)proc_pidversion(p) != args.pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	user_stack = p->user_stack;
++	argslen = p->p_argslen;
++	task = proc_task(p);
++	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
++		proc_rele(p);
++		return 0;
++	}
++	/* as sysctl_procargsx(): the task keeps the map alive once the process is let go */
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return 0;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size), strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL || vm_map_copy_overwrite(kernel_map, strings, copy, strings_size, FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return 0;                       /* on its way out, or its stack unmapped */
++	}
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, (size_t)(end - s));
++		if (len > prefix_len && s + len < end && strncmp(s, SWEET_SANDBOX_CONTAINER_VARIABLE, prefix_len) == 0) {
++			s += prefix_len;
++			len -= prefix_len;
++			error = len < args.size ? copyout(s, args.buffer, len + 1) : ENAMETOOLONG;
++			if (said < 20) {
++				said++;
++				printf("HOTDOGB Sandbox: container of pid %lld: %.*s\n", args.pid, (int)len, s);
++			}
++			break;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return error;
++}
++
+ static int
+ sweet_sandbox_extension_issue(struct proc *p, user_addr_t arg)
+ {
+@@ -370,7 +474,8 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		return sweet_sandbox_extension_issue(p, arg);
+ 	case 6:         /* extension consume (0174) */
+ 		return sweet_sandbox_extension_consume(arg);
+-	case 4:         /* container path (audit token / pid) */
++	case 4:         /* container path (audit token / pid) (0177) */
++		return sweet_sandbox_container_path(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

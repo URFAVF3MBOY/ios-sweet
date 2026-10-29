@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -1991,6 +1991,15 @@ static const struct { const char *path, *part; } rmtfs_parts[] = {
+ 	{ "/oem/nvbk/dynamic", "dycnvbk" },
+ };
+ #define RMTFS_NPARTS        ((uint32_t)(sizeof(rmtfs_parts) / sizeof(rmtfs_parts[0])))
++/*
++ * Bisection switches (0100). With 0099 the whole phone went to crashdump within ~100 ms of the
++ * modem coming up -- before the 1 Hz persistent log flush, so no log of it exists. They make the
++ * phone survive instead, so the log is kept:
++ *   sweetmodem_reads=0  answer every rmtfs read/write with an error (requests still logged);
++ *   sweetmodem_nvbk=0   refuse /oem/nvbk/* again (0098 behaviour: modem crashed alone, phone lived).
++ */
++static bool rmtfs_reads_on = true, rmtfs_nvbk_on = true;
++static unsigned rmtfs_logged;
+ static uint64_t rmtfs_pa;
+ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+@@ -2051,6 +2060,9 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 		qm_string(d, len, 1, path, sizeof(path));
+ 		ok = false;
+ 		for (i = 0; i < RMTFS_NPARTS && !ok; i++) {
++			if (!rmtfs_nvbk_on && strncmp(rmtfs_parts[i].path, "/oem/nvbk/", 10) == 0) {
++				continue;
++			}
+ 			if (strcmp(path, rmtfs_parts[i].path) == 0) {
+ 				uint8_t probe[16];
+ 				ok = sweet_ufs_read_part(rmtfs_parts[i].part, 0, probe, sizeof(probe)) == 0;
+@@ -2078,6 +2090,20 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 		const uint8_t *iov = qm_find(d, len, 3, &l2);
+ 		bool write = dir != NULL && *dir != 0;
+ 		ok = caller >= 1 && caller <= RMTFS_NPARTS && iov != NULL && rmtfs_pa != 0;
++		if (iov != NULL && rmtfs_logged < 12) {
++			rmtfs_logged++;
++			uint32_t e0[3] = { 0, 0, 0 };
++			if (iov[0] > 0) {
++				memcpy(e0, iov + 1, 12);
++			}
++			LOG("t=%u ms: rmtfs: %s caller %u (%s), %u iovec, first: sector %x phys %x count %u",
++			    g_ms, write ? "write" : "read", caller,
++			    caller >= 1 && caller <= RMTFS_NPARTS ? rmtfs_parts[caller - 1].part : "?", iov[0], e0[0], e0[1], e0[2]);
++		}
++		if (ok && !rmtfs_reads_on) {
++			ok = false;
++			LOG("t=%u ms: rmtfs: refused (sweetmodem_reads=0)", g_ms);
++		}
+ 		for (i = 0; ok && i < iov[0]; i++) {
+ 			uint32_t e[3];                      /* sector, phys, count */
+ 			memcpy(e, iov + 1 + 12 * i, 12);
+@@ -5695,6 +5721,17 @@ sweet_modem_init(void)
+ 		return;
+ 	}
+ 	started = true;
++	uint32_t v = 1;
++	if (PE_parse_boot_argn("sweetmodem_reads", &v, sizeof(v))) {
++		rmtfs_reads_on = v != 0;
++	}
++	v = 1;
++	if (PE_parse_boot_argn("sweetmodem_nvbk", &v, sizeof(v))) {
++		rmtfs_nvbk_on = v != 0;
++	}
++	if (!rmtfs_reads_on || !rmtfs_nvbk_on) {
++		LOG("bisect: rmtfs reads %s, /oem/nvbk %s", rmtfs_reads_on ? "on" : "OFF", rmtfs_nvbk_on ? "on" : "OFF");
++	}
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

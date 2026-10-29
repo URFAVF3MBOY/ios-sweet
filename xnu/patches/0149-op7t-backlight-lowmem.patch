@@ -1,0 +1,127 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 03:10:00 -0400
+Subject: [PATCH] op7t-0149: brightness: DSI command packet in unused low DDR, not an IOBMD
+
+0148 on the phone (2026-10-26): CoreBrightness now takes AppleARMBacklight
+from boot without a backboardd restart (brightness 726 of 1024), but the
+two-page buffer below 4 GiB failed outright ("phys 0x0"): xnu manages no
+memory below 4 GiB on the 7T, which is also why 0147's one-page buffers
+were at 0x1dc0e0000. Nothing reached the panel, nothing bad was sent.
+Now the packet goes into the last 16K page of the low DDR bank that
+nothing uses (0xBBAFC000; SweetSurface.cpp's scanout pool ends at
+0xBB7C0000, the bank at 0xBBB00000), mapped with ml_io_map (uncached, no
+cache upkeep) and written a word at a time; DMA_BASE gets its address.
+Stub-syntax-checked with g++.
+
+Apply after 0148.
+---
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+index e5dfe46..18c2360 100644
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -59,9 +59,18 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ 
+ #define DBV_MAX         0x7ffu
+ 
++/*
++ * 0149: where the command packet goes. 0148's two-page buffer below 4 GiB failed outright (phys 0:
++ * xnu manages no memory below 4 GiB here, which is also why 0147's buffers were at 0x1dc0e0000).
++ * So a page of the low DDR bank nobody uses: SweetSurface.cpp's scanout pool ends at 0xBB7C0000
++ * and the bank at 0xBBB00000; its last 16K page, mapped like a device (uncached, so nothing to
++ * push out of the cache) and written a word at a time.
++ */
++#define SWEET_DSI_PKT_PA        0xBBAFC000ull
++#define SWEET_DSI_PKT_SIZE      0x4000u
++
+ static volatile uint8_t *sweet_dsi;
+-static IOBufferMemoryDescriptor *sweet_dsi_buf;
+-static uint64_t sweet_dsi_buf_phys;
++static volatile uint32_t *sweet_dsi_pkt;        /* 0149: SWEET_DSI_PKT_PA, uncached */
+ static unsigned sweet_bl_cmd = 0x51, sweet_bl_which;
+ static IOLock *sweet_bl_lock;
+ static uint32_t sweet_bl_last;
+@@ -82,19 +91,23 @@ static inline void dsi_wr(uint32_t o, uint32_t v)
+ static bool
+ sweet_dsi_dcs_long(const uint8_t *payload, uint32_t len)
+ {
+-	if (sweet_dsi == NULL || sweet_dsi_buf == NULL || len > 60) {
++	if (sweet_dsi == NULL || sweet_dsi_pkt == NULL || len > 60) {
+ 		return false;
+ 	}
+-	uint8_t *p = (uint8_t *)sweet_dsi_buf->getBytesNoCopy();
++	uint8_t p[64];
+ 	uint32_t size = (4 + len + 3) & ~3u;
+ 
+-	memset(p, 0xff, 64);
++	memset(p, 0xff, sizeof(p));
+ 	p[0] = (uint8_t)len;            /* word count low */
+ 	p[1] = (uint8_t)(len >> 8);     /* word count high */
+ 	p[2] = 0x39;                    /* data type: long DCS write */
+ 	p[3] = 0xc0;                    /* last | long */
+ 	memcpy(p + 4, payload, len);
+-	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	for (uint32_t i = 0; i < sizeof(p) / 4; i++) {          /* 0149: device memory, a word at a time */
++		sweet_dsi_pkt[i] = (uint32_t)p[4 * i] | (uint32_t)p[4 * i + 1] << 8 |
++		    (uint32_t)p[4 * i + 2] << 16 | (uint32_t)p[4 * i + 3] << 24;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+ 	uint32_t ctrl = dsi_rd(R_CTRL), trig = dsi_rd(R_TRIG_CTRL);
+ 	if ((trig & 7) != 4) {
+@@ -103,7 +116,7 @@ sweet_dsi_dcs_long(const uint8_t *payload, uint32_t len)
+ 	dsi_wr(R_CTRL, ctrl | 4 | 1);                   /* CMD_MODE_EN | DSI_EN */
+ 	dsi_wr(R_INT_CTRL, dsi_rd(R_INT_CTRL) | 1);     /* clear CMD_DMA_DONE */
+ 	dsi_wr(R_TPG_CTRL, 0);                          /* no test pattern */
+-	dsi_wr(R_DMA_BASE, (uint32_t)sweet_dsi_buf_phys);
++	dsi_wr(R_DMA_BASE, (uint32_t)SWEET_DSI_PKT_PA);
+ 	dsi_wr(R_DMA_LEN, size);
+ 	uint32_t dma = dsi_rd(R_CMD_DMA_CTRL);
+ 	dsi_wr(R_CMD_DMA_CTRL, dma & ~(1u << 26));      /* high speed */
+@@ -136,39 +149,25 @@ sweet_bl_send(uint32_t level)
+ 	return done;
+ }
+ 
+-/* map DSI and get the DMA buffer below 4 GiB, once */
++/* map DSI and the packet page (0149), once */
+ static bool
+ sweet_bl_map(void)
+ {
+-	if (sweet_dsi != NULL && sweet_dsi_buf != NULL && sweet_dsi_buf_phys != 0) {
++	if (sweet_dsi != NULL && sweet_dsi_pkt != NULL) {
+ 		return true;
+ 	}
+ 	if (sweet_dsi == NULL) {
+ 		sweet_dsi = (volatile uint8_t *)ml_io_map(sweet_bl_which ? DSI1_PA : DSI0_PA, DSI_SIZE);
+ 	}
+-	if (sweet_dsi_buf == NULL) {
+-		/*
+-		 * 0148: two pages, not 64 bytes. For one page IOKernelAllocateWithPhysicalRestrict
+-		 * (IOLib.cpp) turns a mask below 4 GiB into KMA_LOMEM, which arm64 has no pool for, and
+-		 * takes any page: on the phone (0147) the buffer was at 0x1dc0e0000 and DMA_BASE (32
+-		 * bits) pointed elsewhere -- "NO DONE" for every level. More than a page goes to
+-		 * kmem_alloc_contig with the limit as its highest page.
+-		 */
+-		sweet_dsi_buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 2 * PAGE_SIZE, 0x00000000fffff000ull);
+-		sweet_dsi_buf_phys = sweet_dsi_buf ? sweet_dsi_buf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-		if (sweet_dsi_buf_phys + 64 > 0x100000000ULL) {
+-			LOG("DMA buffer at 0x%llx is above 4 GiB: DSI cannot reach it", (unsigned long long)sweet_dsi_buf_phys);
+-			OSSafeReleaseNULL(sweet_dsi_buf);
+-			sweet_dsi_buf_phys = 0;
+-		}
++	if (sweet_dsi_pkt == NULL) {
++		sweet_dsi_pkt = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_DSI_PKT_PA, SWEET_DSI_PKT_SIZE);
+ 	}
+-	if (sweet_dsi == NULL || sweet_dsi_buf == NULL || sweet_dsi_buf_phys == 0) {
+-		LOG("could not map DSI%u (%p) or get a DMA buffer below 4 GiB (phys 0x%llx)",
+-		    sweet_bl_which, (void *)sweet_dsi, (unsigned long long)sweet_dsi_buf_phys);
++	if (sweet_dsi == NULL || sweet_dsi_pkt == NULL) {
++		LOG("could not map DSI%u (%p) or the packet page at 0x%llx (%p)", sweet_bl_which, (void *)sweet_dsi,
++		    (unsigned long long)SWEET_DSI_PKT_PA, (void *)sweet_dsi_pkt);
+ 		return false;
+ 	}
+-	LOG("DSI%u mapped, DMA buffer at 0x%llx", sweet_bl_which, (unsigned long long)sweet_dsi_buf_phys);
++	LOG("DSI%u mapped, packet page at 0x%llx", sweet_bl_which, (unsigned long long)SWEET_DSI_PKT_PA);
+ 	return true;
+ }
+ 

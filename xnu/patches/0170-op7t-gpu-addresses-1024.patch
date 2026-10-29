@@ -1,0 +1,114 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 05:30:00 -0500
+Subject: [PATCH] op7t-0170: GPU addresses: 1024 free ranges, double frees refused, stats on
+
+HANDOFF-5 (2026-11-08): backboardd crash-looped in OSMesa after
+"RedwoodGPU: no addresses left for a buffer of N bytes" (403 times), with
+the kept cache empty. The GPU address allocator (sweet_gpu.c, 0086/0089)
+keeps at most 64 free ranges: once that many holes exist, every free that
+merges with no neighbour is counted in k1_lost and never handed out again,
+so the 768 MB window drains. HackiOS's own allocator (hakios.adreno.c,
+vayu branch) keeps 1024 and refuses a range given back twice.
+
+Now: 1024 free ranges; a range overlapping one already free is refused and
+logged ("free already: not given back again", 20 times at most) instead of
+merged into nonsense; gpu_va = 1, so RedwoodGPU's periodic line "addresses:
+N MB in N buffers, longest run free, holes (most), KB lost, refused" is
+said, with real live / most / refused counts (were 0 / 64 / 0).
+The window itself stays 0x10000000..0x3fffffff (the shim's one L2 table).
+
+Apply after 0169.
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4e2521b..7a677f9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -364,8 +364,16 @@ static void map_framebuffer(void)
+ static vm_offset_t sl_k1, k1_cb;
+ static uint64_t *k1_l3[K1_NTABLES];		/* table t (VA 2 MiB block t), kernel VA; NULL: not made yet */
+ static unsigned k1_l3_made;
+-static struct { uint64_t start, size; } k1_free[64];
++/*
++ * 0170: 1024 free ranges, not 64. With 64, once that many holes existed every further free that
++ * merged with no neighbour was "lost" (counted, never handed out again): the window drained until
++ * "RedwoodGPU: no addresses left" and backboardd's OSMesa crashed on the NULL (HANDOFF-5, 2026-11-08).
++ * HackiOS's own allocator (hakios.adreno.c, vayu branch) has 1024 and refuses a range freed twice.
++ */
++#define K1_FREE_MOST		1024U
++static struct { uint64_t start, size; } k1_free[K1_FREE_MOST];
+ static unsigned k1_nfree, k1_lost;
++static unsigned k1_live, k1_most, k1_refused;	/* 0170: for RedwoodGPU's "addresses:" line */
+ static int k1_va_fresh;			/* no TLB maintenance works: never reuse an address */
+ static uint32_t k1_fence;
+ 
+@@ -387,9 +395,11 @@ uint64_t sweet_gpu_address(uint64_t size)
+ 					k1_free[j] = k1_free[j + 1];
+ 				k1_nfree--;
+ 			}
++			k1_live++;
+ 			return a;
+ 		}
+ 	}
++	k1_refused++;
+ 	return 0;
+ }
+ 
+@@ -403,6 +413,17 @@ void sweet_gpu_address_free(uint64_t a, uint64_t size)
+ 	}
+ 	for (at = 0; at < k1_nfree && k1_free[at].start < a; at++)
+ 		;
++	/* 0170: a range that overlaps one free already was given back twice: keep the list as it is */
++	if ((at > 0 && k1_free[at - 1].start + k1_free[at - 1].size > a) ||
++	    (at < k1_nfree && a + size > k1_free[at].start)) {
++		static unsigned said;
++		if (said++ < 20)
++			printf("RedwoodGPU: addresses %#llx (%#llx bytes) are free already: not given back again\n",
++			    (unsigned long long)a, (unsigned long long)size);
++		return;
++	}
++	if (k1_live != 0)
++		k1_live--;
+ 	if (at > 0 && k1_free[at - 1].start + k1_free[at - 1].size == a) {
+ 		k1_free[at - 1].size += size;
+ 		if (at < k1_nfree && a + size == k1_free[at].start) {
+@@ -414,12 +435,14 @@ void sweet_gpu_address_free(uint64_t a, uint64_t size)
+ 	} else if (at < k1_nfree && a + size == k1_free[at].start) {
+ 		k1_free[at].start = a;
+ 		k1_free[at].size += size;
+-	} else if (k1_nfree < 64) {
++	} else if (k1_nfree < K1_FREE_MOST) {
+ 		for (unsigned j = k1_nfree; j > at; j--)
+ 			k1_free[j] = k1_free[j - 1];
+ 		k1_free[at].start = a;
+ 		k1_free[at].size = size;
+ 		k1_nfree++;
++		if (k1_nfree > k1_most)
++			k1_most = k1_nfree;
+ 	} else {
+ 		k1_lost += (unsigned)(size >> 12);	/* counted, never handed out again */
+ 	}
+@@ -833,7 +856,7 @@ static void k1_selftest(void)
+ #define K1B_RING_WORDS		1024U
+ #define A640_CHIP_ID		0x06040001ULL
+ 
+-uint32_t gpu_va;		/* (HackiOS boot-args; 0 here) */
++uint32_t gpu_va = 1;	/* (HackiOS boot-args) 0170: 1, so RedwoodGPU's "addresses:" line is said */
+ uint32_t gpu_log;
+ static int k1b_on;
+ static uint32_t k1b_fence;
+@@ -921,12 +944,12 @@ void redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsign
+ 			big = k1_free[i].size;
+ 	}
+ 	*used = K1_VA_SIZE - free_bytes;
+-	*live = 0;
++	*live = k1_live;
+ 	*largest = big;
+ 	*holes = k1_nfree;
+-	*most = 64;
++	*most = k1_most;			/* 0170: the most holes there have been (of K1_FREE_MOST) */
+ 	*lost = (uint64_t)k1_lost << 12;
+-	*refused = 0;
++	*refused = k1_refused;
+ }
+ 
+ bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)

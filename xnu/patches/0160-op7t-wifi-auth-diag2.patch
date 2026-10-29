@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -3758,7 +3758,7 @@
+ 	}
+ }
+ 
+-static void w_diag_rx(const uint8_t *f, uint32_t flen);      /* 0159 */
++static void w_diag_rx(const uint8_t *f, uint32_t flen, const uint32_t *h);      /* 0159, 0160: h = mgmt rx header */
+ 
+ static void
+ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+@@ -3789,7 +3789,7 @@
+ 	}
+ 	flen = MIN(hdr[4], flen);
+ 	if (flen >= 24) {
+-		w_diag_rx(f, flen);
++		w_diag_rx(f, flen, hdr);
+ 	}
+ 	if (flen >= 24 && (f[0] & 0x0C) == 0 && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
+ 		w_assoc_mgmt_rx(f, flen);               /* auth, assoc response, deauth, disassoc */
+@@ -4465,6 +4465,19 @@
+ 	return wmi_send(CMD_STA_PS_MODE, m, sizeof(m));
+ }
+ 
++/* 0160: n bytes as hex, for the logs */
++static void
++w_hex(char *out, uint32_t cap, const uint8_t *b, uint32_t n)
++{
++	static const char hx[] = "0123456789abcdef";
++	uint32_t o = 0;
++	for (uint32_t i = 0; i < n && o + 3 <= cap; i++) {
++		out[o++] = hx[b[i] >> 4];
++		out[o++] = hx[b[i] & 15];
++	}
++	out[o] = 0;
++}
++
+ static bool
+ w_mgmt_tx(const uint8_t *f, uint32_t len)
+ {
+@@ -4491,6 +4504,12 @@
+ 	bool ok = wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
+ 	JLOG("t=%u ms: join: mgmt tx fc %02x len %u desc %u try %u -> %s", g_ms, f[0], len, s_desc, s_tries,
+ 	    ok ? "queued to the radio" : "FAILED");
++	if (len >= 24) {                            /* 0160: the frame as sent, the three MACs left out */
++		char hb[96];
++		w_hex(hb, sizeof(hb), f + 24, MIN(len - 24, 40u));
++		JLOG("t=%u ms: join: tx bytes: fc/flags/dur %02x%02x%02x%02x seq %02x%02x body(%u) %s", g_ms, f[0], f[1], f[2], f[3],
++		    f[22], f[23], len - 24, hb);
++	}
+ 	return ok;
+ }
+ 
+@@ -4873,25 +4892,33 @@
+  * 0159: what the radio hears while a join runs. Join 2026-11-08: VDEV_START ok, then four auth
+  * requests with no reply (ETIMEDOUT in state 2, 1.6 s), nothing logged in between.
+  */
+-static unsigned d_ap_frames, d_other_frames, d_ap_mgmt_logged;
++static unsigned d_ap_frames, d_other_frames, d_ap_mgmt_logged, d_unhandled_logged;
++/* 0160: all reset at the start of every join (0159's counters ran out after a few joins) */
++static unsigned d_ap_snr_sum, d_mgmt_sub[16];
+ 
+ static void
+-w_diag_rx(const uint8_t *f, uint32_t flen)
++w_diag_rx(const uint8_t *f, uint32_t flen, const uint32_t *h)
+ {
+ 	if (s_state == S_IDLE) {
+ 		return;
+ 	}
++	bool mgmt = (f[0] & 0x0C) == 0;
++	uint32_t sub = f[0] >> 4;
+ 	bool from_ap = memcmp(f + 10, s_bssid, 6) == 0;
+ 	if (from_ap) {
+ 		d_ap_frames++;
++		d_ap_snr_sum += h[1];
+ 	} else {
+ 		d_other_frames++;
++		if (mgmt) {
++			d_mgmt_sub[sub & 15]++;
++		}
+ 	}
+-	bool beacon = (f[0] & 0x0C) == 0 && ((f[0] >> 4) == 8 || (f[0] >> 4) == 5);
++	bool beacon = mgmt && (sub == 8 || sub == 5);
+ 	if ((from_ap || memcmp(f + 4, our_mac, 6) == 0) && !beacon && d_ap_mgmt_logged < 40) {
+ 		d_ap_mgmt_logged++;
+-		JLOG("t=%u ms: join: heard fc %02x%02x len %u from %02x:%02x:%02x:**:**:** to %02x:%02x:%02x:**:**:** (state %u)",
+-		    g_ms, f[0], f[1], flen, f[10], f[11], f[12], f[4], f[5], f[6], s_state);
++		JLOG("t=%u ms: join: heard fc %02x%02x len %u from %02x:%02x:%02x:**:**:** to %02x:%02x:%02x:**:**:** (state %u) ch %u snr %u rate %u rxstatus %08x",
++		    g_ms, f[0], f[1], flen, f[10], f[11], f[12], f[4], f[5], f[6], s_state, h[0], h[1], h[2], h[5]);
+ 	}
+ }
+ 
+@@ -4899,8 +4926,11 @@
+ w_join_end(int result)
+ {
+ 	if (result != 0) {
+-		JLOG("t=%u ms: join: while joining the radio heard %u frames from the AP (beacons etc), %u from others",
+-		    g_ms, d_ap_frames, d_other_frames);
++		JLOG("t=%u ms: join: while joining the radio heard %u frames from the AP (beacons etc, mean rssi %d), %u from others",
++		    g_ms, d_ap_frames, d_ap_frames ? (int)(d_ap_snr_sum / d_ap_frames) - 95 : 0, d_other_frames);
++		JLOG("t=%u ms: join: mgmt frames from others by subtype: auth %u assoc %u probereq %u proberesp %u beacon %u action %u deauth %u",
++		    g_ms, d_mgmt_sub[11], d_mgmt_sub[0] + d_mgmt_sub[1] + d_mgmt_sub[2] + d_mgmt_sub[3], d_mgmt_sub[4],
++		    d_mgmt_sub[5], d_mgmt_sub[8], d_mgmt_sub[13], d_mgmt_sub[12]);
+ 	}
+ 	d_ap_frames = d_other_frames = 0;
+ 	if (result != 0) {
+@@ -4924,10 +4954,15 @@
+ 	 * heard in the last BSS_FRESH_MS first -- an entry's RSSI is from when it was last heard, and an
+ 	 * AP heard strongly minutes ago may be the wrong band or gone -- else any.
+ 	 */
++	d_ap_frames = d_other_frames = d_ap_mgmt_logged = d_unhandled_logged = d_ap_snr_sum = 0;   /* 0160 */
++	bzero(d_mgmt_sub, sizeof(d_mgmt_sub));
++	/* 0160: heard in the last 15 s first (a hotspot picks a new random BSSID on every toggle, and the
++	 * stale entry used to win on RSSI), then the last BSS_FRESH_MS, then any */
++	static const uint32_t fresh_lim[3] = { 15000u, BSS_FRESH_MS, 0xFFFFFFFFu };
+ 	int best = -1;
+-	for (int pass = 0; pass < 2 && best < 0; pass++) {
++	for (int pass = 0; pass < 3 && best < 0; pass++) {
+ 		for (uint32_t i = 0; i < nbss; i++) {
+-			if (pass == 0 && g_ms - bss[i].last_ms > BSS_FRESH_MS) {
++			if (g_ms - bss[i].last_ms > fresh_lim[pass]) {
+ 				continue;
+ 			}
+ 			if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
+@@ -4952,6 +4987,8 @@
+ 		w_join_end(ENOENT);
+ 		return;
+ 	}
++	JLOG("t=%u ms: join: picked entry %d of %u, last heard %u ms ago, rssi %d", g_ms, best, nbss, g_ms - bss[best].last_ms,
++	    (int)bss[best].rssi);
+ 	memcpy(s_bssid, bss[best].bssid, 6);
+ 	s_freq = bss[best].freq;
+ 	s_body_len = bss[best].ie_len;
+@@ -5369,10 +5406,19 @@
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+ 		break;
++	case 0x7006: {                              /* 0160: MGMT_TX_COMPLETION {desc, status, pdev, ppdu, ack_rssi} */
++		uint32_t w[6] = {};
++		memcpy(w, d + 4, MIN(len - 4, (uint32_t)sizeof(w)));
++		if (s_state != S_IDLE && d_unhandled_logged < 60) {
++			d_unhandled_logged++;
++			JLOG("t=%u ms: join: mgmt tx done: desc %u status %u (0 acked, 3 not acked) ppdu %u ack_rssi %d  raw %08x %08x %08x %08x %08x %08x",
++			    g_ms, w[1], w[2], w[4], (int32_t)w[5], w[0], w[1], w[2], w[3], w[4], w[5]);
++		}
++		break;
++	}
+ 	default: {
+-		static unsigned unhandled_logged;
+-		if (s_state != S_IDLE && unhandled_logged < 60) {   /* 0159: e.g. the mgmt-tx completion */
+-			unhandled_logged++;
++		if (s_state != S_IDLE && d_unhandled_logged < 60) {   /* 0159: other events during a join */
++			d_unhandled_logged++;
+ 			uint32_t w[4] = {};
+ 			memcpy(w, d + 4, MIN(len - 4, (uint32_t)sizeof(w)));
+ 			JLOG("t=%u ms: join: wmi event 0x%x len %u (not handled) state %u: %08x %08x %08x %08x", g_ms, id, len,

@@ -1,0 +1,274 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 06:30:00 -0500
+Subject: [PATCH] op7t-0171: Bluetooth, step 3: rampatch and NVM from the modem partition
+
+0169 worked (2026-11-10): the WCN3990 answered EDL get version (SoC id
+0x40010224, ROM 0x1001, patch 0x6699) and HCI_Reset (status 0).
+
+`sysctl kern.sweetbt=1` now goes on to the firmware, as Linux btqca.c:
+- file number: Linux's rule gives 0x01 for ROM 0x1001 (no such file);
+  Qualcomm's libbt-vendor calls SoC 0x40010224 CHEROKEE 1.1 ->
+  image/crbtfw11.tlv + image/crnv11.bin (major 15:12, minor 3:0); both
+  numbers logged;
+- read through SweetModem's topaz_part_fw_size/read (sweetmodem=1);
+- patch header logged (total, data, format, signature, download mode,
+  product, rom build, patch version); TLV sent in 243-byte EDL segments
+  (01 00 fc len 1e seg data); vendor event rtype 4 awaited per segment
+  unless the download mode skips it (the last segment always waits);
+- NVM: HCI tag 17 with in-band sleep off (bit 7 of byte 0; our driver does
+  not speak IBS) and UART speed 0 (115200), as logged;
+- 10 ms between patch and NVM, HCI_Reset, HCI_Read_Local_Version.
+Stages: 5 patch sent, 6 NVM sent, 7 reset after firmware OK; -5/-6 if a
+file stopped (the log says which segment).
+Stub-compiled with clang -Wall -Wextra -Wshorten-64-to-32.
+
+Apply after 0170.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 6932ece..3693192 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -24,9 +24,15 @@
+  *   - EDL "get version" (HCI command 0xFC00, parameter 0x19; the WCN3990 answers with a vendor
+  *     event 0xFF: cresp 0, rtype 2, product id, patch, ROM version, SoC id) and HCI_Reset; every
+  *     byte that comes back is logged, and the ROM version and SoC id are decoded.
+- * No firmware is sent yet. Reading kern.sweetbt gives the stage reached: 0 not run, 1 clock, 2
+- * UART up, 3 the chip answered the version request, 4 it answered HCI_Reset; negative: stopped
+- * there (-1 clock did not start, -2 no mapping, -3 not the UART firmware).
++ * 0169 worked (2026-11-10): SoC id 0x40010224, ROM 0x1001, patch 0x6699; HCI_Reset status 0.
++ * 0171, step 3: then the firmware from the modem partition (image/crbtfw11.tlv, image/crnv11.bin for
++ * this chip), as Linux btqca.c: TLV in 243-byte EDL segments (HCI 0xFC00, command 0x1E), each answered
++ * by vendor event rtype 4 unless the patch header's download mode skips it (the last always waits);
++ * NVM with in-band sleep off and the UART speed 115200 in its HCI tag; HCI_Reset; Read Local Version.
++ * Reading kern.sweetbt gives the stage reached: 0 not run, 1 clock, 2 UART up, 3 the chip answered
++ * the version request, 4 it answered HCI_Reset, 5 patch sent, 6 NVM sent, 7 reset after firmware
++ * answered 0; negative: stopped there (-1 clock did not start, -2 no mapping, -3 not the UART
++ * firmware, -5 patch, -6 NVM).
+  * Everything is logged as "sweet_bt: ...".
+  */
+ #include <sys/param.h>
+@@ -34,11 +40,15 @@
+ #include <sys/errno.h>
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <kern/kalloc.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);    /* (private to the kernel proper; declared as the other drivers do) */
++/* 0171: files of the modem partition (SweetModem.cpp, 0096: the index the Wi-Fi board data comes from; needs sweetmodem=1) */
++extern int64_t topaz_part_fw_size(const char *path);
++extern bool topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n);
+ 
+ #define BT_GCC_PA       0x00100000u
+ #define BT_GCC_LEN      0x00060000u
+@@ -396,12 +406,144 @@ hci_cmd(const char *what, uint16_t opcode, const uint8_t *param, uint8_t plen, u
+ 	return n;
+ }
+ 
++/* ---- 0171: the firmware (Linux btqca.c qca_download_firmware / qca_tlv_check_data / qca_tlv_send_segment) ---- */
++
++#define EDL_PATCH_TLV_REQ_CMD   0x1e
++#define EDL_TVL_DNLD_RES_EVT    0x04
++#define TLV_SEGMENT_MOST        243u
++#define EDL_TAG_ID_HCI          17
++#define QCA_SKIP_EVT_NONE       0
++#define QCA_SKIP_EVT_VSE        1
++#define QCA_SKIP_EVT_CC         2
++#define QCA_SKIP_EVT_VSE_CC     3
++
++static uint8_t rx_keep[256];
++static unsigned rx_kept;
++
++/* Wait for the vendor event "04 ff len 00 rtype ..." (anything before it is dropped); its next byte goes to *result. */
++static bool
++wait_vse(uint8_t rtype, unsigned timeout_us, uint8_t *result)
++{
++	for (unsigned t = 0; t < timeout_us; t += 2000) {
++		rx_kept += uart_rx(rx_keep + rx_kept, sizeof(rx_keep) - rx_kept, 2000, 500);
++		for (unsigned i = 0; i + 5 < rx_kept; i++) {
++			if (rx_keep[i] == HCI_EVENT_PKT && rx_keep[i + 1] == 0xff && rx_keep[i + 3] == 0x00 && rx_keep[i + 4] == rtype &&
++			    i + 3 + rx_keep[i + 2] <= rx_kept) {
++				unsigned end = i + 3 + rx_keep[i + 2];
++
++				*result = rx_keep[i + 2] >= 3 ? rx_keep[i + 5] : 0;
++				memmove(rx_keep, rx_keep + end, rx_kept - end);
++				rx_kept -= end;
++				return true;
++			}
++		}
++		if (rx_kept > sizeof(rx_keep) - 64) {           /* (keep the tail: an event may straddle) */
++			memmove(rx_keep, rx_keep + rx_kept - 32, 32);
++			rx_kept = 32;
++		}
++	}
++	return false;
++}
++
++/* One file of TLV type 1 (patch) or 2 (NVM), whole, in segments of at most 243 bytes. */
++static bool
++tlv_download(const char *path, bool nvm)
++{
++	int64_t size = topaz_part_fw_size(path);
++	uint8_t *f, cmd[4 + 2 + TLV_SEGMENT_MOST];
++	unsigned mode = QCA_SKIP_EVT_NONE, segments = 0, acks = 0;
++	uint64_t began = mach_absolute_time(), took;
++	uint32_t type_len;
++	bool ok = true;
++
++	if (size < 8 || size > 0x100000) {
++		printf("sweet_bt: %s: %s (%lld bytes)\n", path, size < 0 ? "not on the modem partition" : "odd size", size);
++		return false;
++	}
++	f = kalloc_data((vm_size_t)size, Z_WAITOK);
++	if (f == NULL || !topaz_part_fw_read(path, 0, f, (uint64_t)size)) {
++		printf("sweet_bt: %s: cannot read it\n", path);
++		if (f != NULL) {
++			kfree_data(f, (vm_size_t)size);
++		}
++		return false;
++	}
++	type_len = f[0] | f[1] << 8 | f[2] << 16 | (uint32_t)f[3] << 24;
++	printf("sweet_bt: %s: %lld bytes, TLV type %u length %u\n", path, size, type_len & 0xff, type_len >> 8);
++	if (!nvm && (type_len & 0xff) == 1 && size >= 4 + 24) {
++		const uint8_t *h = f + 4;               /* struct tlv_type_patch */
++
++		mode = h[10];
++		printf("sweet_bt: patch: total %u data %u format %u signature %u download mode %u product %#x rom build %#x "
++		    "patch version %#x\n", h[0] | h[1] << 8 | h[2] << 16 | (uint32_t)h[3] << 24,
++		    h[4] | h[5] << 8 | h[6] << 16 | (uint32_t)h[7] << 24, h[8], h[9], h[10], h[12] | h[13] << 8,
++		    h[14] | h[15] << 8, h[16] | h[17] << 8);
++	} else if (nvm && (type_len & 0xff) == 2) {
++		/* tags: id (2), length (2), 8 reserved, data; HCI tag: in-band sleep off (our driver does not do it), 115200 */
++		for (uint64_t at = 4; at + 12 <= (uint64_t)size;) {
++			unsigned id = f[at] | f[at + 1] << 8, len = f[at + 2] | f[at + 3] << 8;
++
++			if (at + 12 + len > (uint64_t)size) {
++				break;
++			}
++			if (id == EDL_TAG_ID_HCI && len >= 3) {
++				printf("sweet_bt: nvm: HCI tag: flags %#x -> %#x, baud %#x -> 0 (115200)\n", f[at + 12],
++				    f[at + 12] & ~0x80u, f[at + 14]);
++				f[at + 12] &= (uint8_t)~0x80u;
++				f[at + 14] = 0;
++			}
++			at += 12 + len;
++		}
++	}
++
++	for (uint64_t off = 0; off < (uint64_t)size; off += TLV_SEGMENT_MOST) {
++		unsigned seg = (unsigned)((uint64_t)size - off < TLV_SEGMENT_MOST ? (uint64_t)size - off : TLV_SEGMENT_MOST);
++		bool last = off + seg >= (uint64_t)size || seg < TLV_SEGMENT_MOST;
++		bool wait = last || mode == QCA_SKIP_EVT_NONE || mode == QCA_SKIP_EVT_CC;
++		uint8_t result = 0;
++
++		cmd[0] = HCI_COMMAND_PKT;
++		cmd[1] = 0x00;
++		cmd[2] = 0xfc;
++		cmd[3] = (uint8_t)(seg + 2);
++		cmd[4] = EDL_PATCH_TLV_REQ_CMD;
++		cmd[5] = (uint8_t)seg;
++		memcpy(cmd + 6, f + off, seg);
++		if (!uart_tx(cmd, 6 + seg, 500000)) {
++			printf("sweet_bt: %s: segment at %llu not sent\n", path, off);
++			ok = false;
++			break;
++		}
++		segments++;
++		if (wait) {
++			if (!wait_vse(EDL_TVL_DNLD_RES_EVT, 1000000, &result)) {
++				printf("sweet_bt: %s: no answer to the segment at %llu (mode %u)\n", path, off, mode);
++				dump("rx kept", rx_keep, rx_kept);
++				ok = false;
++				break;
++			}
++			acks++;
++			if (result != 0) {
++				printf("sweet_bt: %s: segment at %llu answered %#x\n", path, off, result);
++			}
++		} else if (rx_kept < sizeof(rx_keep) - 64) {
++			rx_kept += uart_rx(rx_keep + rx_kept, sizeof(rx_keep) - rx_kept, 1, 1);
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &took);
++	printf("sweet_bt: %s: %s, %u segments, %u answered, %llu ms\n", path, ok ? "sent" : "STOPPED", segments, acks,
++	    took / NSEC_PER_MSEC);
++	kfree_data(f, (vm_size_t)size);
++	return ok;
++}
++
+ static int
+ sweet_bt_up(void)
+ {
+ 	static const uint8_t ver_req[] = { 0x19 };
+ 	uint8_t r[128], pulse;
+-	unsigned n;
++	unsigned n, fw_ver = 0;
++	char path[32];
+ 
+ 	gcc = ml_io_map(BT_GCC_PA, BT_GCC_LEN);
+ 	tlmm = ml_io_map(BT_TLMM_PA, BT_TLMM_LEN);
+@@ -445,11 +587,15 @@ sweet_bt_up(void)
+ 			uint32_t product = v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24;
+ 			uint16_t patch = (uint16_t)(v[4] | v[5] << 8), rom = (uint16_t)(v[6] | v[7] << 8);
+ 			uint32_t soc = v[8] | v[9] << 8 | v[10] << 16 | (uint32_t)v[11] << 24;
+-			uint32_t soc_ver = soc << 16 | rom;
+-			unsigned rom_ver = ((soc_ver & 0xf00) >> 4) | (soc_ver & 0xf);
+-
++			/*
++			 * 0171: the files' number. Linux's rule ((rom & 0xf00) >> 4 | rom & 0xf) gives 0x01 for this chip's
++			 * ROM 0x1001, and there is no crbtfw01; Qualcomm's libbt-vendor names SoC 0x40010224 "CHEROKEE 1.1"
++			 * (crbtfw11.tlv, crnv11.bin): major in bits 15:12, minor in 3:0. Linux's rule is logged for comparison.
++			 */
++			fw_ver = ((rom >> 12) & 0xfu) << 4 | (rom & 0xfu);
+ 			printf("sweet_bt: chip: product %#x patch %#x rom %#x soc id %#x -> firmware image/crbtfw%02x.tlv, "
+-			    "image/crnv%02x.bin\n", product, patch, rom, soc, rom_ver, rom_ver);
++			    "image/crnv%02x.bin (Linux's rule: %02x)\n", product, patch, rom, soc, fw_ver, fw_ver,
++			    ((rom & 0xf00u) >> 4) | (rom & 0xfu));
+ 			bt_stage = 3;
+ 			break;
+ 		}
+@@ -466,6 +612,42 @@ sweet_bt_up(void)
+ 			break;
+ 		}
+ 	}
++	if (bt_stage != 4) {
++		return bt_stage;
++	}
++
++	/* 0171: rampatch, 10 ms (btqca: "time to get ready to receive the NVM"), NVM, reset, local version */
++	rx_kept = 0;
++	snprintf(path, sizeof(path), "image/crbtfw%02x.tlv", fw_ver);
++	if (!tlv_download(path, false)) {
++		return -5;
++	}
++	bt_stage = 5;
++	delay(10000);
++	snprintf(path, sizeof(path), "image/crnv%02x.bin", fw_ver);
++	if (!tlv_download(path, true)) {
++		return -6;
++	}
++	bt_stage = 6;
++	n = hci_cmd("reset after firmware", 0x0c03, NULL, 0, r, sizeof(r));
++	for (unsigned i = 0; i + 6 < n; i++) {
++		if (r[i] == HCI_EVENT_PKT && r[i + 1] == 0x0e && r[i + 4] == 0x03 && r[i + 5] == 0x0c) {
++			printf("sweet_bt: reset after firmware: status %#x\n", r[i + 6]);
++			if (r[i + 6] == 0) {
++				bt_stage = 7;
++			}
++			break;
++		}
++	}
++	/* HCI_Read_Local_Version_Information: 04 0e 0c 01 01 10 status hci_ver hci_rev(2) lmp_ver manufacturer(2) lmp_subver(2) */
++	n = hci_cmd("local version", 0x1001, NULL, 0, r, sizeof(r));
++	for (unsigned i = 0; i + 14 < n; i++) {
++		if (r[i] == HCI_EVENT_PKT && r[i + 1] == 0x0e && r[i + 4] == 0x01 && r[i + 5] == 0x10) {
++			printf("sweet_bt: local version: status %#x hci %u rev %#x lmp %u manufacturer %#x lmp subversion %#x\n",
++			    r[i + 6], r[i + 7], r[i + 8] | r[i + 9] << 8, r[i + 10], r[i + 11] | r[i + 12] << 8, r[i + 13] | r[i + 14] << 8);
++			break;
++		}
++	}
+ 	return bt_stage;
+ }
+ 

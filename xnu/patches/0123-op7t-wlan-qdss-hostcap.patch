@@ -1,0 +1,72 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sat, 24 Oct 2026 15:00:00 +0000
+Subject: [PATCH] op7t-0123: WLAN: QDSS clock on (AOP), host_cap back to 4 bytes
+
+Mainline sm8150.dtsi's wifi node has two clocks, not one:
+  clocks = <&rpmhcc RPMH_RF_CLK2>, <&aoss_qmp>;  clock-names = "cxo_ref_clk_pin", "qdss";
+0122 added the first. This adds the second: AOP's QDSS clock, switched on through the
+AOSS QMP mailbox with "{class: clock, res: qdss, val: 1}" (qcom_aoss.c
+qmp_qdss_clk_prepare), before the modem boots. Per the upstream commit that added it,
+the SM8150 Wi-Fi firmware needs the QDSS clock running. Decoded crash (7T modem_a
+wlanmdsp.mbn c2-00006): PC 0xb01998b0 reads CoreSight LSR 0x18AD2FB4 right after the
+0xC5ACCE55 unlock -- the WCSS QDSS block. Boot-arg sweetqdss=0 skips it.
+
+host_cap: 0122's one-byte daemon_support was rejected (err 1); send 4 bytes again.
+The sweethostcap32 boot-arg is gone.
+
+Apply after 0122.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2597,17 +2597,11 @@
+ 		LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
+ 		if (wm_new(&m, WLFW_HOST_CAP)) {
+ 			/*
+-			 * 0122: daemon_support as ONE byte: mainline sm8150 sets qcom,snoc-host-cap-8bit-quirk
+-			 * (ath10k wlfw_host_cap_8bit_req_msg_v01); the 4-byte form is for other SoCs.
+-			 * Boot-arg sweethostcap32=1 sends the old 4-byte form.
++			 * 0123: daemon_support as 4 bytes again. 0122's one-byte form (the 8-bit quirk) was
++			 * rejected by this firmware ("host_cap rejected err 1", boot 2026-10-24); mainline
++			 * sm8150.dtsi does not set qcom,snoc-host-cap-8bit-quirk either.
+ 			 */
+-			unsigned cap32 = 0;
+-			(void)PE_parse_boot_argn("sweethostcap32", &cap32, sizeof(cap32));
+-			if (cap32) {
+-				wm_u32(&m, 0x10, 0);
+-			} else {
+-				wm_u8(&m, 0x10, 0);         /* daemon_support = 0 */
+-			}
++			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
+ 			wm_send(&m);
+ 			w_step = "host_cap sent";
+ 		}
+@@ -5793,6 +5787,28 @@
+ 	int e;
+ 
+ 	(void)aop_send("{class: image, res: load_state, name: modem, val: on}");
++	/*
++	 * 0123: the QDSS clock. Mainline sm8150.dtsi's Wi-Fi node has
++	 * clocks = <&rpmhcc RPMH_RF_CLK2>, <&aoss_qmp> with clock-names "cxo_ref_clk_pin", "qdss";
++	 * ath10k_snoc enables both before it talks to the firmware. Bjorn Andersson's patch that added
++	 * it ("ath10k: Add optional qdss clk", 2019): "the WiFi firmware [on SM8150] depends on the QDSS
++	 * clock ticking, or the system will reset due to an NoC error". Here the WLAN PD dies instead
++	 * (EX in WLAN RT right after cal_report). Decoded in the 7T's own wlanmdsp.mbn
++	 * (WLAN.HL.3.2.0.c2-00006, modem_a): PC 0xb01998b0 is a READ of 0x18AD2FB4 (CoreSight LSR)
++	 * just after writing the CoreSight unlock key 0xC5ACCE55 to 0x18AD2FB0 (LAR); the routine
++	 * unlocks the WCSS debug components at 0x18AD2000/4000/5000/6000/7000/C000/D000 -- QDSS
++	 * registers, dead without the QDSS clock. The clock is AOP's: qcom_aoss.c qmp_qdss_clk_prepare()
++	 * sends exactly this message over the same QMP mailbox as load_state. Only ever switched on.
++	 * Boot-arg sweetqdss=0 skips it.
++	 */
++	{
++		unsigned qdss = 1;
++		(void)PE_parse_boot_argn("sweetqdss", &qdss, sizeof(qdss));
++		if (qdss) {
++			bool taken = aop_send("{class: clock, res: qdss, val: 1}");
++			LOG("aop: WLAN QDSS clock (ath10k \"qdss\"): %s", taken ? "on" : "NOT taken");
++		}
++	}
+ 	e = vote_retry(sweet_rpmh_arc_level, "cx.lvl", 0x181);
+ 	LOG("rpmh: cx.lvl proxy vote: %d", e);
+ 	e = vote_retry(sweet_rpmh_arc_level, "mss.lvl", 0x181);

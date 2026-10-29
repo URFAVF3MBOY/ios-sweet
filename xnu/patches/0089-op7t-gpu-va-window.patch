@@ -1,0 +1,134 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -40,8 +40,11 @@
+ #include <pexpert/pexpert.h>
+ #include <mach/mach_time.h>
+ #include <stdbool.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t kvtophys(vm_offset_t va);		/* pmap_paddr_t; as HackiOS redwood_adreno.c */
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_gpu_init(void);
+ 
+@@ -328,9 +331,12 @@ static void map_framebuffer(void)
+  * _done): a GPU address allocator, 4K pages mapped into the 3D core's SMMU context at run
+  * time, unmapping with TLB maintenance on that context, and a submit of indirect buffers
+  * ending in a fence. RedwoodGPU's user client (K1b) will sit on top of these.
+- *   VA window 0x10000000-0x13ffffff: L2 entries 128..159 of the shim's L2 (L1[0]), one L3
+- *   table per 2 MiB from a 32-table pool at scratch +0x500000 (slice SL_K1, 192 KiB:
+- *   0x20000 tables, 0x10000 test pages).
++ *   VA window 0x10000000-0x3fffffff (768 MiB, 0089; was 64 MiB): L2 entries 128..511 of the
++ *   shim's L2 (L1[0]), one L3 table per 2 MiB, made on first use from ordinary kernel memory
++ *   (kmem_alloc, physical address by kvtophys) as HackiOS space_new_table() does, and pushed out
++ *   of the CPU's cache before the SMMU may walk it (it reads memory, not the cache). The old
++ *   32-table pool in scratch would have needed ml_io_map space, which ran out on boots 22/23.
++ *   Scratch +0x500000 (slice SL_K1) still holds the self-test pages (K1_TEST_PA).
+  *   TLB: TLBIASID 0 + TLBSYNC on the GPU's own context bank (found by its SMR,
+  *   SID 0 mask 0x401, as the shim programs it). HackiOS does this routinely on the GPU's
+  *   context; our "no CB access while a master runs" rule came from the GMU's CB0. The
+@@ -340,10 +346,10 @@ static void map_framebuffer(void)
+  */
+ #define SL_K1_PA		(SCRATCH_PA + 0x500000UL)
+ #define SL_K1_LEN		0x30000UL
+-#define K1_POOL_PA		SL_K1_PA			/* 32 L3 tables */
+ #define K1_TEST_PA		(SL_K1_PA + 0x20000UL)		/* 16 test pages */
+ #define K1_VA_BASE		0x10000000ULL
+-#define K1_VA_SIZE		0x04000000ULL
++#define K1_VA_SIZE		0x30000000ULL			/* up to L2 index 511: the shim's one L2 */
++#define K1_NTABLES		((uint32_t)(K1_VA_SIZE >> 21))	/* one L3 table per 2 MiB */
+ #define K1_PTE_RO		(1ULL << 7)			/* AP[2]: read-only */
+ #define K1_FENCE_OFF		0x180U				/* scratch word, after 0084's */
+ #define K1_SMMU_PA		0x02ca0000UL
+@@ -356,7 +362,8 @@ static void map_framebuffer(void)
+ #define K1_GPU_SMR		(0x80000000U | (0x401U << 16))	/* VALID | mask 0x401 | SID 0 */
+ 
+ static vm_offset_t sl_k1, k1_cb;
+-static uint32_t k1_l3_live;			/* bit t: pool table t is in the L2 */
++static uint64_t *k1_l3[K1_NTABLES];		/* table t (VA 2 MiB block t), kernel VA; NULL: not made yet */
++static unsigned k1_l3_made;
+ static struct { uint64_t start, size; } k1_free[64];
+ static unsigned k1_nfree, k1_lost;
+ static int k1_va_fresh;			/* no TLB maintenance works: never reuse an address */
+@@ -418,23 +425,55 @@ void sweet_gpu_address_free(uint64_t a, uint64_t size)
+ 	}
+ }
+ 
++/* clean [p, p+n) of this processor's cache out to memory (the SMMU walks memory, not the cache) */
++static void k1_clean(const void *p, uint64_t n)
++{
++	vm_offset_t s = (vm_offset_t)p;
++	for (vm_offset_t line = s & ~(vm_offset_t)63; line < s + n; line += 64)
++		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * One zeroed 4K L3 table from kernel memory: HackiOS space_new_table(). A kmem page is
++ * PAGE_SIZE (16K on this kernel) and physically one page, so it is cut into 4K tables, each
++ * with its own kvtophys. Never given back (as HackiOS): at most K1_NTABLES (384) = 1.5 MiB.
++ */
++static uint64_t *k1_new_table(void)
++{
++	static vm_offset_t spare;
++	static unsigned spare_left;
++	if (spare_left == 0) {
++		if (kmem_alloc(kernel_map, &spare, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++			return NULL;
++		spare_left = PAGE_SIZE / 4096;
++	}
++	return (uint64_t *)(spare + PAGE_SIZE - 4096 * spare_left--);
++}
++
+ /* one 4K page; a fresh 2 MiB table is zeroed and hung in the L2 before use (no TLB issue: never valid before) */
+ int sweet_gpu_map(uint64_t va, uint64_t pa, int read_only)
+ {
+ 	if (va < K1_VA_BASE || va >= K1_VA_BASE + K1_VA_SIZE || (va & 0xfffULL) || (pa & 0xfffULL))
+ 		return 0;
+ 	uint32_t t = (uint32_t)((va - K1_VA_BASE) >> 21);
+-	uintptr_t l3 = K1_POOL_PA + (uintptr_t)t * 0x1000;
+-	if (!(k1_l3_live & (1U << t))) {
+-		volatile uint64_t *tab = (volatile uint64_t *)k1p(l3);
+-		for (unsigned i = 0; i < 512; i++)
+-			tab[i] = 0;
++	uint64_t *tab = k1_l3[t];
++	if (tab == NULL) {
++		tab = k1_new_table();
++		if (tab == NULL)
++			return 0;
++		uint64_t tpa = kvtophys((vm_offset_t)tab);
++		if (tpa == 0 || (tpa & 0xfffULL))
++			return 0;
++		k1_clean(tab, 4096);			/* its zeroes in memory before the L2 points at it */
++		*sp64(GPU_PT_PA + 0x1000 + (uintptr_t)((va >> 21) & 0x1ffU) * 8) = tpa | PTE_TABLE;
+ 		__asm__ volatile("dsb sy" ::: "memory");
+-		*sp64(GPU_PT_PA + 0x1000 + (uintptr_t)((va >> 21) & 0x1ffU) * 8) = (uint64_t)l3 | PTE_TABLE;
+-		k1_l3_live |= 1U << t;
++		k1_l3[t] = tab;
++		k1_l3_made++;
+ 	}
+-	((volatile uint64_t *)k1p(l3))[(va >> 12) & 0x1ffU] =
+-	    pa | PTE_PAGE | PTE_ATTR | (read_only ? K1_PTE_RO : 0);
++	tab[(va >> 12) & 0x1ffU] = pa | PTE_PAGE | PTE_ATTR | (read_only ? K1_PTE_RO : 0);
++	k1_clean(&tab[(va >> 12) & 0x1ffU], 8);
+ 	return 1;
+ }
+ 
+@@ -544,8 +583,12 @@ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ 		if (v < K1_VA_BASE || v >= K1_VA_BASE + K1_VA_SIZE)
+ 			continue;
+ 		uint32_t t = (uint32_t)((v - K1_VA_BASE) >> 21);
+-		if (k1_l3_live & (1U << t))
+-			((volatile uint64_t *)k1p(K1_POOL_PA + (uintptr_t)t * 0x1000))[(v >> 12) & 0x1ffU] = 0;
++		if (k1_l3[t] != NULL) {
++			uint64_t *e = &k1_l3[t][(v >> 12) & 0x1ffU];
++			*e = 0;
++			vm_offset_t line = (vm_offset_t)e & ~(vm_offset_t)63;
++			__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	return k1_tlb_flush_range(va, size);

@@ -1,0 +1,158 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sat, 24 Oct 2026 19:50:00 +0000
+Subject: [PATCH] op7t-0127: WLAN: teardown order back to DOWN/PEER_DELETE/STOP; en0 DHCP diagnostics
+
+Boot 2026-10-24 15:30 (0126): the join works (VDEV_START status 0, auth, assoc
+aid 2, 4-way, "*** joined Naja2025 ***", link up), but:
+
+1. en0 never sent a single frame ("0 frames sent ... dropped: 0 out", 563 received):
+   the stack never handed en0 anything, so no DHCP, Settings stays "connecting",
+   and wifid leaves after ~75 s.
+2. That leave tore the link down and the WLAN firmware died in the same millisecond
+   (PFR "EX:wlan_process:0x1:WLAN RT:0x107a:PC=0x8622ee30"). 0126 had moved
+   PEER_DELETE after VDEV_STOP; ath10k and 0124 delete the peer before the stop.
+   After the WLAN restart the radio layer is not set up again, so no more scans.
+
+Fix (1 is diagnosed, not fixed yet):
+ - w_teardown: VDEV_DOWN -> PEER_DELETE (+ self-peer) -> VDEV_STOP, 10 ms apart, logged.
+ - redwood_net: every en0 ioctl logged, configd's included (IPConfiguration runs in
+   configd), repeats folded, with the link state and interface flags; SIOCSIFFLAGS
+   logs the resulting flags; the first 60 outgoing / 20 incoming frames traced by
+   default (net_trace=0 turns it off), outgoing ones even when dropped.
+
+Apply after 0126.
+---
+ bsd/dev/redwood_net.c           | 30 +++++++++++++++++++++---------
+ iokit/Kernel/arm/SweetModem.cpp | 23 +++++++++++++++++------
+ 2 files changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
+index e7b46fd..d88d7ea 100644
+--- a/bsd/dev/redwood_net.c
++++ b/bsd/dev/redwood_net.c
+@@ -57,12 +57,14 @@ static uint32_t net_trace, net_names;
+ static void
+ trace_frame(const char *way, const uint8_t *frame, size_t length, size_t whole)
+ {
+-	static uint32_t said, names;
++	static uint32_t said_in, said_out, names;
++	uint32_t *said_p = way[0] == 'o' ? &said_out : &said_in;
++	uint32_t quota = way[0] == 'o' ? net_trace : net_trace / 3;   /* 0127: outgoing frames are the question */
+ 	const uint8_t *end = frame + length, *ip = frame + ETHER_HDR_LEN, *l4;
+ 	uint16_t type;
+ 	bool ports;
+ 
+-	if (length < ETHER_HDR_LEN + 28 || (said >= net_trace && (!net_names || names >= NAMES_MAX))) {
++	if (length < ETHER_HDR_LEN + 28 || (*said_p >= quota && (!net_names || names >= NAMES_MAX))) {
+ 		return;
+ 	}
+ 	type = (uint16_t)(frame[12] << 8 | frame[13]);
+@@ -89,10 +91,10 @@ trace_frame(const char *way, const uint8_t *frame, size_t length, size_t whole)
+ 			printf("net: connects to %u.%u.%u.%u port %u\n", ip[16], ip[17], ip[18], ip[19], l4[2] << 8 | l4[3]);
+ 		}
+ 	}
+-	if (said >= net_trace) {
++	if (*said_p >= quota) {
+ 		return;
+ 	}
+-	said++;
++	(*said_p)++;
+ 	if (type == ETHERTYPE_IP) {
+ 		printf("net: %s %zu bytes: IPv4 %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u%s\n", way, whole, ip[9] == IPPROTO_TCP ? "TCP" :
+ 		    ip[9] == IPPROTO_UDP ? "UDP" : ip[9] == IPPROTO_ICMP ? "ICMP" : "protocol?", ip[12], ip[13], ip[14], ip[15],
+@@ -125,9 +127,9 @@ net_output(ifnet_t ifp, mbuf_t packet)
+ 	size_t length = mbuf_pkthdr_len(packet);
+ 	bool sent = false;
+ 
++	trace_packet(packet, length);               /* 0127: traced even when it is dropped below */
+ 	if (length <= REDWOOD_NET_FRAME_MAX && net_link_up) {
+ 		bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
+-		trace_packet(packet, length);
+ 		lck_mtx_lock(&net_tx_lock);
+ 		sent = net_link->transmit(packet, length);
+ 		lck_mtx_unlock(&net_tx_lock);
+@@ -188,14 +190,22 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
+ 	user_addr_t list;
+ 	errno_t error = 0;
+ 
+-	if (net_link->wireless && net_ioctls_said < 80) {
++	if (net_link->wireless && net_ioctls_said < 400) {
++		static u_long last_command;
++		static char last_who[32];
+ 		char who[32] = "?";
+ 
+-		/* (while iOS's Wi-Fi side is being got to talk to this: who asks the interface what) */
++		/*
++		 * 0127: configd included (IPConfiguration runs in it: whether it ever brings en0 up and
++		 * starts DHCP is the open question), repeats of the same request by the same process folded.
++		 */
+ 		proc_selfname(who, sizeof(who));
+-		if (strcmp(who, "configd") != 0) {
++		if (command != last_command || strcmp(who, last_who) != 0) {
++			last_command = command;
++			strlcpy(last_who, who, sizeof(last_who));
+ 			net_ioctls_said++;
+-			printf("net: en0 is asked %#lx by %s\n", command, who);
++			printf("net: en0 is asked %#lx by %s (link %s, flags %#x)\n", command, who, net_link_up ? "up" : "down",
++			    (unsigned)ifnet_flags(ifp));
+ 		}
+ 	}
+ 	switch (command) {
+@@ -205,6 +215,7 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
+ 	case SIOCSIFFLAGS:
+ 		/* running whenever it is up: the link is there or it is not, nothing is switched on */
+ 		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		printf("net: en0 flags now %#x (up %d)\n", (unsigned)ifnet_flags(ifp), (ifnet_flags(ifp) & IFF_UP) != 0);
+ 		break;
+ 	case SIOCGIFMEDIA32:
+ 	case SIOCGIFMEDIA64:
+@@ -371,6 +382,7 @@ redwood_net_attach(const struct redwood_net_link *link)
+ void
+ redwood_net_init(void)
+ {
++	net_trace = 60;                         /* 0127: on by default while DHCP is investigated; net_trace=0 off */
+ 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
+ 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
+ }
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index 8e74d0a..7c517b3 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -4731,20 +4731,31 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ static void
+ w_teardown(void)
+ {
+-	if (s_state >= S_START) {
+-		if (s_state >= S_4WAY) {
+-			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+-		}
+-		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++	/*
++	 * 0127: DOWN -> PEER_DELETE -> STOP, the order ath10k (and 0124) use. 0126 moved the peer
++	 * delete after VDEV_STOP; boot 2026-10-24 15:30: the first teardown of a joined link (wifid
++	 * leaving) killed the WLAN firmware in the same millisecond ("EX:wlan_process ... WLAN RT:
++	 * 0x107a"), and with no re-init after a WLAN restart the radio stayed silent (no scans).
++	 */
++	bool started = s_state >= S_START;
++	if (started && s_state >= S_4WAY) {
++		w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		IOSleep(10);
+ 	}
+-	if (s_peer_made) {                          /* 0126: the peer can now exist from before start */
++	if (s_peer_made) {                          /* 0126: the peer can exist from before start */
+ 		w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
+ 		s_peer_made = false;
++		IOSleep(10);
+ 	}
+ 	if (s_selfpeer_made) {
+ 		w_peer_addr(CMD_PEER_DELETE, TAG_PEER_DELETE, our_mac, false);
+ 		s_selfpeer_made = false;
++		IOSleep(10);
++	}
++	if (started) {
++		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	}
++	LOG("t=%u ms: join: torn down (was state %u)", g_ms, s_state);
+ 	if (s_state == S_UP) {
+ 		w_link(false);
+ 	}

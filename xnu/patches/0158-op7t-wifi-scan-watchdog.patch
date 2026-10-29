@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -3475,7 +3475,7 @@
+ 	c = put32(c, 0xA000 | 1);                   /* scan_req_id */
+ 	c = put32(c, 0);                            /* vdev */
+ 	c = put32(c, 1);                            /* priority low */
+-	c = put32(c, 0x001 | 0x002 | 0x004 | 0x008 | 0x100 | 0x010);   /* events */
++	c = put32(c, 0x001 | 0x002 | 0x004 | 0x008 | 0x100 | 0x010 | 0x020 | 0x040);   /* events (0158: + preempted, failed) */
+ 	c = put32(c, 50);                           /* dwell active */
+ 	c = put32(c, 150);                          /* dwell passive */
+ 	c = put32(c, 50);                           /* min rest */
+@@ -3749,7 +3749,7 @@
+ 	if (e[0] == 0x001) {
+ 		JLOG("t=%u ms: scan: STARTED", g_ms);
+ 	}
+-	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
++	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010 || e[0] == 0x020) {
+ 		scanning = false;
+ 		scans++;
+ 		JLOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", g_ms, scans, e[0], nbss, scan_frames, htt_msdus);
+@@ -3758,6 +3758,39 @@
+ 	}
+ }
+ 
++/*
++ * 0158: a scan the radio never reports the end of must not block a join forever. The scan asks for
++ * events 0x001|0x002|0x004|0x008|0x100|0x010 only: a scan that ends as preempted (0x020) or failed
++ * (0x040) was never heard, `scanning` stayed true, and w_join_poll (join only when !scanning) never
++ * started the join: ASSOCIATE_RESULT 0 for ever / timeout after 30 s, no join log (2026-11-08).
++ * A join request wins over a scan after 3 s; any scan is dropped after 25 s (max scan time is 20 s).
++ */
++static void
++w_scan_watchdog(bool join_waits)
++{
++	static bool seen;
++	static unsigned began;
++
++	if (!scanning) {
++		seen = false;
++		return;
++	}
++	if (!seen) {
++		seen = true;
++		began = g_ms;
++	}
++	unsigned age = g_ms - began;
++	if ((join_waits && age > 3000) || age > 25000) {
++		JLOG("t=%u ms: scan watchdog: dropping scan %u after %u ms (%s)", g_ms, scans + 1, age,
++		    join_waits ? "a join is waiting" : "no end event");
++		scanning = false;
++		seen = false;
++		scans++;
++		next_scan_ms = 0;
++		api_scans_done++;
++	}
++}
++
+ static void
+ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ {
+@@ -5399,6 +5432,7 @@
+ 			topaz_wlan_ready_hook();
+ 		}
+ 	}
++	w_scan_watchdog(s_join_asked);
+ 	if (api_ready) {
+ 		w_join_poll();
+ 		w_tx_pump();

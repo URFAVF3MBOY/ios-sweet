@@ -1,0 +1,25 @@
+#!/bin/bash
+# bt_up.sh: Bluetooth for iOS on the OnePlus 7T, the userland half, once per boot (as root on the phone).
+#   1. kernel: power/UART/firmware of the WCN3990 (sweet_bt.c): sysctl kern.sweetbt=1 (stage 6); from 0178 that
+#      also registers the kernel control com.apple.uart.sk.bluetooth that bluetoothd's H4 driver connects to
+#   2. com.apple.BlueTool answered by bluetool_stub.py instead of Apple's BlueTool (Broadcom only)
+#   3. bluetoothd restarted, so that it finds both (ADT transport-encoding 1 = H4)
+# Files: /var/jb/usr/libexec/bluetool_stub.py, /var/jb/usr/libexec/bluetool-stub-user.plist
+# (tools/bt_bridge.py, the pty + /dev/uart.bluetooth bridge, is not needed for this: bluetoothd 16.5's H4 driver
+#  does not open a tty.)
+export PATH=/var/jb/usr/bin:/var/jb/usr/sbin:/var/jb/bin:/var/jb/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH
+set -u
+stage=$(sysctl -n kern.sweetbt)
+if [ "$stage" -lt 6 ]; then
+	sysctl -w kern.sweetbt=1 >/dev/null
+	stage=$(sysctl -n kern.sweetbt)
+fi
+echo "chip: stage $stage"
+[ "$stage" -ge 6 ] || { echo "chip not up"; exit 1; }
+# (Apple's job answers to system/, user/501/ and user/foreground/ alike; bootstrap goes to user/501)
+for d in user/501 user/foreground system; do launchctl bootout $d/com.apple.BlueTool 2>/dev/null; done
+sleep 1
+launchctl bootstrap user/501 /var/jb/usr/libexec/bluetool-stub-user.plist 2>&1 | tail -1
+launchctl print user/501/com.apple.BlueTool 2>/dev/null | grep -m1 'program'
+killall -9 bluetoothd 2>/dev/null
+echo "bluetoothd restarted"

@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -294,6 +294,33 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * OnePlus 7T, GPU acceleration (0093), as HackiOS's MiniIOSurface.cpp surfaceCreate():
++	 * the iPhone X userland asks for 10-bit wide-gamut formats, made here as ordinary 8-bit
++	 * BGRA of the same geometry -- the panel has no wide gamut, CoreAnimation's software
++	 * renderer cannot draw 'w30r', and the OpenGL ES renderer (eagl.c) takes BGRA only.
++	 *   'w30r' 'l10r' 'w30R'  one 32-bit plane, 10 bits a colour      -> BGRA
++	 *   'b3a8'                the same with alpha in a second plane    -> BGRA, one plane
++	 * The surface says BGRA from then on (the create result, lookups), and the window
++	 * server reads the format back from the surface.
++	 */
++	bool sweet_one_plane = false, sweet_wide = false;
++	if (s->pixelFormat == 'w30r' || s->pixelFormat == 'l10r' || s->pixelFormat == 'w30R' ||
++	    s->pixelFormat == 'b3a8') {
++		static uint32_t sweet_wide_logged;
++		if (sweet_wide_logged++ < 4) {
++			IOLog("HOTDOGB SURF: %c%c%c%c %ux%u made as BGRA (no wide gamut here)\n",
++			    (int)(s->pixelFormat >> 24 & 0xff), (int)(s->pixelFormat >> 16 & 0xff),
++			    (int)(s->pixelFormat >> 8 & 0xff), (int)(s->pixelFormat & 0xff),
++			    sweet_dict_u32(props, "IOSurfaceWidth", 0), sweet_dict_u32(props, "IOSurfaceHeight", 0));
++		}
++		sweet_one_plane = s->pixelFormat == 'b3a8';
++		sweet_wide = true;
++		s->pixelFormat = 'BGRA';
++		s->bytesPerElement = 4;
++		s->elementWidth = 1;
++		s->elementHeight = 1;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -302,12 +329,16 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+ 	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	if (sweet_wide && s->bytesPerRow < (uint64_t)s->width * 4) {
++		/* (a two-plane format's top-level row size need not be its first plane's) */
++		s->bytesPerRow = sweet_row_bytes(s->width, 1, 4);
++	}
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = sweet_one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;

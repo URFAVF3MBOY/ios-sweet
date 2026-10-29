@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2092,8 +2092,18 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			if (rmtfs_va == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
+-				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
+-				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 3);
++				/*
++				 * HLOS + modem only. The downstream msm_sharedmem driver adds VMID_NAV only when
++				 * the rmtfs node has "qcom,vm-nav-path"; the 7T's qcom,rmtfs_sharedmem node does
++				 * not (dtb/hotdogb-live.dts). With NAV in the list (topaz's three VMIDs) the
++				 * hypervisor refused the whole assignment (ret -2) and the modem died 22 ms after
++				 * touching the buffer (boot 2026-10-22, log a91837).
++				 */
++				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA };
++				uint64_t r = scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 2);
++				if (r != 0) {
++					LOG("t=%u ms: rmtfs: buffer NOT given to the modem (%llx): expect a modem crash", g_ms, r);
++				}
+ 			}
+ 		}
+ 		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);

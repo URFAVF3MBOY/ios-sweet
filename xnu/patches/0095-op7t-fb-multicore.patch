@@ -1,0 +1,254 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4a7f219..a3d83a4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,6 +69,7 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++static void sweet_fb_threads_start(void);       /* 0095: the panel copy's other threads */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -218,6 +219,7 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	sweet_fb_threads_start();
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -331,9 +333,140 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * OnePlus 7T (0095): the copy to the panel on several processors, as HackiOS's
++ * MiniIOMobileFramebuffer (fb_threads, 3 by default: "a frame is in the panel's memory
++ * 3 ms after its turn instead of 9"). present() works out each layer's rectangle as
++ * before, then the panel's rows are split into bands: one per thread, the first done
++ * by present()'s own thread, the others by threads started once (sweetfb_threads=N,
++ * 1..6, default 3; 1 = the old single copy). A surface the GPU drew into (K2) is made
++ * readable band by band: each thread pushes out of the cache only the source rows it
++ * copies, instead of one thread doing the whole surface first.
++ */
++#define SWEET_FB_MAX_THREADS    6
++
++struct sweet_fb_layer_job {
++	uintptr_t dst, src;             /* first byte of the rectangle in the panel / in the surface */
++	uint32_t  dstride, sstride;     /* bytes a row */
++	uint32_t  bytes;                /* bytes copied a row */
++	int32_t   top, rows;            /* panel rows top .. top + rows - 1 */
++	bool      sync;                 /* the GPU wrote the source: invalidate before reading */
++};
++static struct {
++	uint32_t                  layers;
++	int32_t                   height;       /* the panel's rows, split into the bands */
++	struct sweet_fb_layer_job l[SWEET_FB_LAYERS];
++} sweet_fb_job;
++static IOLock   *sweet_fb_job_lock;
++static uint32_t  sweet_fb_threads = 1;  /* including present()'s own */
++static uint32_t  sweet_fb_job_gen, sweet_fb_job_done;
++
++extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern "C" void thread_deallocate(thread_t);
++
++static void
++sweet_fb_band(uint32_t band, uint32_t bands)
++{
++	for (uint32_t i = 0; i < sweet_fb_job.layers; i++) {
++		const struct sweet_fb_layer_job *j = &sweet_fb_job.l[i];
++		/* the band is panel rows, so that a layer above another is copied after it in every row */
++		int32_t first = (int32_t)((int64_t)sweet_fb_job.height * band / bands) - j->top;
++		int32_t end = (int32_t)((int64_t)sweet_fb_job.height * (band + 1) / bands) - j->top;
++		if (first < 0) {
++			first = 0;
++		}
++		if (end > j->rows) {
++			end = j->rows;
++		}
++		for (int32_t y = first; y < end; y++) {
++			uintptr_t from = j->src + (uint64_t)y * j->sstride;
++			if (j->sync) {
++				for (uintptr_t line = from & ~(uintptr_t)63; line < from + j->bytes; line += 64) {
++					__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++				}
++				__asm__ volatile ("dsb sy" ::: "memory");
++			}
++			memcpy((void *)(j->dst + (uint64_t)y * j->dstride), (const void *)from, j->bytes);
++		}
++	}
++}
++
++static void
++sweet_fb_worker(void *arg, wait_result_t wr)
++{
++	uint32_t band = (uint32_t)(uintptr_t)arg, seen = 0;
++	(void)wr;
++	for (;;) {
++		IOLockLock(sweet_fb_job_lock);
++		while (sweet_fb_job_gen == seen) {
++			IOLockSleep(sweet_fb_job_lock, &sweet_fb_job_gen, THREAD_UNINT);
++		}
++		seen = sweet_fb_job_gen;
++		IOLockUnlock(sweet_fb_job_lock);
++		sweet_fb_band(band, sweet_fb_threads);
++		IOLockLock(sweet_fb_job_lock);
++		if (++sweet_fb_job_done == sweet_fb_threads - 1) {
++			IOLockWakeup(sweet_fb_job_lock, &sweet_fb_job_done, false);
++		}
++		IOLockUnlock(sweet_fb_job_lock);
++	}
++}
++
++static void
++sweet_fb_threads_start(void)
++{
++	uint32_t want = 3;
++	PE_parse_boot_argn("sweetfb_threads", &want, sizeof(want));
++	if (want < 1) {
++		want = 1;
++	}
++	if (want > SWEET_FB_MAX_THREADS) {
++		want = SWEET_FB_MAX_THREADS;
++	}
++	sweet_fb_job_lock = IOLockAlloc();
++	if (sweet_fb_job_lock == NULL) {
++		return;
++	}
++	uint32_t started = 1;
++	for (uint32_t i = 1; i < want; i++) {
++		thread_t t;
++		if (kernel_thread_start((thread_continue_t)sweet_fb_worker, (void *)(uintptr_t)i, &t) != KERN_SUCCESS) {
++			break;
++		}
++		thread_deallocate(t);
++		started++;
++	}
++	sweet_fb_threads = started;
++	IOLog("HOTDOGB FB: panel copy on %u thread(s)\n", started);
++}
++
++/* every band done: by present()'s own thread and the workers */
++static void
++sweet_fb_copy(void)
++{
++	if (sweet_fb_threads <= 1 || sweet_fb_job_lock == NULL) {
++		sweet_fb_band(0, 1);
++		return;
++	}
++	IOLockLock(sweet_fb_job_lock);
++	sweet_fb_job_done = 0;
++	sweet_fb_job_gen++;
++	IOLockWakeup(sweet_fb_job_lock, &sweet_fb_job_gen, false);
++	IOLockUnlock(sweet_fb_job_lock);
++	sweet_fb_band(0, sweet_fb_threads);
++	IOLockLock(sweet_fb_job_lock);
++	while (sweet_fb_job_done < sweet_fb_threads - 1) {
++		IOLockSleep(sweet_fb_job_lock, &sweet_fb_job_done, THREAD_UNINT);
++	}
++	IOLockUnlock(sweet_fb_job_lock);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	SweetSurface *held[SWEET_FB_LAYERS];
++	uint32_t nheld = 0;
++
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+@@ -347,6 +480,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	sweet_fb_job.layers = 0;
++	sweet_fb_job.height = (int32_t)fHeight;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -370,8 +505,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+-		/* K2: a surface the GPU draws into is copied once the GPU is done (at most 100 ms) */
+-		(void)RedwoodGPUSurfaceDrawn(s, 100);
++		/* K2: a surface the GPU draws into is copied once the GPU is done (at most 100 ms);
++		 * 0095: its cache lines are invalidated by the bands that read them */
++		uint32_t fence = RedwoodGPUSurfaceReady(s, 100);
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -416,13 +552,21 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
+-			}
++			struct sweet_fb_layer_job *j = &sweet_fb_job.l[sweet_fb_job.layers++];
++			j->dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			j->src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			j->dstride = fRowBytes;
++			j->sstride = s->bytesPerRow;
++			j->bytes = (uint32_t)w * 4;
++			j->top = dy;
++			j->rows = h;
++			j->sync = fence != 0;
+ 		}
+-		s->release();
++		held[nheld++] = s;              /* held until copied */
++	}
++	sweet_fb_copy();
++	for (uint32_t i = 0; i < nheld; i++) {
++		held[i]->release();
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 90699ce..3cb2002 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -297,6 +297,27 @@ RedwoodGPUSurfaceDrawn(SweetSurface * surface, uint64_t milliseconds)
+ 	return done;
+ }
+ 
++/*
++ * 0095: as RedwoodGPUSurfaceDrawn(), but the cache is left to the caller: the panel copy
++ * invalidates only the rows it reads, on several processors (SweetFramebuffer.cpp), instead of
++ * the whole surface here under the GPU's lock. Gives the fence to invalidate for (0: nothing to).
++ */
++uint32_t
++RedwoodGPUSurfaceReady(SweetSurface * surface, uint64_t milliseconds)
++{
++	uint32_t fence = surface->gpuDrawn;
++
++	if (fence == 0 || gGPULock == NULL) {
++		return 0;
++	}
++	IOLockLock(gGPULock);
++	if (redwood_gpu_ready()) {
++		(void)gpuWait(fence, milliseconds);
++	}
++	IOLockUnlock(gGPULock);
++	return fence;
++}
++
+ /*
+  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
+  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 333389c..8851eee 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -69,6 +69,7 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+  * for a surface the GPU never drew into.
+  */
+ bool RedwoodGPUSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
++uint32_t RedwoodGPUSurfaceReady(SweetSurface *surface, uint64_t milliseconds);
+ 
+ /* K2: a test's pixels onto the panel (SweetFramebuffer.cpp; RedwoodGPU's kRedwoodShow) */
+ void SweetFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t rowBytes);

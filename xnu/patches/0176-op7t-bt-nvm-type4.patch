@@ -1,0 +1,62 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 11:00:00 -0500
+Subject: [PATCH] op7t-0176: Bluetooth: NVM of TLV type 4: 115200, in-band sleep off
+
+0175 booted (2026-11-11 01:04): firmware in, then btio.py's reset was
+answered "04 0e 04 01 00 00 00" and nothing more came at 115200 (no
+WAKE_ACK, no command complete). crnv11.bin is TLV type 4: the tags of a
+type 2 NVM behind 4 more header bytes (04 ea 0a 00 | 02 27 09 00 | tag 2
+len 6 | tag 17 len 8: 82 01 11 08 04 02 0a 00). Its HCI tag says in-band
+sleep on (0x80) and UART 0x11 = 3.2 Mbaud, so the reset that applies it
+moved the chip to 3.2 Mbaud.
+
+Now type 4 is parsed from byte 8 (type 2 from 4, as before) and the HCI
+tag gets in-band sleep off and 115200 (0), as 0171 meant to; the change is
+logged ("nvm: HCI tag: flags 0x82 -> 0x2, baud 0x11 -> 0"), and a head
+dump if no HCI tag is found.
+
+Apply after 0175.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index f93d4f7..bd012b9 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -691,11 +691,19 @@ tlv_download(const char *path, bool nvm)
+ 		    "patch version %#x\n", h[0] | h[1] << 8 | h[2] << 16 | (uint32_t)h[3] << 24,
+ 		    h[4] | h[5] << 8 | h[6] << 16 | (uint32_t)h[7] << 24, h[8], h[9], h[10], h[12] | h[13] << 8,
+ 		    h[14] | h[15] << 8, h[16] | h[17] << 8);
+-	} else if (nvm && (type_len & 0xff) != 2) {
+-		dump("nvm head (not TLV type 2: left as it is)", f, size < 48 ? (unsigned)size : 48);
+-	} else if (nvm && (type_len & 0xff) == 2) {
+-		/* tags: id (2), length (2), 8 reserved, data; HCI tag: in-band sleep off (our driver does not do it), 115200 */
+-		for (uint64_t at = 4; at + 12 <= (uint64_t)size;) {
++	} else if (nvm && (type_len & 0xff) != 2 && (type_len & 0xff) != 4) {
++		dump("nvm head (TLV type neither 2 nor 4: left as it is)", f, size < 48 ? (unsigned)size : 48);
++	} else if (nvm) {
++		/*
++		 * tags: id (2), length (2), 8 reserved, data; HCI tag: in-band sleep off (our driver does not do it), 115200.
++		 * 0176: crnv11.bin is TLV type 4: the same tags behind 4 more header bytes (head 04 ea 0a 00 | 02 27 09 00 |
++		 * tag 2, 6 bytes ..; tag 17 (HCI) data 82 01 11 08 04 02 0a 00 = in-band sleep on, UART 0x11 = 3.2 Mbaud).
++		 * Left as it was (0175, 2026-11-11), the reset that applies it moved the chip to 3.2 Mbaud: after its
++		 * "04 0e 04 01 00 00 00" nothing more was heard at 115200.
++		 */
++		unsigned hci_tags = 0;
++
++		for (uint64_t at = (type_len & 0xff) == 4 ? 8 : 4; at + 12 <= (uint64_t)size;) {
+ 			unsigned id = f[at] | f[at + 1] << 8, len = f[at + 2] | f[at + 3] << 8;
+ 
+ 			if (at + 12 + len > (uint64_t)size) {
+@@ -706,9 +714,13 @@ tlv_download(const char *path, bool nvm)
+ 				    f[at + 12] & ~0x80u, f[at + 14]);
+ 				f[at + 12] &= (uint8_t)~0x80u;
+ 				f[at + 14] = 0;
++				hci_tags++;
+ 			}
+ 			at += 12 + len;
+ 		}
++		if (hci_tags == 0) {
++			dump("nvm: no HCI tag found; head", f, size < 48 ? (unsigned)size : 48);
++		}
+ 	}
+ 
+ 	for (uint64_t off = 0; off < (uint64_t)size; off += TLV_SEGMENT_MOST) {

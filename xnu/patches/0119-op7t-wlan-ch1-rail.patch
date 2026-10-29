@@ -1,0 +1,28 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -5747,6 +5747,14 @@ soc_power_up(void)
+ {
+ 	static const struct { const char *res; unsigned mv; } wlan_rails[] = {
+ 		{ "ldoa1", 752 }, { "ldoa7", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3104 },
++		/*
++		 * 0119: WCN3990 vdd-3.3-ch1 = PM8150L L10 (the 7T Pro's working mainline Wi-Fi uses all five
++		 * rails, hotdog-linux-bringup validate-mainline616-build.sh). The 7T's downstream icnss node
++		 * names only ch0; on stock, L10C is kept on by the audio driver (sound-tavil vreg_ldo), which
++		 * this port does not run. Without it every boot stopped at "waiting for FW_READY" and the
++		 * phone crashed as the firmware powered the radio. 3304 mV: inside the 7T's L10C 3.0-3.312 V.
++		 */
++		{ "ldoc10", 3304 },
+ 	};
+ 	int e;
+ 
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -342,5 +342,6 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	static const struct { const char *name; unsigned lo, hi; } allowed[] = {
+ 		{ "ldoc11", 2950, 3400 }, { "ldoa17", 2950, 3400 },
+ 		{ "ldoa1", 752, 752 }, { "ldoa7", 1800, 1800 }, { "ldoc2", 1304, 1304 },
++		{ "ldoc10", 2950, 3400 },               /* 0119: WCN3990 vdd-3.3-ch1 (PM8150L L10) */
+ 	};
+ 	unsigned k;

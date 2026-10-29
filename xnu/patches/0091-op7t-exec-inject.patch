@@ -1,0 +1,90 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5586,10 +5586,62 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++/*
++ * U2 (after HackiOS kern.exec_inject, redwood.patch): launchd strips DYLD_* variables from a
++ * job's EnvironmentVariables ("launchd refuses to pass DYLD_ variables from a job
++ * description"), so DYLD_INSERT_LIBRARIES in backboardd's launchd job never reached it.
++ * The kernel adds it here, at exec, after launchd: a program whose file name is in boot-arg
++ * sweetinject=NAME[,NAME...] (default none: off) starts with
++ * DYLD_INSERT_LIBRARIES=<boot-arg sweetinjectlib, default /redwood/lib/libredwood.dylib>.
++ * dyld honours it because AMFI (0090) allows DYLD_* for the processes in sweetdyld=.
++ */
++static bool
++sweet_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	char names[96] = "", lib[96] = "/redwood/lib/libredwood.dylib";
++	const char *name, *at;
++	size_t namelen;
++
++	if (imgp->ip_ndp == NULL ||
++	    !PE_parse_boot_argn("sweetinject", names, sizeof(names)) || names[0] == '\0') {
++		return false;
++	}
++	(void)PE_parse_boot_argn("sweetinjectlib", lib, sizeof(lib));
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	if (name == NULL || namelen == 0) {
++		return false;
++	}
++	for (at = names; *at != '\0';) {
++		size_t len = 0;
++
++		while (at[len] != '\0' && at[len] != ',') {
++			len++;
++		}
++		if (len == namelen && strncmp(at, name, len) == 0) {
++			if (strlcpy(env, "DYLD_INSERT_LIBRARIES=", size) >= size ||
++			    strlcat(env, lib, size) >= size) {
++				return false;
++			}
++			return true;
++		}
++		at += len;
++		if (*at == ',') {
++			at++;
++		}
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	char            sweet_inject_buf[160];
++#endif
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -5759,6 +5811,23 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* one more variable for the programs named in sweetinject= (see sweet_inject_env) */
++	if (sweet_inject_env(imgp, sweet_inject_buf, sizeof(sweet_inject_buf))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(sweet_inject_buf), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++		printf("HOTDOGB INJECT: %.*s started with %s\n", (int)imgp->ip_ndp->ni_cnd.cn_namelen,
++		    imgp->ip_ndp->ni_cnd.cn_nameptr, sweet_inject_buf);
++	}
++#endif
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;

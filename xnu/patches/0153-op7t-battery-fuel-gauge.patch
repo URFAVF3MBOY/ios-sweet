@@ -1,0 +1,161 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 29 Oct 2026 12:00:00 -0400
+Subject: [PATCH] op7t-0153: battery percentage from the PM8150B fuel gauge
+
+The status bar always showed 100 %: SweetBattery published a static
+value unless sweetbattery=1, and that path reads the Redmi's PM6150,
+which the OnePlus 7T does not have. The 7T's PM8150B (SPMI SID 2) runs
+Qualcomm's fuel gauge (fg-gen4, BATT_SOC at 0x4000). It keeps running in
+the PMIC across reboots with the battery profile Android loaded, so its
+MONOTONIC_SOC register (0x4009) is read as Linux fg_get_msoc() does and
+published every 30 s. USB in is USBIN_PLUGIN (0x1310 bit 4); charging is
+"USB in and not full" because the Warp MCU charges with the PMIC charger
+suspended. sweet_spmi_read() now also allows those PM8150B blocks.
+
+Default sweetbattery=2 (fuel gauge, static fallback if it cannot be
+read); 0 = static 100 %, 1 = the old PM6150 path. Logs
+"HOTDOGB BATTERY: gauge raw ..." whenever the value changes.
+
+Apply after 0152.
+---
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index d97bd9c..45c395c 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,9 +88,12 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	/* 0131: and the RTC counter (0x60, read only, sweet_clock.c) */
++	/* 0153: and the OnePlus 7T's PM8150B (SID 2): charger 0x10/0x11/0x13, fuel gauge 0x40/0x41 */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
++	bool pm8150b = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
++	    peripheral == 0x13 || peripheral == 0x40 || peripheral == 0x41);
++	if (!sp_ready || !out || addr > 0xffffu || (sid != 0 && !pm8150b) ||
++	    (sid == 0 && peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..38c8312 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,9 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ * 0153 (OnePlus 7T): by default the PM8150B fuel gauge's own SOC (SID 2,
++ * BATT_SOC 0x4009 MONOTONIC_SOC, as Linux fg-gen4 reads it); sweetbattery=0
++ * keeps the static 100%, =1 the PM6150 path above.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -26,13 +29,14 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
+-	int fLastMode;
++	bool fTimerAdded, fRunning, fReal, fGauge;
++	int fLastMode, fLastGauge;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	bool pollGauge(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -51,7 +55,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fGauge = false;
++	fLastGauge = -1;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -154,7 +159,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("HOTDOGB BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (fGauge ? "PM8150B fuel gauge" : "PM6150 / estimated SOC") :
++		    "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -203,9 +209,42 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* 0153: OnePlus 7T. The fuel gauge keeps running in the PMIC across reboots
++ * (Android loaded its battery profile), so its monotonic SOC is usable as is.
++ * Charging state is kept simple: the Warp MCU charges with the PMIC charger
++ * suspended, so "USB in and not full" means charging. */
++bool
++SweetBattery::pollGauge(void)
++{
++	uint8_t raw, usb = 0, charger = 0;
++	if (sweet_spmi_read(2, 0x4009, &raw)) {
++		return false;
++	}
++	/* Linux fg_get_msoc(): 0xff = 100, 0 = 0, else (raw - 1) * 98 / 253 + 1 rounded. */
++	unsigned percent = raw == 0xff ? 100 : raw == 0 ? 0 :
++	    ((raw - 1u) * 98u + 126u) / 253u + 1u;
++	bool external = !sweet_spmi_read(2, 0x1310, &usb) && (usb & 0x10u);
++	(void)sweet_spmi_read(2, 0x1006, &charger);
++	bool full = external && (percent >= 100 || (charger & 7u) == 5);
++	bool charging = external && !full;
++	int key = (int)percent | (external ? 0x100 : 0) | (charger << 9);
++	if (key != fLastGauge) {
++		IOLog("HOTDOGB BATTERY: gauge raw %#x = %u%%, usb %#x, charger %#x\n",
++		    raw, percent, usb, charger);
++		fLastGauge = key;
++	}
++	/* Never publish 0%: powerd would shut down on a bad read. */
++	publish(percent ? percent : 1, 3870, 0, external, external, charging, full,
++	    true, false);
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fGauge && (pollGauge() || fLastGauge >= 0)) { /* a failed read keeps the last value */
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -262,12 +301,16 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 2;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	uint8_t probe;
++	fGauge = real == 2 && sweet_spmi_init() == 0 && sweet_spmi_read(2, 0x4009, &probe) == 0;
++	IOLog("HOTDOGB BATTERY: sweetbattery=%d, PM8150B fuel gauge %s\n", real,
++	    fGauge ? "found" : "not used");
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || fGauge) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+@@ -275,7 +318,7 @@ SweetBattery::start(IOService *provider)
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(30000);
+ 		} else {
+-			fReal = false;
++			fReal = fGauge = false;
+ 			poll();
+ 			IOLog("HOTDOGB BATTERY: timer unavailable; static fallback\n");
+ 		}

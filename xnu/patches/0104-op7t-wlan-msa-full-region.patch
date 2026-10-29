@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2245,7 +2245,14 @@
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+ #define WLFW_MSA_BASE       0x8BC00000u         /* 7T DT pil_wlan_fw_region (icnss qcom,wlan-msa-fixed-region) */
+-#define WLFW_MSA_SIZE       0x00100000u         /* icnss qcom,wlan-msa-memory */
++#define WLFW_MSA_SIZE       0x00180000u         /* 7T DT pil_wlan_fw_region reg size (0x180000);
++                                                   * NOT icnss qcom,wlan-msa-memory (0x100000) -- the two
++                                                   * MSA regions fill the first 1 MiB exactly, but the
++                                                   * firmware's board/cal-data writes use the whole reserved
++                                                   * 1.5 MiB region. With only 1 MiB assigned, the write into
++                                                   * 0x8bd00000..0x8bd7ffff is outside the hyp-assign -> XPU
++                                                   * violation -> SoC crashdump (0103 boot: modem ran to
++                                                   * cal_report/FW_READY, then the whole phone crashdumped). */
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define VMID_WLAN           0x18
+@@ -2254,6 +2261,7 @@
+ static uint32_t w_node, w_port, w_board = 0xFF, w_bdf_seg;
+ static uint16_t w_txn = 1;
+ static bool w_msa_ind, w_cap_done, w_bdf_started, w_fw_ready, w_mission;
++static bool w_msa_assigned_all;
+ static int w_bdf_fi = -1;
+ static uint32_t w_bdf_len, w_bdf_off;
+ static const char *w_step = "not started";
+@@ -2477,6 +2485,22 @@
+ 		}
+ 		(void)scm_assign(addr, size, vm, sec ? 2 : 3);
+ 	}
++	/*
++	 * 0104: the firmware reports regions only up to 1 MiB, but writes board/cal data into the whole
++	 * reserved pil_wlan_fw_region (1.5 MiB). Hyp-assign the top part the firmware did not report once,
++	 * to {MSS_MSA, WLAN, WLAN_CE}, so its write there does not trip the XPU. Harmless if it overlaps.
++	 */
++	if (!w_msa_assigned_all) {
++		static const uint32_t vm_all[3] = { VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE };
++		uint64_t top = (uint64_t)WLFW_MSA_BASE + 0x100000u;         /* above the 1 MiB the FW reports */
++		uint64_t end = (uint64_t)WLFW_MSA_BASE + WLFW_MSA_SIZE;     /* 1.5 MiB */
++
++		if (end > top) {
++			uint64_t r = scm_assign(top, (uint32_t)(end - top), vm_all, 3);
++			LOG(" MSA tail %llx + %x assigned (%llx)", top, (unsigned)(end - top), r);
++		}
++		w_msa_assigned_all = true;
++	}
+ }
+ 
+ static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;

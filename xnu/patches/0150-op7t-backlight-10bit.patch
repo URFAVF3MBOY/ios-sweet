@@ -1,0 +1,79 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 03:40:00 -0400
+Subject: [PATCH] op7t-0150: brightness: the panel's DBV is 10 bits
+
+0149 on the phone (2026-10-26): every level arrives ("done", ack-err 0),
+CoreBrightness drives it from boot and the screen follows the slider, but
+dark to light up to the slider's middle, dark again just past it, light
+to the top: DBV 1024..2047 (bit 10) is taken as DBV - 1024 (topaz's 11
+bits are not this panel's). DBV_MAX 0x3ff; iOS's 0..1024 maps onto
+1..1023; kern.sweetbl takes 1..1023.
+
+Apply after 0149.
+---
+diff --git a/bsd/dev/sweet_bl.c b/bsd/dev/sweet_bl.c
+index 20372c5..cc4bc15 100644
+--- a/bsd/dev/sweet_bl.c
++++ b/bsd/dev/sweet_bl.c
+@@ -1,6 +1,6 @@
+ /*
+  * 0147: panel brightness from a root shell (iokit/Kernel/arm/SweetBacklight.cpp does the work).
+- *   sysctl kern.sweetbl=N         DBV N (1..2047) to the panel at once (DCS 0x51 over DSI0);
++ *   sysctl kern.sweetbl=N         DBV N (1..1023, 0150) to the panel at once (DCS 0x51 over DSI0);
+  *                                 reading gives the last value sent (0: none yet)
+  *   sysctl kern.sweetbl_nits=N    full scale for iOS's IOMFBBrightnessLevel (nits, default 600)
+  *   sysctl kern.sweetbl_svc=1     publish AppleARMBacklight for CoreBrightness (then restart
+@@ -29,7 +29,7 @@ sysctl_sweetbl SYSCTL_HANDLER_ARGS
+ 	if (error != 0 || !changed) {
+ 		return error;
+ 	}
+-	if (value < 1 || value > 0x7ff) {
++	if (value < 1 || value > 0x3ff) {       /* 0150: 10 bits */
+ 		return EINVAL;
+ 	}
+ 	error = sweet_backlight_set((uint32_t)value);
+@@ -38,7 +38,7 @@ sysctl_sweetbl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetbl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbl, "I",
+-    "panel brightness, DSI DCS 0x51 DBV 1..2047 (0147)");
++    "panel brightness, DSI DCS 0x51 DBV 1..1023 (0147, 0150)");
+ 
+ static int
+ sysctl_sweetbl_nits SYSCTL_HANDLER_ARGS
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+index 18c2360..ac5717b 100644
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -3,7 +3,7 @@
+  * 0113 was a corrupt patch file, so neither was ever in a kernel).
+  *
+  * The panel (dsi_samsung_sofef03f_m_fhd_dsc_cmd) takes the MIPI DCS "set_display_brightness"
+- * (0x51) with an 11-bit DBV value (1..0x7ff, MSB first), sent as a long DCS write through DSI0's
++ * (0x51) with a 10-bit DBV value (1..0x3ff, 0150; MSB first), sent as a long DCS write through DSI0's
+  * command-DMA path: a packet in a contiguous buffer below 4 GiB, DMA_BASE/DMA_LEN, software
+  * trigger, wait for CMD_DMA_DONE. Ported from topaz's working 0104-topaz-dsi-brightness
+  * (MakrSas/topaz-woa TopazGpuW disp.c); on SM8150 DSI0 is at 0x0AE94000. The panel is in
+@@ -57,7 +57,12 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ #define R_TPG_CTRL      0x15cu
+ #define R_INT_CTRL      0x110u   /* bit0 CMD_DMA_DONE */
+ 
+-#define DBV_MAX         0x7ffu
++/*
++ * 0150: the panel takes 10 bits, not 11. With 0149 (2026-10-26) every level arrived, but the
++ * slider went dark to light up to its middle, dark again just past it, and light to the top:
++ * DBV 1024..2047 (bit 10 set) is taken as DBV - 1024. So 1..0x3ff, and iOS's 0..1024 onto that.
++ */
++#define DBV_MAX         0x3ffu
+ 
+ /*
+  * 0149: where the command packet goes. 0148's two-page buffer below 4 GiB failed outright (phys 0:
+@@ -214,7 +219,7 @@ sweet_backlight_nits_set(uint32_t nits)
+ 	return 0;
+ }
+ 
+-/* a fraction num/den of full brightness onto DBV 1..0x7ff */
++/* a fraction num/den of full brightness onto DBV 1..DBV_MAX */
+ static uint32_t
+ sweet_bl_dbv(uint64_t num, uint64_t den)
+ {

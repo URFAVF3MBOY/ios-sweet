@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd job that takes the com.apple.BlueTool Mach service in place of Apple's BlueTool (tools/bluetool_stub.py).
+     Use for one boot: launchctl bootout system/com.apple.BlueTool; launchctl bootstrap system /var/jb/usr/libexec/bluetool-stub.plist -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.apple.BlueTool</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/usr/bin/python3</string>
+		<string>/var/jb/usr/libexec/bluetool_stub.py</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.BlueTool</key>
+		<true/>
+	</dict>
+	<key>UserName</key>
+	<string>mobile</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/bluetool_stub.log</string>
+	<key>EnableTransactions</key>
+	<false/>
+</dict>
+</plist>

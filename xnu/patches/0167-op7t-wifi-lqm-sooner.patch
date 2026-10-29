@@ -1,0 +1,50 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 02:50:00 -0500
+Subject: [PATCH] op7t-0167: Wi-Fi: link quality at once on link-up, then every 2 s
+
+0166 works (2026-11-10): wifid logs "Rssi: -63 ... Snr: 32" from event 39
+and the status bar shows bars. The user wants them sooner. Now: the first
+event is posted at link-up itself, the next 1 s later, then every 2 s
+(was 1 s after link-up, then 5 s). wifid's handler only drops events
+under 1 s apart. Per-core RSSI is filled too (both cores = RSSI): wifid
+logged "perCoreRssiHistory is Empty!" every event.
+
+Apply after 0166.
+---
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index ccd5230..6a054d1 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -651,7 +651,7 @@ post(uint32_t code, const void *data, uint32_t length)
+  * are not measured here: 54 (Mbit/s) stands for them. wifid drops events that come "too frequent";
+  * Apple's drivers send them every few seconds.
+  */
+-#define LQM_PERIOD_MS           5000u
++#define LQM_PERIOD_MS           2000u     /* 0167: was 5000; wifid ignores only those under 1 s apart */
+ 
+ struct apple80211_weight_avg_lqm {
+ 	int32_t rssi, snr, tx_rate, rx_rate;
+@@ -711,6 +711,8 @@ lqm_post(void)
+ 		if (full != NULL) {             /* 0166 */
+ 			full->rssi_valid = 1;
+ 			full->rssi = lqm.rssi;
++			full->per_core_valid = 1;       /* 0167: wifid logged "perCoreRssiHistory is Empty!" */
++			full->per_core[0] = full->per_core[1] = (int8_t)lqm.rssi;
+ 			full->snr_valid = 1;
+ 			full->snr = (int16_t)lqm.snr;
+ 			full->noise_valid = 1;
+@@ -758,8 +760,12 @@ lqm_run(bool on)
+ 	lqm_running = on;
+ 	lck_mtx_unlock(&apple80211_lock);
+ 	if (on) {
+-		/* (the first a second after the link: wifid sets up its link-quality state on link-up first) */
+-		thread_call_enter_delayed(lqm_call, mach_absolute_time() + lqm_period_abs() / 5);
++		/*
++		 * 0167: the first at once (the bars came a second or more after the link), the next 1 s later in
++		 * case wifid was still setting up its link-quality state for the new link, then every period.
++		 */
++		thread_call_enter_delayed(lqm_call, mach_absolute_time() + lqm_period_abs() / 2);
++		lqm_post();
+ 	} else {
+ 		thread_call_cancel(lqm_call);
+ 	}

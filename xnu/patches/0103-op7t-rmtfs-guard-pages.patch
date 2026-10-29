@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -1968,6 +1968,7 @@
+ 
+ /* rmtfs */
+ #define RMTFS_BUF_SIZE      0x200000            /* 7T DT qcom,rmtfs_sharedmem size */
++#define RMTFS_GUARD         0x1000              /* msm_sharedmem SZ_4K each side (qcom,guard-memory) */
+ #define VMID_HLOS           3
+ #define VMID_MSS_MSA        15
+ #define VMID_NAV            0x2B
+@@ -2166,10 +2167,24 @@
+ 	}
+ 	case 4: {                                   /* ALLOC_BUFF */
+ 		if (rmtfs_pa == 0) {
+-			rmtfs_va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE, &rmtfs_pa);   /* the modem owns it from now on */
++			/*
++			 * 0103: guard pages, as the downstream msm_sharedmem driver does for the 7T's
++			 * qcom,rmtfs_sharedmem node ("qcom,guard-memory"): allocate 8 KiB more, give the
++			 * modem only the middle, so the assigned buffer is not contiguous with other
++			 * allocations. Its comment: "needed to overcome the XPU limitation on few MSM HW".
++			 * Without it the buffer sat flush against pool memory the modem does not own, and
++			 * the first read that let the modem touch the buffer (real data, zeros, or untouched
++			 * with readnowrite) crashed the whole SoC; refusing the read (no modem access) did not.
++			 */
++			uint64_t base_pa = 0;
++			uint8_t *base_va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE + 2 * RMTFS_GUARD, &base_pa);
++			rmtfs_va = base_va != NULL ? base_va + RMTFS_GUARD : NULL;
++			rmtfs_pa = base_va != NULL ? base_pa + RMTFS_GUARD : 0;
+ 			if (rmtfs_va == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
++				LOG("t=%u ms: rmtfs: buffer %llx + %x with %x guard each side", g_ms, rmtfs_pa,
++				    (unsigned)RMTFS_BUF_SIZE, (unsigned)RMTFS_GUARD);
+ 				/*
+ 				 * HLOS + modem only. The downstream msm_sharedmem driver adds VMID_NAV only when
+ 				 * the rmtfs node has "qcom,vm-nav-path"; the 7T's qcom,rmtfs_sharedmem node does

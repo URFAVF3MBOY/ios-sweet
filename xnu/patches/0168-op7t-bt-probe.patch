@@ -1,0 +1,187 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 03:30:00 -0500
+Subject: [PATCH] op7t-0168: Bluetooth, step 1: look at the UART before driving it
+
+The 7T's Bluetooth is the WCN3990's BT on qcom,qup_uart@0xc8c000 (QUP
+wrapper 2, serial engine 3, Android qupv3_se13; gpio43 CTS, 44 RTS,
+45 TX, 46 RX). Its three supplies are the Wi-Fi rails soc_power_up
+already turns on. Before writing a UART driver for it, this logs what
+is there: `sysctl kern.sweetbt=1` (root, once) votes on the SE3 core
+clock (Linux gcc-sm8150: vote 0x52014 bit 7, branch 0x1e4d4, RCG 0x1e4d8)
+and logs that RCG with its DFS table next to SE0's (the touchscreen's,
+known good), the serial engine's firmware revision (protocol 2 = UART),
+status and clock registers, and gpio43..46. Nothing else is written.
+Log lines "sweet_bt: ...". Reading kern.sweetbt: 1 done, -1 clock did
+not start, -2 no mapping, 0 not run.
+Stub-compiled with clang -Wall -Wextra.
+
+Apply after 0167.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_vsync.c			standard
+ bsd/dev/sweet_bl.c			standard
+ bsd/dev/sweet_adsp.c			standard
++bsd/dev/sweet_bt.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,152 @@
++/*
++ * OnePlus 7T Bluetooth, step 1: look at the hardware before driving it (0168).
++ *
++ * The 7T's Bluetooth is the BT side of the WCN3990 (live FDT bt_wcn3990), on the high-speed UART
++ * qcom,qup_uart@0xc8c000: QUP wrapper 2, serial engine 3 (Android's qupv3_se13), pins gpio43 CTS,
++ * gpio44 RTS, gpio45 TX, gpio46 RX (function qup13). Its three supplies (pm8150 L7 1.8 V, pm8150l L2
++ * 1.304 V, pm8150l L11) are the ones SweetModem.cpp's soc_power_up already turns on for Wi-Fi.
++ * The touchscreen (sweet_touch.c) uses serial engine 0 of the same wrapper, so the wrapper's bus
++ * clocks run already.
++ *
++ * `sysctl kern.sweetbt=1` (root) does, once:
++ *   - vote on the SE3 core clock (GCC_QUPV3_WRAP2_S3_CLK; Linux gcc-sm8150: APCS vote 0x52014
++ *     bit 7, branch 0x1e4d4, its RCG 0x1e4d8) and wait for the branch to run;
++ *   - log the RCG of SE3 next to SE0's (0x1e148, known good from the touchscreen) with their DFS
++ *     tables (clk-rcg2: perf level i at RCG + 0x1c + 4i, M at + 0x5c + 4i, N at + 0x9c + 4i), so the
++ *     offsets are checked by comparison before anything is written there;
++ *   - if the clock runs: log the serial engine's own registers (firmware revision = protocol 2 for
++ *     UART, status, clock config, the DFS level it selects, output/clock gating control);
++ *   - log the TLMM config/io of gpio43..46 (EAST tile: reading another tile's window for them may abort).
++ * Nothing else is written. Reading kern.sweetbt gives the stage: 0 not run, 1 clock on and SE
++ * read, -1 clock did not start (SE registers not read), -2 no mapping.
++ * Everything is logged as "sweet_bt: ...".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);    /* (private to the kernel proper; declared as the other drivers do) */
++
++#define BT_GCC_PA       0x00100000u
++#define BT_GCC_LEN      0x00060000u
++#define BT_SE_PA        0x00c8c000u
++#define BT_SE_LEN       0x00004000u
++#define BT_TLMM_PA      0x03500000u     /* TLMM EAST tile: gpio43..46 are EAST (Linux pinctrl-sm8150; mainline dtsi east 0x03500000) */
++#define BT_TLMM_LEN     0x00080000u
++
++#define GCC_VOTE_WRAP2  0x52014u        /* S_AHB b1, M_AHB b2, S0 b4 .. S5 b9 */
++#define GCC_S3_BIT      (1u << 7)
++#define GCC_S3_CBCR     0x1e4d4u
++#define GCC_S3_RCG      0x1e4d8u
++#define GCC_S0_CBCR     0x1e144u
++#define GCC_S0_RCG      0x1e148u
++
++#define SE_GENI_OUTPUT_CTRL     0x024u
++#define SE_GENI_CGC_CTRL        0x028u
++#define SE_GENI_STATUS          0x040u
++#define SE_GENI_SER_M_CLK_CFG   0x048u
++#define SE_GENI_SER_S_CLK_CFG   0x04cu
++#define SE_GENI_FW_REVISION_RO  0x068u
++#define SE_GENI_S_FW_REVISION   0x06cu
++#define SE_GENI_CLK_SEL         0x07cu
++#define SE_GENI_DMA_MODE_EN     0x258u
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++
++static int bt_stage;
++static bool bt_ran;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++rcg_dump(vm_offset_t gcc, const char *name, uint32_t rcg)
++{
++	printf("sweet_bt: %s rcg %#x: cmd %#x cfg %#x m %#x n %#x d %#x dfsr %#x\n", name, rcg, rd(gcc, rcg),
++	    rd(gcc, rcg + 4), rd(gcc, rcg + 8), rd(gcc, rcg + 0xc), rd(gcc, rcg + 0x10), rd(gcc, rcg + 0x14));
++	for (unsigned i = 0; i < 8; i++) {
++		printf("sweet_bt: %s dfs %u: perf %#x m %#x n %#x\n", name, i, rd(gcc, rcg + 0x1c + 4 * i),
++		    rd(gcc, rcg + 0x5c + 4 * i), rd(gcc, rcg + 0x9c + 4 * i));
++	}
++}
++
++static int
++sweet_bt_probe(void)
++{
++	vm_offset_t gcc = ml_io_map(BT_GCC_PA, BT_GCC_LEN);
++	vm_offset_t tlmm = ml_io_map(BT_TLMM_PA, BT_TLMM_LEN);
++	uint32_t vote, cbcr = 0;
++	bool on = false;
++
++	if (gcc == 0 || tlmm == 0) {
++		printf("sweet_bt: no mapping\n");
++		return -2;
++	}
++	for (unsigned pin = 43; pin <= 46; pin++) {
++		printf("sweet_bt: gpio%u cfg %#x io %#x\n", pin, rd(tlmm, pin * 0x1000u), rd(tlmm, pin * 0x1000u + 4));
++	}
++	vote = rd(gcc, GCC_VOTE_WRAP2);
++	printf("sweet_bt: wrap2 vote %#x (s3 %s), s0 cbcr %#x, s3 cbcr %#x\n", vote, vote & GCC_S3_BIT ? "on" : "off",
++	    rd(gcc, GCC_S0_CBCR), rd(gcc, GCC_S3_CBCR));
++	rcg_dump(gcc, "s0", GCC_S0_RCG);
++	rcg_dump(gcc, "s3", GCC_S3_RCG);
++
++	*(volatile uint32_t *)(gcc + GCC_VOTE_WRAP2) = vote | GCC_S3_BIT;
++	for (unsigned i = 0; i < 200 && !on; i++) {
++		cbcr = rd(gcc, GCC_S3_CBCR);
++		on = (cbcr & (1u << 31)) == 0;
++		if (!on) {
++			delay(50);
++		}
++	}
++	printf("sweet_bt: voted s3: vote %#x, s3 cbcr %#x -> %s\n", rd(gcc, GCC_VOTE_WRAP2), cbcr, on ? "running" : "STILL OFF");
++	if (!on) {
++		return -1;
++	}
++
++	vm_offset_t se = ml_io_map(BT_SE_PA, BT_SE_LEN);
++	if (se == 0) {
++		printf("sweet_bt: no SE mapping\n");
++		return -2;
++	}
++	uint32_t fw = rd(se, SE_GENI_FW_REVISION_RO);
++	printf("sweet_bt: se fw rev %#x (protocol %u%s, version %u), s fw %#x\n", fw, (fw >> 8) & 0xff,
++	    ((fw >> 8) & 0xff) == 2 ? " = UART" : "", fw & 0xff, rd(se, SE_GENI_S_FW_REVISION));
++	printf("sweet_bt: se status %#x out %#x cgc %#x m_clk %#x s_clk %#x clk_sel %#x dma %#x hw %#x/%#x\n",
++	    rd(se, SE_GENI_STATUS), rd(se, SE_GENI_OUTPUT_CTRL), rd(se, SE_GENI_CGC_CTRL), rd(se, SE_GENI_SER_M_CLK_CFG),
++	    rd(se, SE_GENI_SER_S_CLK_CFG), rd(se, SE_GENI_CLK_SEL), rd(se, SE_GENI_DMA_MODE_EN), rd(se, SE_HW_PARAM_0),
++	    rd(se, SE_HW_PARAM_1));
++	return 1;
++}
++
++static int
++sysctl_sweetbt SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = bt_stage, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != 1) {
++		return EINVAL;
++	}
++	if (bt_ran) {
++		return EALREADY;
++	}
++	bt_ran = true;
++	bt_stage = sweet_bt_probe();
++	printf("sweet_bt: sysctl kern.sweetbt=1 -> %d\n", bt_stage);
++	return bt_stage < 0 ? EIO : 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetbt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbt, "I",
++    "1: look at the Bluetooth UART (0168); reads how far it got");

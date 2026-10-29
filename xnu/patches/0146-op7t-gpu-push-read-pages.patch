@@ -1,0 +1,109 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 00:40:00 -0400
+Subject: [PATCH] op7t-0146: RedwoodGPU: push the pages a program read, too
+
+0145 pushed only the pages of a mapped buffer written since the last
+submission. The old whole-buffer dc civac had also thrown away the lines
+of pages the processor only read before the GPU drew into them again; with
+0145 those stayed, and reading such a page back gave the previous frame's
+lines. On the phone (2026-10-26): a dark diagonal wedge over the home
+screen for seconds, icons missing now and then; none with sweetgpudirty=0.
+Now a page with MODIFIED or REFERENCED is pushed and both bits are
+cleared (FF_WIRED): the access flag goes off every mapping, so the next
+read faults and marks the page again, and nothing is loaded into the cache
+through the program's mapping meanwhile. The kernel's own (wired) mapping
+loses the flag too, so the push goes through the physical aperture
+(pmap_find_pa + phystokv), which has no pv entry and does not re-mark it.
+Measured before it: 0145 ~60.9 fps median, sweetgpudirty=0 57.8.
+Log line now "... pages of mapped buffers: N touched since and pushed".
+Syntax-checked with g++ -Wall -Wextra on stubs.
+
+Apply after 0145.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 00e2ab0..95880a7 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -65,10 +65,15 @@ unsigned int pmap_get_refmod(ppnum_t pn);
+ void pmap_clear_refmod_options(ppnum_t pn, unsigned int mask, unsigned int options, void * arg);
+ boolean_t pmap_valid_page(ppnum_t pn);
+ ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++uint64_t pmap_find_pa(pmap_t pmap, addr64_t va);        /* 0146: pmap_paddr_t */
++uint64_t phystokv(uint64_t pa);                         /* 0146: vm_map_address_t, the physical aperture */
+ }
+ #ifndef VM_MEM_MODIFIED
+ #define VM_MEM_MODIFIED 0x01
+ #endif
++#ifndef VM_MEM_REFERENCED
++#define VM_MEM_REFERENCED 0x02
++#endif
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -253,7 +258,7 @@ static struct {
+ 	uint32_t submissions, commands, buffers, surfaces, waits, over;
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+-	uint32_t written_pages, unwritten_pages;        /* 0145: pages of mapped buffers pushed / left alone */
++	uint32_t written_pages, unwritten_pages;        /* 0145: pages of mapped buffers pushed / left alone (0146: touched / not) */
+ } gGPUStat;
+ 
+ /*
+@@ -541,7 +546,21 @@ struct gpu_buffer {
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+ };
+ 
+-/* 0145: the pages of a mapped buffer of its own written since the last push, out of the cache (gGPUDirty) */
++/*
++ * 0145: the pages of a mapped buffer of its own written since the last push, out of the cache
++ * (gGPUDirty). 0146: and the pages only READ since. 0145 left those alone, but the old push
++ * (dc civac of the whole buffer at every submission) had also been what threw away the lines a
++ * processor read of a page the GPU then draws into again: a picture read back, or Mesa's own
++ * look at a buffer, which then reads the previous frame's lines. On the phone with 0145
++ * (2026-10-26): a dark diagonal wedge over the home screen for seconds, icons gone now and then
++ * (none with sweetgpudirty=0, the old whole-buffer push, in the user's use).
++ * So a page with either bit is pushed and both are cleared: clearing
++ * REFERENCED takes the access flag off every mapping of the page, so the next read faults and
++ * sets it again (arm_fast_fault) -- and, the flag being off, nothing can be loaded into the
++ * cache through the program's mapping meanwhile. The kernel's own mapping of the buffer loses
++ * the flag as well (it is wired: PMAP_OPTIONS_FF_WIRED), so the push goes through the physical
++ * aperture instead, which is no mapping of the page's (no pv entry) and does not mark it again.
++ */
+ static uint64_t
+ pushWritten(struct gpu_buffer * b)
+ {
+@@ -549,16 +568,20 @@ pushWritten(struct gpu_buffer * b)
+ 
+ 	for (uint64_t offset = 0; offset < b->size; offset += PAGE_SIZE) {
+ 		uint64_t length = b->size - offset < PAGE_SIZE ? b->size - offset : PAGE_SIZE;
+-		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)(b->kernel + offset));
++		addr64_t va = (addr64_t)(uintptr_t)(b->kernel + offset);
++		ppnum_t pn = pmap_find_phys(kernel_pmap, va);
++		uint64_t pa = pmap_find_pa(kernel_pmap, va);
++		void * line = b->kernel + offset;
+ 
+-		if (pn != 0 && pmap_valid_page(pn)) {
+-			if (!(pmap_get_refmod(pn) & VM_MEM_MODIFIED)) {
++		if (pn != 0 && pa != 0 && pmap_valid_page(pn)) {
++			if (!(pmap_get_refmod(pn) & (VM_MEM_MODIFIED | VM_MEM_REFERENCED))) {
+ 				gGPUStat.unwritten_pages++;
+ 				continue;
+ 			}
+-			pmap_clear_refmod_options(pn, VM_MEM_MODIFIED, PMAP_OPTIONS_FF_WIRED, NULL);
++			pmap_clear_refmod_options(pn, VM_MEM_MODIFIED | VM_MEM_REFERENCED, PMAP_OPTIONS_FF_WIRED, NULL);
++			line = (void *)(uintptr_t)phystokv(pa);
+ 		}
+-		redwood_gpu_to_memory(b->kernel + offset, length);
++		redwood_gpu_to_memory(line, length);
+ 		gGPUStat.written_pages++;
+ 		pushed += length;
+ 	}
+@@ -1306,7 +1329,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			    largest >> 20, holes, most, lost >> 10, refused);
+ 		}
+ 		if (gGPUDirty) {                                /* 0145 */
+-			IOLog("RedwoodGPU: pages of mapped buffers: %u written since and pushed, %u left alone\n",
++			IOLog("RedwoodGPU: pages of mapped buffers: %u touched since and pushed, %u left alone\n",
+ 			    gGPUStat.written_pages, gGPUStat.unwritten_pages);
+ 		}
+ 		for (uint32_t i = 0; i < GPU_PUSH_TOP; i++) {   /* 0144 */

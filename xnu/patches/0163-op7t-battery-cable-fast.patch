@@ -1,0 +1,78 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 9 Nov 2026 21:00:00 -0500
+Subject: [PATCH] op7t-0163: battery: the charger cable seen within a second
+
+Plugging or unplugging the charger took about a minute to show on the
+phone (2026-11-09): 0153 polls the PM8150B every 30 s, and iOS adds its
+own delay on top. Now, with the fuel gauge in use, the timer ticks every
+second and reads only USBIN_PLUGIN (0x1310 bit 4, one SPMI read); when it
+differs from what was last published, the full update (SOC, charger
+state, IOPMPowerSource updateStatus) runs at once. The full update still
+runs every 30 s otherwise. The PM6150 path (sweetbattery=1) is unchanged.
+
+Apply after 0161.
+---
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 210ddde..02d25ff 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -31,6 +31,8 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal, fGauge;
+ 	int fLastMode, fLastGauge;
++	int fLastUsb;           /* 0163: USBIN_PLUGIN as last published (-1: not yet) */
++	unsigned fTicks;        /* 0163: one-second ticks since the last full update */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -57,6 +59,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = fGauge = false;
+ 	fLastGauge = -1;
++	fLastUsb = -1;
++	fTicks = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -224,6 +228,7 @@ SweetBattery::pollGauge(void)
+ 	unsigned percent = raw == 0xff ? 100 : raw == 0 ? 0 :
+ 	    ((raw - 1u) * 98u + 126u) / 253u + 1u;
+ 	bool external = !sweet_spmi_read(2, 0x1310, &usb) && (usb & 0x10u);
++	fLastUsb = external ? 1 : 0;            /* 0163 */
+ 	(void)sweet_spmi_read(2, 0x1006, &charger);
+ 	bool full = external && (percent >= 100 || (charger & 7u) == 5);
+ 	bool charging = external && !full;
+@@ -290,8 +295,22 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+-		sender->setTimeoutMS(30000);
++		/*
++		 * 0163: with the fuel gauge, the cable is looked at every second (one SPMI read of
++		 * USBIN_PLUGIN) and everything is published at once when it changes; the full update
++		 * (SOC, charger state) stays every 30 s. With 30 s alone, plugging or unplugging showed
++		 * up to half a minute late, about a minute with iOS's own delay on top (2026-11-09).
++		 */
++		bool due = !self->fGauge || ++self->fTicks >= 30;
++		if (!due) {
++			uint8_t usb;
++			due = sweet_spmi_read(2, 0x1310, &usb) == 0 && ((usb & 0x10u) ? 1 : 0) != self->fLastUsb;
++		}
++		if (due) {
++			self->fTicks = 0;
++			self->poll();
++		}
++		sender->setTimeoutMS(self->fGauge ? 1000 : 30000);
+ 	}
+ }
+ 
+@@ -316,7 +335,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fGauge ? 1000 : 30000);     /* 0163 */
+ 		} else {
+ 			fReal = fGauge = false;
+ 			poll();

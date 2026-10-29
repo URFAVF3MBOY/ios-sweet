@@ -1,0 +1,122 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 09:00:00 -0500
+Subject: [PATCH] op7t-0174: Sandbox stand-in: issue and consume extensions
+
+Settings > iPhone Storage hung (2026-11-11) waiting for the Photos storage
+plugin, whose assetsd exits at every start: tccd "Failed to issue Sandbox
+Extension for kTCCServicePhotos" (kTCCErrorDomain 6), then assetsd and
+momentsd "openPhotoLibraryDatabase failed" (com.apple.photos.error 41017,
+41002) and "launch failed". The sandbox stand-in (0050) answers op 5
+(extension issue) and op 6 (consume) with ENOENT.
+
+Now op 5 writes a token "sweet;<type>;<class>;<path>" into the caller's
+2048-byte buffer and op 6 returns an increasing handle: nothing is
+sandboxed, so an extension grants nothing, but callers carry on. The
+argument layouts are libsystem_sandbox's (iOS 16.5): op 5 { class, type,
+path, flags, token buffer, pid, extra }, op 6 { token, length, handle
+out }. The first 20 issues are logged ("HOTDOGB Sandbox: X issues
+extension ..."). Container lookups (4, 0x43) stay ENOENT.
+
+Apply after 0173.
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 28ff294..dda4e38 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -37,6 +37,7 @@
+ #include <security/mac_policy.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
++#include <libkern/OSAtomic.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -287,6 +288,74 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * 0174: sandbox extensions. tccd issues one for every TCC grant it hands out
++ * (sandbox_extension_issue_generic("com.apple.tcc.kTCCServicePhotos", ..)) and the
++ * receiver consumes it. With op 5 failing (ENOENT) tccd says "Failed to issue
++ * Sandbox Extension for kTCCServicePhotos", assetsd and momentsd cannot open the
++ * Photos library (com.apple.photos.error 41017 / 41002), assetsd exits, and
++ * Settings' iPhone Storage (its Photos plugin) waits for it (2026-11-11).
++ * Nothing is sandboxed here, so an extension grants nothing: a token is issued
++ * and consumed so that callers carry on.
++ * Layout, from libsystem_sandbox of iOS 16.5 (sandbox_extension_issue_* ->
++ * helper -> __mac_syscall("Sandbox", 5, args); consume -> op 6):
++ *   op 5: { char *class; u64 type (0 file, 3 generic, ..); char *path; u64 flags;
++ *           char *token (2048 bytes, the library's); i64 pid; u64 extra }
++ *   op 6: { char *token; u64 length incl. NUL; i64 *handle out }
++ */
++#define SWEET_SANDBOX_TOKEN_MAX	2048
++
++static int
++sweet_sandbox_extension_issue(struct proc *p, user_addr_t arg)
++{
++	struct {
++		uint64_t class_name, type, path, flags, token, pid, extra;
++	} a;
++	char class_name[128] = "", path[256] = "", token[sizeof(class_name) + sizeof(path) + 64];
++	size_t done = 0;
++	int error, len;
++	static unsigned said;
++
++	if ((error = copyin(arg, &a, sizeof(a))) != 0) {
++		return error;
++	}
++	if (a.class_name != 0) {
++		(void)copyinstr((user_addr_t)a.class_name, class_name, sizeof(class_name), &done);
++	}
++	if (a.path != 0 && (a.type == 0 || a.type == 1 || a.type == 2)) {
++		(void)copyinstr((user_addr_t)a.path, path, sizeof(path), &done);
++	}
++	len = snprintf(token, sizeof(token), "sweet;%llx;%s;%s", a.type, class_name, path);
++	if (len < 0 || (size_t)len + 1 > sizeof(token)) {
++		len = (int)sizeof(token) - 1;
++	}
++	if (said < 20) {
++		char name[32];
++
++		said++;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("HOTDOGB Sandbox: %s issues extension \"%s\" (type %llu)\n", name, class_name, a.type);
++	}
++	return a.token == 0 ? EINVAL : copyout(token, (user_addr_t)a.token, (size_t)len + 1);
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	static int64_t next_handle;
++	struct {
++		uint64_t token, length, handle;
++	} a;
++	int64_t handle;
++	int error;
++
++	if ((error = copyin(arg, &a, sizeof(a))) != 0) {
++		return error;
++	}
++	handle = OSIncrementAtomic64(&next_handle) + 1;
++	return a.handle == 0 ? 0 : copyout(&handle, (user_addr_t)a.handle, sizeof(handle));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+@@ -297,9 +366,11 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("HOTDOGB Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
++	case 5:         /* extension issue (0174) */
++		return sweet_sandbox_extension_issue(p, arg);
++	case 6:         /* extension consume (0174) */
++		return sweet_sandbox_extension_consume(arg);
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

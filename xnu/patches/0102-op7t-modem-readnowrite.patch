@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2005,8 +2005,13 @@
+  * LUN 0 block 0x12d08) sector 0, 1 x 512 bytes -> phys b8003000; served (0099) the phone died.
+  *   sweetmodem_readmax=N  serve only the first N read requests, refuse the rest (0 = no limit);
+  *   sweetmodem_readzero=1 serve reads with zeros, no UFS read (keeps the modem going without LUN 0).
++ * 0102. readzero=1 still crashdumped the phone, so it is not the UFS read. Left: (a) our CPU write into
++ * the hyp-assigned buffer faults, or (b) the modem, once a read succeeds, goes on and touches
++ * something unpowered.
++ *   sweetmodem_readnowrite=1 answer reads with success WITHOUT touching the buffer at all (no UFS
++ *   read, no bzero, no memcpy, no reading it back for the log). Survives -> (a); dies -> (b).
+  */
+-static uint32_t rmtfs_readmax, rmtfs_readzero, rmtfs_served;
++static uint32_t rmtfs_readmax, rmtfs_readzero, rmtfs_readnowrite, rmtfs_served;
+ static uint64_t rmtfs_pa;
+ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+@@ -2127,6 +2132,15 @@
+ 				rmtfs_writes++;                 /* never written to the phone's EFS */
+ 			} else {
+ 				uint8_t *to = rmtfs_va + (e[1] - rmtfs_pa);
++				if (rmtfs_readnowrite) {
++					/* 0102: success, buffer untouched (not even read for the log) */
++					rmtfs_reads++;
++					if (rmtfs_served < 6) {
++						LOG("t=%u ms: rmtfs: answered %s sector %x x%u without touching the buffer",
++						    g_ms, rmtfs_parts[caller - 1].part, e[0], e[2]);
++					}
++					continue;
++				}
+ 				if (rmtfs_readzero) {
+ 					bzero(to, (size_t)bytes);
+ 				} else {
+@@ -5755,9 +5769,11 @@
+ 	}
+ 	(void)PE_parse_boot_argn("sweetmodem_readmax", &rmtfs_readmax, sizeof(rmtfs_readmax));
+ 	(void)PE_parse_boot_argn("sweetmodem_readzero", &rmtfs_readzero, sizeof(rmtfs_readzero));
+-	if (!rmtfs_reads_on || !rmtfs_nvbk_on || rmtfs_readmax || rmtfs_readzero) {
+-		LOG("bisect: rmtfs reads %s, /oem/nvbk %s, readmax %u, readzero %u", rmtfs_reads_on ? "on" : "OFF",
+-		    rmtfs_nvbk_on ? "on" : "OFF", rmtfs_readmax, rmtfs_readzero);
++	(void)PE_parse_boot_argn("sweetmodem_readnowrite", &rmtfs_readnowrite, sizeof(rmtfs_readnowrite));
++	if (!rmtfs_reads_on || !rmtfs_nvbk_on || rmtfs_readmax || rmtfs_readzero || rmtfs_readnowrite) {
++		LOG("bisect: rmtfs reads %s, /oem/nvbk %s, readmax %u, readzero %u, readnowrite %u",
++		    rmtfs_reads_on ? "on" : "OFF", rmtfs_nvbk_on ? "on" : "OFF", rmtfs_readmax, rmtfs_readzero,
++		    rmtfs_readnowrite);
+ 	}
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

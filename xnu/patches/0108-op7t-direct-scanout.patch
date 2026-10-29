@@ -1,0 +1,394 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 699be48..e7dd010 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_modem_init(void);        /* iokit/Kernel/arm/SweetModem.cpp (0096, boot-arg sweetmodem=1) */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -119,6 +120,30 @@ public:
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
++	/*
++	 * 0108 direct scanout (boot-arg sweetscan=1|2). ABL leaves the 7T's command-mode panel
++	 * (sofef03f, DSC) fed by two source pipes from the splash buffer 0x9C000000, stride 4320:
++	 * VIG0 the left 540 columns, VIG1 the right 540 (its SRC_XY x = 540), through CTL0, which
++	 * refreshes on its own. The shim's flip test (sweetmdpflip, 2026-10-24) showed that writing
++	 * both pipes' SRC0_ADDR and then CTL0 FLUSH = VIG0|VIG1|CTL (0x20003) switches the whole
++	 * screen at the next refresh, 10 times a second without a glitch; CTL_START jams it (never
++	 * written). So a swap that shows one full-screen surface from the scanout pool
++	 * (SweetSurface.cpp) is shown by pointing the pipes at it: no 10 MB copy.
++	 *   sweetscan=1: the 1125x2436 surface is cropped to the 1080x2400 panel by the address
++	 *                (rows) and SRC_XY (columns: 22 / 562);
++	 *   sweetscan=2: both by the address (base + 18 rows + 22 columns), SRC_XY as ABL set it.
++	 */
++	volatile uint32_t *fVig0, *fVig1, *fCtl0;
++	uint32_t      fScanMode;
++	uint32_t      fBootAddr, fBootStride, fBootXY0, fBootXY1;
++	SweetSurface *fScanned;       /* the surface the pipes fetch now (held), NULL: the splash buffer */
++	uint32_t      fScanFlips, fScanCopies;
++
++	void          scanSetup(void);
++	void          scanTo(uint32_t addr, uint32_t stride, uint32_t xy0, uint32_t xy1);
++	void          scanSplash(void);
++	bool          scanPresent(const uint8_t *rec);
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+@@ -232,6 +257,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	sweet_fb_threads_start();
++	scanSetup();
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -262,6 +288,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		if (fb->fScanned != NULL) {
++			fb->scanSplash();       /* 0108: the fade works on the splash buffer */
++		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -558,6 +587,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	if (scanPresent(rec)) {
++		if (sweet_fps_on) {
++			sweet_fps_copies++;         /* (counts flips now) */
++		}
++		return;
++	}
++
+ 	sweet_fb_job.layers = 0;
+ 	sweet_fb_job.height = (int32_t)fHeight;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -643,6 +679,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		held[nheld++] = s;              /* held until copied */
+ 	}
+ 	sweet_fb_copy();
++	if (fScanned != NULL) {
++		scanSplash();                   /* 0108: this swap was copied: show the splash buffer again */
++	}
+ 	if (sweet_fps_on) {
+ 		uint64_t now = mach_absolute_time();
+ 		sweet_fps_copies++;
+@@ -732,6 +771,121 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+ 
++/* ---------------------------------------------------------------- 0108 direct scanout */
++
++#define MDSS_VIG0_PA    0x0AE05000u     /* downstream DT qcom,sde-sspp-off 0x5000 (VIG0), 0x7000 (VIG1) */
++#define MDSS_VIG1_PA    0x0AE07000u
++#define MDSS_CTL0_PA    0x0AE02000u     /* qcom,sde-ctl-off 0x2000 */
++#define SSPP_SRC_XY     0x08
++#define SSPP_SRC0_ADDR  0x14
++#define SSPP_YSTRIDE0   0x24
++#define CTL_FLUSH       0x18
++#define CTL_FLUSH_VIGS  0x20003u        /* VIG0 bit 0, VIG1 bit 1, CTL bit 17 */
++
++void
++AppleCLCD::scanSetup(void)
++{
++	PE_parse_boot_argn("sweetscan", &fScanMode, sizeof(fScanMode));
++	if (fScanMode == 0) {
++		return;
++	}
++	fVig0 = (volatile uint32_t *)ml_io_map(MDSS_VIG0_PA, 0x1000);
++	fVig1 = (volatile uint32_t *)ml_io_map(MDSS_VIG1_PA, 0x1000);
++	fCtl0 = (volatile uint32_t *)ml_io_map(MDSS_CTL0_PA, 0x1000);
++	if (fVig0 == NULL || fVig1 == NULL || fCtl0 == NULL) {
++		IOLog("HOTDOGB SCAN: display registers not mapped: off\n");
++		fScanMode = 0;
++		return;
++	}
++	fBootAddr = fVig0[SSPP_SRC0_ADDR / 4];
++	fBootStride = fVig0[SSPP_YSTRIDE0 / 4];
++	fBootXY0 = fVig0[SSPP_SRC_XY / 4];
++	fBootXY1 = fVig1[SSPP_SRC_XY / 4];
++	IOLog("HOTDOGB SCAN: mode %u; ABL: VIG0 0x%x stride %u xy 0x%x size 0x%x img 0x%x, VIG1 0x%x xy 0x%x, CTL0 top 0x%x\n",
++	    fScanMode, fBootAddr, fBootStride, fBootXY0, fVig0[0], fVig0[1], fVig1[SSPP_SRC0_ADDR / 4], fBootXY1,
++	    fCtl0[0x14 / 4]);
++	if (fBootAddr != (uint32_t)fPhys || fVig1[SSPP_SRC0_ADDR / 4] != (uint32_t)fPhys || fBootXY0 != 0 ||
++	    fBootXY1 != fWidth / 2 || fBootStride != fRowBytes) {
++		IOLog("HOTDOGB SCAN: the display is not set up as on the 2026-10-24 probe (splash 0x%llx): off\n", fPhys);
++		fScanMode = 0;
++	}
++}
++
++void
++AppleCLCD::scanTo(uint32_t addr, uint32_t stride, uint32_t xy0, uint32_t xy1)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the pixels before the switch */
++	fVig0[SSPP_SRC0_ADDR / 4] = addr;
++	fVig0[SSPP_YSTRIDE0 / 4] = stride;
++	fVig0[SSPP_SRC_XY / 4] = xy0;
++	fVig1[SSPP_SRC0_ADDR / 4] = addr;
++	fVig1[SSPP_YSTRIDE0 / 4] = stride;
++	fVig1[SSPP_SRC_XY / 4] = xy1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fCtl0[CTL_FLUSH / 4] = CTL_FLUSH_VIGS;          /* taken at the next refresh; never CTL_START */
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void
++AppleCLCD::scanSplash(void)
++{
++	scanTo(fBootAddr, fBootStride, fBootXY0, fBootXY1);
++	OSSafeReleaseNULL(fScanned);
++	if (fScanCopies++ < 8 || (fScanCopies % 500) == 0) {
++		IOLog("HOTDOGB SCAN: a frame copied (%u so far), %u flipped\n", fScanCopies, fScanFlips);
++	}
++}
++
++/* One full-screen layer, from the scanout pool: point the pipes at it. False: copy as before. */
++bool
++AppleCLCD::scanPresent(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS, n = 0;
++
++	if (fScanMode == 0 || fPowerOff) {
++		return false;
++	}
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
++	uint32_t bw = get32(b, 8), bh = get32(b, 12);
++	if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
++	    !((bw == fLogicalW && bh == fLogicalH) || (bw == 0 && bh == 0))) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	uint64_t pa = sweet_surface_scan_phys(s);
++	if (pa == 0 || s->width != fLogicalW || s->height != fLogicalH || s->offset != 0 ||
++	    s->bytesPerRow < fLogicalW * 4 || (s->bytesPerRow & 63) != 0 ||
++	    pa + (uint64_t)s->bytesPerRow * s->height > 0x100000000ull) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	(void)RedwoodGPUSurfaceReady(s, 100);           /* the GPU done drawing it (at most 100 ms) */
++	uint32_t row0 = (uint32_t)(pa + (uint64_t)fOffY * s->bytesPerRow);
++	if (fScanMode == 2) {
++		scanTo(row0 + (uint32_t)fOffX * 4, s->bytesPerRow, fBootXY0, fBootXY1);
++	} else {
++		scanTo(row0, s->bytesPerRow, fBootXY0 + (uint32_t)fOffX, fBootXY1 + (uint32_t)fOffX);
++	}
++	if (fScanFlips++ < 8 || (fScanFlips % 1000) == 0) {
++		IOLog("HOTDOGB SCAN: flip %u: surface %u at 0x%llx (mode %u)\n", fScanFlips, s->id, pa, fScanMode);
++	}
++	if (fScanned != NULL) {
++		fScanned->release();            /* (the display may fetch it one more refresh: a slot is
++		                                 * only reused once its surface is freed by backboardd) */
++	}
++	fScanned = s;                           /* held while shown */
++	return true;
++}
++
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
+ IOReturn
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9defdd1..3b9c877 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -81,6 +81,74 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * OnePlus 7T, direct scanout (0108, boot-arg sweetscan=1|2): backboardd's full-screen surfaces
++ * come from a pool of contiguous RAM below 4 GiB that the kernel does not manage, so that
++ * AppleCLCD can point the display's source pipes straight at them instead of copying every frame
++ * into the splash buffer (topaz patches 0092-0103 do the same on SM6225). The display fetches
++ * 32-bit addresses only; iOS's own memory is all above 4 GiB on the 7T.
++ * Pool: 14 slots of 0xD40000 (13.25 MiB: one 1125x2436 BGRA surface, 4544 bytes a row,
++ * IOSurfaceAllocSize 13893632): 8 at 0xB1000000-0xB7A00000, 3 at 0xAD000000-0xAF7C0000, 3 at
++ * 0xB9000000-0xBB7C0000 (the low DDR bank ends at 0xBBB00000). Clear of the GPU's
++ * 0xB0000000-0xB0530000, USB's 0xB0800000, 0096's modem pool 0xB8000000-0xB9000000 and everything in
++ * the 7T DT's reserved-memory (mtp_mem ends 0xACE00000). First boot (8 slots): backboardd keeps
++ * about 9 full-screen surfaces in turn, so every 7th frame missed the pool and was copied.
++ * Mapped write-combined everywhere (as the splash surface): no cache upkeep before the display
++ * reads it. A surface that does not fit, or once the pool is full, is made as before.
++ */
++#define SWEET_SCAN_SLOT                 0x00D40000ull
++#define SWEET_SCAN_SLOTS                14
++static uint64_t
++sweet_scan_slot_pa(uint32_t i)
++{
++	if (i < 8) {
++		return 0xB1000000ull + i * SWEET_SCAN_SLOT;
++	}
++	if (i < 11) {
++		return 0xAD000000ull + (i - 8) * SWEET_SCAN_SLOT;
++	}
++	return 0xB9000000ull + (i - 11) * SWEET_SCAN_SLOT;
++}
++static uint32_t      sweet_scan_mode = ~0u;     /* boot-arg sweetscan, read once */
++static uint32_t      sweet_scan_used;           /* bit per slot, under sweet_surface_lock */
++static uint32_t      sweet_scan_logged;
++
++static bool
++sweet_scan_wanted(const SweetSurface *s, const char *proc)
++{
++	if (sweet_scan_mode == ~0u) {
++		uint32_t m = 0;
++		PE_parse_boot_argn("sweetscan", &m, sizeof(m));
++		sweet_scan_mode = m;
++	}
++	return sweet_scan_mode != 0 && strcmp(proc, "backboardd") == 0 &&
++	       s->width == 1125 && s->height == 2436 && s->pixelFormat == 'BGRA' &&
++	       s->bytesPerElement == 4 && s->planeCount == 0 && s->allocSize <= SWEET_SCAN_SLOT;
++}
++
++/* a free slot (1-based), or 0 */
++static uint32_t
++sweet_scan_take(void)
++{
++	uint32_t slot = 0;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < SWEET_SCAN_SLOTS; i++) {
++		if (!(sweet_scan_used & (1u << i))) {
++			sweet_scan_used |= 1u << i;
++			slot = i + 1;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return slot;
++}
++
++uint64_t
++sweet_surface_scan_phys(SweetSurface *s)
++{
++	return (s != NULL && s->scanSlot != 0) ? sweet_scan_slot_pa(s->scanSlot - 1) : 0;
++}
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -94,6 +162,12 @@ SweetSurface::free()
+ 		memory->complete();
+ 	}
+ 	OSSafeReleaseNULL(memory);
++	if (scanSlot != 0) {                    /* 0108: back to the scanout pool */
++		IOLockLock(sweet_surface_lock);
++		sweet_scan_used &= ~(1u << (scanSlot - 1));
++		IOLockUnlock(sweet_surface_lock);
++		scanSlot = 0;
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+@@ -731,6 +805,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		props->release();
+ 		return kIOReturnNoMemory;
+ 	}
++	char name_buf[32];
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	OSNumber *wrap = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+@@ -774,21 +849,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	} else if (ret == kIOReturnSuccess) {
+-		IOBufferMemoryDescriptor *mem = NULL;
+-		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+-		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+-		}
+-		if (mem == NULL) {
+-			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+-			ret = kIOReturnNoMemory;
++		/* 0108: a full-screen surface of backboardd's from the scanout pool, when a slot is free */
++		proc_selfname(name_buf, sizeof(name_buf));
++		uint32_t slot = sweet_scan_wanted(s, name_buf) ? sweet_scan_take() : 0;
++		if (slot != 0) {
++			s->scanSlot = slot;
++			s->memory = IOMemoryDescriptor::withPhysicalAddress(sweet_surface_scan_phys(s), s->allocSize,
++			    kIODirectionInOut);
++			s->mapCache = kIOMapWriteCombineCache;
++			uintptr_t px = s->memory != NULL ? s->kernelAddress() : 0;
++			if (px == 0) {
++				ret = kIOReturnNoMemory;
++			} else {
++				bzero((void *)px, s->allocSize);
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++			if (sweet_scan_logged++ < 16) {
++				IOLog("HOTDOGB SCAN: surface %u in scanout slot %u at 0x%llx (%u bytes) -> 0x%x\n",
++				    s->id, slot - 1, sweet_surface_scan_phys(s), s->allocSize, ret);
++			}
+ 		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
+-			s->memory = mem;
+-			s->mapCache = kIOMapDefaultCache;
+-			if (!sweet_surface_publish(s)) {
+-				ret = kIOReturnNoResources;
++			if (sweet_scan_wanted(s, name_buf) && sweet_scan_logged++ < 16) {
++				IOLog("HOTDOGB SCAN: pool full, surface made as before\n");
++			}
++			IOBufferMemoryDescriptor *mem = NULL;
++			if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
++			    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
++			if (mem == NULL) {
++				OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++				ret = kIOReturnNoMemory;
++			} else {
++				bzero(mem->getBytesNoCopy(), s->allocSize);
++				s->memory = mem;
++				s->mapCache = kIOMapDefaultCache;
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8851eee..e564347 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -44,6 +44,7 @@ public:
+ 	uint64_t                  clientAddress;
+ 	uint32_t                  gpuDrawn;     /* the GPU's last submission naming the pixels (RedwoodGPU.cpp), 0: none */
+ 	uint32_t                  gpuSynced;    /* ... the one after which the CPU's cache was last invalidated */
++	uint32_t                  scanSlot;     /* 0108: 1 + slot of the scanout pool holding the pixels, 0: none */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -74,6 +75,12 @@ uint32_t RedwoodGPUSurfaceReady(SweetSurface *surface, uint64_t milliseconds);
+ /* K2: a test's pixels onto the panel (SweetFramebuffer.cpp; RedwoodGPU's kRedwoodShow) */
+ void SweetFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
+ 
++/*
++ * 0108 direct scanout: physical address of a surface's pixels when they are in the scanout pool
++ * (contiguous, below 4 GiB: the display controller can fetch them), else 0.
++ */
++uint64_t sweet_surface_scan_phys(SweetSurface *surface);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 

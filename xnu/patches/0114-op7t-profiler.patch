@@ -1,0 +1,289 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,101 @@
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++/*
++ * sweet profiler (0114, from ios-sailfish 0111-0113/0148; bsd/dev/sweet_sample.c sets
++ * sweet_prof_pid): every
++ * interrupt taken while a thread of that process runs records its user pc
++ * (or counts a kernel-mode sample), then the callers: kernel frames tagged
++ * with their depth 1-3 in the low 2 bits, user frames (up to 32) tagged 1.
++ */
++#define SWEET_PROF_USER_FRAMES 32
++extern pmap_paddr_t mmu_uvtop(vm_offset_t va);
++extern boolean_t pmap_valid_address(pmap_paddr_t addr);
++extern vm_map_address_t phystokv(pmap_paddr_t pa);
++
++/*
++ * 16-byte user frame record {fp, lr} at va, read without faulting: AT
++ * S1E0R through the interrupted task's tables (mmu_uvtop), then the kernel's
++ * physical window, RAM only. Only called for samples taken in user mode,
++ * so no interrupted kernel code has an AT/PAR_EL1 sequence in flight.
++ */
++static inline bool
++sweet_prof_user_frame(uint64_t va, uint64_t rec[2])
++{
++	if ((va & 15) || va == 0 || va >= MACH_VM_MAX_ADDRESS) {
++		return false;
++	}
++	pmap_paddr_t pa = mmu_uvtop((vm_offset_t)va);
++	if (pa == 0 || !pmap_valid_address(pa)) {
++		return false;
++	}
++	const uint64_t *p = (const uint64_t *)phystokv(pa);
++	rec[0] = p[0];
++	rec[1] = p[1];
++	return true;
++}
++#define SWEET_PROF_MAX 262144
++int sweet_prof_pid;
++uint64_t sweet_prof_pc[SWEET_PROF_MAX];
++uint32_t sweet_prof_n, sweet_prof_kernel, sweet_prof_all;
++extern int task_pid(task_t task);
++
++static inline void
++sweet_prof_irq(arm_saved_state_t *state)
++{
++	int pid = sweet_prof_pid;
++	if (pid <= 0) {
++		return;
++	}
++	os_atomic_inc(&sweet_prof_all, relaxed);
++	if (task_pid(current_task()) != pid) {
++		return;
++	}
++	/* Kernel pcs are stored unslid (0xfffffff007...: nm of the built kernel). */
++	uint64_t pc = get_saved_state_pc(state);
++	if (!PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		os_atomic_inc(&sweet_prof_kernel, relaxed);
++		pc = VM_KERNEL_UNSLIDE(pc);
++	}
++	uint32_t i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++	if (i < SWEET_PROF_MAX) {
++		sweet_prof_pc[i] = pc;
++	}
++	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		/* user callers: frame-pointer return addresses, tag 1 */
++		uint64_t fp = get_saved_state_fp(state), rec[2];
++		for (int d = 0; d < SWEET_PROF_USER_FRAMES && sweet_prof_user_frame(fp, rec); d++) {
++			if (rec[1] == 0) {
++				break;
++			}
++			i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++			if (i < SWEET_PROF_MAX) {
++				sweet_prof_pc[i] = (rec[1] & ~3ULL) | 1;
++			}
++			if (rec[0] <= fp) {
++				break;          /* stacks grow down: callers' frames are higher */
++			}
++			fp = rec[0];
++		}
++		return;
++	}
++	/*
++	 * Kernel callers: frame-pointer return addresses, depth 1-3 in the low
++	 * 2 bits (frames inside this thread's kernel stack only).
++	 */
++	vm_offset_t lo = current_thread()->kernel_stack, hi = lo + kernel_stack_size;
++	uint64_t fp = get_saved_state_fp(state);
++	for (uint64_t d = 1; d <= 3 && fp >= lo && fp + 16 <= hi && (fp & 15) == 0; d++) {
++		i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++		if (i < SWEET_PROF_MAX) {
++			sweet_prof_pc[i] = (VM_KERNEL_UNSLIDE(((uint64_t *)fp)[1]) & ~3ULL) | d;
++		}
++		fp = ((uint64_t *)fp)[0];
++	}
++}
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1867,6 +1962,7 @@
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
++	sweet_prof_irq(state);
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -19,6 +19,9 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <sys/bsdtask_info.h>
++#include <sys/vnode.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -78,10 +81,162 @@
+ 	}
+ }
+ 
++/*
++ * Profiler (0114, from ios-sailfish 0111/0113/0148): boot-arg sweetprof=NAME (OFF by
++ * default here; sailfish defaults to backboardd).
++ * osfmk/arm64/sleh.c records the user pc of NAME at every interrupt that
++ * lands on one of its threads; every 20 s this prints the sample counts
++ * ("PROF ... samples N kernel K of all A", A = interrupts on any non-idle
++ * thread) and the 640 most frequent pcs, 8 per line ("PROF pc:count ...");
++ * entries with low bits set are callers (sleh.c sweet_prof_irq).
++ * Symbolicate with the slide from an SMP/UBT/CRASH line of the same boot.
++ * 0114: also prints which file each hot user pc lies in ("PROFREG start-end fileoff path", our
++ * GL libraries load at random addresses outside the shared cache, so without this their pcs
++ * cannot be symbolicated): a pc maps to file offset pc - start + fileoff.
++ */
++#define SWEET_PROF_MAX 262144
++extern void qsort(void *a, size_t n, size_t es, int (*cmp)(const void *, const void *));  /* bsd/kern/qsort.c */
++extern int sweet_prof_pid;
++extern uint64_t sweet_prof_pc[SWEET_PROF_MAX];
++extern uint32_t sweet_prof_n, sweet_prof_kernel, sweet_prof_all;
++static char sweet_prof_name[32];
++static int sweet_prof_found;
++
++static int
++sweet_prof_find(proc_t p, __unused void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, sweet_prof_name) == 0) {
++		sweet_prof_found = proc_pid(p);
++	}
++	return PROC_RETURNED;
++}
++
++static int
++sweet_prof_cmp(const void *a, const void *b)
++{
++	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
++	return x < y ? -1 : x > y;
++}
++
++/* 0114: the mapped file of each hot user pc (as proc_pidregionpathinfo does) */
++static void
++sweet_prof_regions(int pid, const uint64_t *pcs, int n)
++{
++	enum { NREG = 24 };
++	static uint64_t lo[NREG], hi[NREG];
++	int nreg = 0;
++	proc_t p = proc_find(pid);
++
++	if (p == PROC_NULL) {
++		return;
++	}
++	for (int i = 0; i < n && nreg < NREG; i++) {
++		uint64_t pc = pcs[i] & ~3ULL;
++		if (pc >= 0xffff000000000000ULL || pc == 0) {
++			continue;       /* kernel */
++		}
++		bool known = false;
++		for (int r = 0; r < nreg && !known; r++) {
++			known = pc >= lo[r] && pc < hi[r];
++		}
++		if (known) {
++			continue;
++		}
++		struct proc_regioninfo_internal ri;
++		uintptr_t vpaddr = 0;
++		uint32_t vid = 0;
++		bzero(&ri, sizeof(ri));
++		if (fill_procregioninfo(proc_task(p), pc, &ri, &vpaddr, &vid) == 0 ||
++		    ri.pri_address > pc || pc >= ri.pri_address + ri.pri_size) {
++			continue;
++		}
++		lo[nreg] = ri.pri_address;
++		hi[nreg] = ri.pri_address + ri.pri_size;
++		nreg++;
++		char path[160] = "(no file)";
++		vnode_t vp = (vnode_t)vpaddr;
++		if (vp != NULLVP && vnode_getwithvid(vp, vid) == 0) {
++			int len = sizeof(path);
++			if (vn_getpath(vp, path, &len) != 0) {
++				strlcpy(path, "(path?)", sizeof(path));
++			}
++			vnode_put(vp);
++		}
++		printf("PROFREG %llx-%llx %llx %s\n", ri.pri_address, ri.pri_address + ri.pri_size, ri.pri_offset, path);
++	}
++	proc_rele(p);
++}
++
++static void
++sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	static uint64_t pcs[SWEET_PROF_MAX];
++	enum { TOP = 640 };
++	static uint64_t top_pc[TOP];
++	static uint32_t top_n[TOP];
++
++	if (!PE_parse_boot_argn("sweetprof", sweet_prof_name, sizeof(sweet_prof_name)) ||
++	    sweet_prof_name[0] == '-' || sweet_prof_name[0] == '\0') {
++		return;         /* 0114: off unless asked for */
++	}
++	for (int round = 0;; round++) {
++		sweet_prof_found = 0;
++		proc_iterate(PROC_ALLPROCLIST, sweet_prof_find, NULL, NULL, NULL);
++		sweet_prof_pid = sweet_prof_found;
++		(void)tsleep(&chan, PZERO, "sweetprf", 10 * hz);
++		sweet_prof_pid = 0;
++		uint32_t n = MIN(sweet_prof_n, SWEET_PROF_MAX), k = sweet_prof_kernel, all = sweet_prof_all;
++		memcpy(pcs, sweet_prof_pc, n * sizeof(pcs[0]));
++		sweet_prof_n = sweet_prof_kernel = sweet_prof_all = 0;
++		if (sweet_prof_found == 0 || n == 0) {
++			continue;
++		}
++		qsort(pcs, n, sizeof(pcs[0]), sweet_prof_cmp);
++		int t = 0;
++		for (uint32_t i = 0; i < n;) {
++			uint32_t j = i;
++			while (j < n && pcs[j] == pcs[i]) {
++				j++;
++			}
++			uint32_t c = j - i;
++			int pos = t < TOP ? t++ : TOP;
++			while (pos > 0 && top_n[pos - 1] < c) {
++				if (pos < TOP) {
++					top_pc[pos] = top_pc[pos - 1];
++					top_n[pos] = top_n[pos - 1];
++				}
++				pos--;
++			}
++			if (pos < TOP) {
++				top_pc[pos] = pcs[i];
++				top_n[pos] = c;
++			}
++			i = j;
++		}
++		printf("PROF %s[%d] round %d samples %u kernel %u of all %u\n", sweet_prof_name,
++		    sweet_prof_found, round, n, k, all);
++		for (int i = 0; i < t; i += 8) {
++			char line[256];
++			int m = snprintf(line, sizeof(line), "PROF");
++			for (int j = i; j < i + 8 && j < t; j++) {
++				m += snprintf(line + m, sizeof(line) - m, " %llx:%u", top_pc[j], top_n[j]);
++			}
++			printf("%s\n", line);
++		}
++		sweet_prof_regions(sweet_prof_found, top_pc, t);
++	}
++}
++
+ void
+ sweet_sample_start(void)
+ {
+ 	thread_t thread;
++	if (kernel_thread_start(sweet_prof_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

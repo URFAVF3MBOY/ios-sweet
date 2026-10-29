@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -1571,8 +1571,16 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ 		 * Print the reason; for any other unknown message, the first bytes.
+ 		 */
+ 		if (msg == 0x24) {
++			/* 0121: TLV 1 = service ("wlan_process" on boot 2026-10-24), TLV 2 = the reason itself
++			 * (Linux struct servreg_loc_pfr_req: service[], reason[]). */
++			char reason[260];
+ 			qm_string(d, len, 1, name, sizeof(name));
+-			LOG("t=%u ms: *** pd-mapper: PFR (failure reason): \"%s\" ***", g_ms, name);
++			qm_string(d, len, 2, reason, sizeof(reason));
++			LOG("t=%u ms: *** pd-mapper: PFR service \"%s\" ***", g_ms, name);
++			LOG("t=%u ms: *** pd-mapper: PFR reason \"%s\" ***", g_ms, reason);
++			LOG("t=%u ms: pd-mapper: PFR %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", g_ms, len,
++			    len > 0 ? d[0] : 0, len > 1 ? d[1] : 0, len > 2 ? d[2] : 0, len > 3 ? d[3] : 0,
++			    len > 4 ? d[4] : 0, len > 5 ? d[5] : 0, len > 6 ? d[6] : 0, len > 7 ? d[7] : 0);
+ 		} else if (len > 0) {
+ 			LOG("t=%u ms: pd-mapper: msg %x, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", g_ms, msg, len,
+ 			    len > 0 ? d[0] : 0, len > 1 ? d[1] : 0, len > 2 ? d[2] : 0, len > 3 ? d[3] : 0,

@@ -1,0 +1,77 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 29 Oct 2026 16:30:00 -0400
+Subject: [PATCH] op7t-0154: audio DSP: say why stage 3 waits
+
+Boot of 0153 (2026-10-29), kern.sweetadsp=1: the firmware loaded and
+TrustZone started the DSP (init_image, mem_setup, auth_and_reset all
+ret=0), then nothing for minutes: its SMP2P item 429 never appeared,
+so stage stayed 3 and the crash reason (SMEM 423) was never read (that
+only happens on a FATAL bit, which needs item 429).
+
+Now, while the DSP is not ready, every 5 s one line: is item 429 in the
+apps<->adsp partition or the global one, and what the crash reason
+says. At 10 s the apps<->adsp partition's items are listed. When the
+wait ends without "ready" the stage becomes -3 (3 = still waiting).
+
+Apply after 0153.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index b037ff3..2335693 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6826,6 +6826,40 @@ adsp_glink_poll(void)
+ 	}
+ }
+ 
++/*
++ * 0154: while the DSP has not said "ready", every 5 s: is its SMP2P item there (our partition or the
++ * global one), and what does its crash reason (SMEM 423) say. Boot of 0153 (2026-10-29): auth_and_reset
++ * ret=0, then nothing at all for minutes: no item 429, so crashed early or waiting on something.
++ */
++static void
++adsp_diag(unsigned ms)
++{
++	struct smem_part_hdr *gp = smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST);
++	uint32_t in_sz = 0, gin_sz = 0, why_sz = 0;
++	const struct smp2p_hdr *in = (const struct smp2p_hdr *)smem_get(adsp.part, ADSP_ITEM_SMP2P_IN, &in_sz);
++	const void *gin = smem_get(gp, ADSP_ITEM_SMP2P_IN, &gin_sz);
++	const char *why = (const char *)smem_get(gp, ADSP_ITEM_CRASH, &why_sz);
++	const char *why_where = "global";
++	char buf[128] = {};
++
++	if (why == NULL) {
++		why = (const char *)smem_get(adsp.part, ADSP_ITEM_CRASH, &why_sz);
++		why_where = "apps<->adsp";
++	}
++	if (why != NULL) {
++		for (uint32_t i = 0; i < why_sz && i < sizeof(buf) - 1 && why[i] != '\0'; i++) {
++			buf[i] = (why[i] >= 0x20 && why[i] < 0x7f) ? why[i] : '.';
++		}
++	}
++	ALOG("t=%u ms: still waiting: item %u here %s (%u bytes, magic %08x), global %s (%u bytes); "
++	    "crash reason (item %u, %s): %s", ms, ADSP_ITEM_SMP2P_IN, in != NULL ? "yes" : "no", in_sz,
++	    in != NULL ? in->magic : 0, gin != NULL ? "yes" : "no", gin_sz, ADSP_ITEM_CRASH,
++	    why != NULL ? why_where : "-", why != NULL ? (buf[0] ? buf : "(empty)") : "(none)");
++	if (ms == 10000) {
++		smem_dump(adsp.part, "apps<->adsp partition, DSP not ready after 10 s");
++	}
++}
++
+ /* the whole of step 1, on a thread of its own */
+ static void
+ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -6947,8 +6981,14 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (adsp.versions_rsp && ms > 0 && (ms % 1000) == 0) {
+ 			break;                          /* everything step 1 wants: stop polling */
+ 		}
++		if (!ready && (ms % 5000) == 0) {
++			adsp_diag(ms);                  /* 0154 */
++		}
+ 		IODelay(1000);
+ 	}
++	if (!ready && adsp_stage == 3) {
++		adsp_stage = -3;                        /* 0154: gave up waiting (3 = still waiting) */
++	}
+ 	ALOG("step 1 over: stage %d; GLINK %u in / %u out; IPCRTR %s, apr_audio_svc %s; qrtr hello %s/%s; APR %u in / %u out, "
+ 	    "state %d; the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"", adsp_stage, adsp.rx_msgs, adsp.tx_msgs,
+ 	    adsp_chan_up(ADSP_CH_QRTR) ? "open" : "NOT OPEN", adsp_chan_up(ADSP_CH_APR) ? "open" : "NOT OPEN",

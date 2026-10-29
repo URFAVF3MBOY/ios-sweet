@@ -1,0 +1,55 @@
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -4946,9 +4946,33 @@
+ 	s_join_done++;
+ }
+ 
++/*
++ * 0161: 5 GHz only for one network. Joining the xfinity gateway's 2.4 GHz BSSID (ch 6, -59 dBm) never
++ * got an auth reply (0159/0160 logs: 4 auth tries acked, nothing heard back), while its 5 GHz BSSID of
++ * the same name joined in 3 ms -- and a join takes the strongest BSSID of the name, which is the dead
++ * 2.4 GHz one. Off unless asked for: boot-arg sweetwifi5g=<ssid> (or -DSWEET_WIFI_5G_SSID=\"<ssid>\" at
++ * build time as the default; the boot-arg wins). For that network only 5 GHz entries are considered; a
++ * BSSID asked for by name is still honoured.
++ */
++#ifndef SWEET_WIFI_5G_SSID
++#define SWEET_WIFI_5G_SSID ""
++#endif
++
+ static void
+ w_join_begin(void)
+ {
++	static char only5g[33];
++	static bool only5g_read;
++	if (!only5g_read) {
++		only5g_read = true;
++		strlcpy(only5g, SWEET_WIFI_5G_SSID, sizeof(only5g));
++		char t[33] = {};
++		if (PE_parse_boot_argn("sweetwifi5g", t, sizeof(t)) && t[0] != 0) {
++			strlcpy(only5g, t, sizeof(only5g));
++		}
++	}
++	bool want5g = only5g[0] != 0 && strlen(only5g) == s_ssid_len && memcmp(only5g, s_ssid, s_ssid_len) == 0;
++
+ 	/*
+ 	 * the AP: the strongest one heard with that name (or the BSSID asked for). 0136: among those
+ 	 * heard in the last BSS_FRESH_MS first -- an entry's RSSI is from when it was last heard, and an
+@@ -4965,6 +4989,9 @@
+ 			if (g_ms - bss[i].last_ms > fresh_lim[pass]) {
+ 				continue;
+ 			}
++			if (want5g && bss[i].freq < 5000) {     /* 0161 */
++				continue;
++			}
+ 			if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
+ 			    (best < 0 || bss[i].rssi > bss[best].rssi)) {
+ 				best = (int)i;
+@@ -4983,7 +5010,7 @@
+ 		}
+ 	}
+ 	if (best < 0) {
+-		JLOG("join: no such network heard");
++		JLOG("join: no such network heard%s", want5g ? " on 5 GHz (sweetwifi5g)" : "");
+ 		w_join_end(ENOENT);
+ 		return;
+ 	}

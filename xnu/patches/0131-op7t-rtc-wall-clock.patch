@@ -1,0 +1,360 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 02:00:00 +0000
+Subject: [PATCH] op7t-0131: wall clock at boot from the PM8150 RTC + a saved offset
+
+Every boot started on 1 Jan 1970 until timed got NTP, and daemons persisted 1970
+dates meanwhile (dasd's widget budget date: ~300% idle CPU, 2026-10-24). Now, in
+bsd_init just before launchd: time = PMIC RTC counter + the offset in
+/private/var/db/sweet-rtc-offset (the RTC is read-only on this phone, a counter,
+not the time); no file yet: the kernel build date. A kernel thread saves the
+offset every 10 minutes once the clock is right (timed/NTP), so after the first
+boot with Wi-Fi every boot starts at the real time, with or without network.
+  sysctl kern.sweetrtc       raw RTC counter
+  sweetclock=0               boot-arg: leave the clock alone
+Log lines: "HOTDOGB CLOCK: ...". PMIC reads only (0062's observer read; peripheral
+0x60 added to its allow-list).
+
+Apply after 0062 (does not depend on 0113/0130).
+---
+ bsd/conf/files        |   1 +
+ bsd/dev/sweet_clock.c | 286 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_spmi.c  |   3 +-
+ bsd/kern/bsd_init.c   |   4 +
+ 4 files changed, 293 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d72833a..45ade07 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_clock.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_clock.c b/bsd/dev/sweet_clock.c
+new file mode 100755
+index 0000000..d8a9734
+--- /dev/null
++++ b/bsd/dev/sweet_clock.c
+@@ -0,0 +1,286 @@
++/*
++ * 0131: the wall clock at boot, before launchd, from the PM8150 RTC (OnePlus 7T).
++ *
++ * Without it every boot started on 1 Jan 1970 until timed got NTP over Wi-Fi, and daemons saved
++ * 1970 dates meanwhile: dasd's widget budget date made it walk 56 years of slots, one CoreDuet
++ * query each, ~300% CPU at idle (2026-10-24). The PMIC RTC (SID 0, 0x6048..0x604b, seconds, LSB
++ * first) keeps counting while the phone is off, but Android never writes it
++ * (qcom,qpnp-rtc-write = <0>): it is a counter, not the time. So, like Android's time_daemon,
++ * keep an offset next to it:
++ *   boot (bsd_init, just before launchd): time = RTC + offset from /private/var/db/sweet-rtc-offset;
++ *     no file yet: the RTC itself if it reads as a real date, else the kernel's build date;
++ *     never earlier than the build date; only when nothing set the clock yet (before 2024).
++ *   then every 10 minutes: once the clock is right (2024 or later: timed/NTP, or the above), save
++ *     offset = time - RTC when it moved by more than 2 s, so the next boot starts at the right time.
++ * PMIC reads only (sweet_spmi.c, observer EXT_READL); the offset file is the only thing written.
++ *   sysctl kern.sweetrtc       the raw RTC counter
++ *   sweetclock=0 (boot-arg)    leave the clock alone, as before
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++
++void sweet_clock_boot(void);
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++#define CLK_RTC_CTRL    0x6046u         /* bit 7: the RTC runs */
++#define CLK_RTC_READ    0x6048u         /* 4 bytes, LSB first */
++#define CLK_OFFSET_PATH "/private/var/db/sweet-rtc-offset"
++#define CLK_SANE        1704067200ll    /* 2024-01-01: anything earlier was never set */
++#define CLK_LATEST      4102444800ll    /* 2100-01-01 */
++#define CLK_SAVE_S      600u
++
++static int64_t clk_saved_offset;
++static bool clk_have_offset;
++
++static int
++clk_rtc_read(uint32_t *secs)
++{
++	uint8_t ctrl = 0, v[4], lsb;
++
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, CLK_RTC_CTRL, &ctrl) != 0 || !(ctrl & 0x80u)) {
++		return -1;
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, CLK_RTC_READ + i, &v[i]) != 0) {
++				return -1;
++			}
++		}
++		/* the LSB again: lower than before = a carry between the byte reads, read again (rtc-pm8xxx.c) */
++		if (sweet_spmi_read(0, CLK_RTC_READ, &lsb) != 0) {
++			return -1;
++		}
++		if (lsb >= v[0]) {
++			*secs = (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* days from 1970-01-01 to a civil date (H. Hinnant's days_from_civil) */
++static int64_t
++clk_days(int64_t y, unsigned m, unsigned d)
++{
++	if (m <= 2) {
++		y--;
++	}
++	int64_t era = (y >= 0 ? y : y - 399) / 400;
++	unsigned yoe = (unsigned)(y - era * 400);
++	unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2u) / 5u + d - 1u;
++	unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
++	return era * 146097 + (int64_t)doe - 719468;
++}
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdate-time"
++static const char clk_build_date[] = __DATE__;  /* "Oct 24 2026" */
++#pragma clang diagnostic pop
++
++/* midnight UTC of the day this file was compiled: a floor for the clock */
++static int64_t
++clk_build_time(void)
++{
++	static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
++	const char *s = clk_build_date;
++	unsigned m = 0, d = 0;
++	int64_t y = 0;
++
++	for (unsigned i = 0; i < 12; i++) {
++		if (strncmp(s, months + 3 * i, 3) == 0) {
++			m = i + 1;
++			break;
++		}
++	}
++	if (s[4] >= '0' && s[4] <= '9') {
++		d = (unsigned)(s[4] - '0') * 10u;
++	}
++	d += (unsigned)(s[5] - '0');
++	for (unsigned i = 7; i < 11; i++) {
++		y = y * 10 + (s[i] - '0');
++	}
++	if (m == 0 || d == 0 || d > 31 || y < 2024) {
++		return CLK_SANE;
++	}
++	return clk_days(y, m, d) * 86400;
++}
++
++static int
++clk_file_read(int64_t *offset, vfs_context_t ctx)
++{
++	char buf[32];
++	vnode_t vp = NULLVP;
++	int error = vnode_open(CLK_OFFSET_PATH, FREAD, 0, 0, &vp, ctx);
++
++	if (error != 0) {
++		return error;
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	if (uio == NULL) {
++		vnode_close(vp, FREAD, ctx);
++		return ENOMEM;
++	}
++	uio_addiov(uio, CAST_USER_ADDR_T(buf), sizeof(buf) - 1);
++	error = VNOP_READ(vp, uio, 0, ctx);
++	size_t got = sizeof(buf) - 1 - (size_t)uio_resid(uio);
++	uio_free(uio);
++	vnode_close(vp, FREAD, ctx);
++	if (error != 0) {
++		return error;
++	}
++	buf[got] = 0;
++
++	const char *p = buf;
++	bool negative = *p == '-';
++	int64_t value = 0;
++	unsigned digits = 0;
++	if (negative) {
++		p++;
++	}
++	for (; *p >= '0' && *p <= '9' && digits < 18; p++, digits++) {
++		value = value * 10 + (*p - '0');
++	}
++	if (digits == 0) {
++		return EINVAL;
++	}
++	*offset = negative ? -value : value;
++	return 0;
++}
++
++static int
++clk_file_write(int64_t offset, vfs_context_t ctx)
++{
++	char buf[32];
++	int len = snprintf(buf, sizeof(buf), "%lld\n", (long long)offset);
++	vnode_t vp = NULLVP;
++	int error = vnode_open(CLK_OFFSET_PATH, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
++
++	if (error != 0) {
++		return error;
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++	if (uio == NULL) {
++		error = ENOMEM;
++	} else {
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), (user_size_t)len);
++		error = VNOP_WRITE(vp, uio, IO_SYNC, ctx);
++		if (error == 0 && uio_resid(uio) != 0) {
++			error = EIO;
++		}
++		uio_free(uio);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error != 0 ? error : close_error;
++}
++
++/* every 10 minutes: keep the offset file in step with the clock, once the clock is right */
++static void
++clk_saver(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		delay_for_interval(CLK_SAVE_S, (uint32_t)NSEC_PER_SEC);
++
++		clock_sec_t now;
++		clock_usec_t usec;
++		uint32_t rtc;
++		clock_get_calendar_microtime(&now, &usec);
++		if ((int64_t)now < CLK_SANE || clk_rtc_read(&rtc) != 0) {
++			continue;
++		}
++		int64_t offset = (int64_t)now - (int64_t)rtc;
++		if (clk_have_offset && offset - clk_saved_offset <= 2 && clk_saved_offset - offset <= 2) {
++			continue;
++		}
++		vfs_context_t ctx = vfs_context_create(NULL);
++		int error = clk_file_write(offset, ctx);
++		vfs_context_rele(ctx);
++		printf("HOTDOGB CLOCK: offset %lld -> %lld saved to " CLK_OFFSET_PATH " (error %d)\n",
++		    clk_have_offset ? (long long)clk_saved_offset : 0ll, (long long)offset, error);
++		if (error == 0) {
++			clk_saved_offset = offset;
++			clk_have_offset = true;
++		}
++	}
++}
++
++void
++sweet_clock_boot(void)
++{
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetclock", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("HOTDOGB CLOCK: off (sweetclock=0)\n");
++		return;
++	}
++
++	clock_sec_t now;
++	clock_usec_t usec;
++	clock_get_calendar_microtime(&now, &usec);
++
++	uint32_t rtc = 0;
++	int rtc_error = clk_rtc_read(&rtc);
++	int file_error = rtc_error != 0 ? ENXIO : clk_file_read(&clk_saved_offset, vfs_context_kernel());
++	clk_have_offset = file_error == 0;
++
++	int64_t built = clk_build_time(), t = 0;
++	const char *source = "kernel build date";
++	if (rtc_error == 0 && clk_have_offset) {
++		t = (int64_t)rtc + clk_saved_offset;
++		source = "RTC + saved offset";
++	} else if (rtc_error == 0 && (int64_t)rtc >= CLK_SANE) {
++		t = rtc;
++		source = "RTC as it is";
++	}
++	if (t < built || t >= CLK_LATEST) {
++		t = built;
++		source = "kernel build date";
++	}
++
++	if ((int64_t)now >= CLK_SANE) {
++		printf("HOTDOGB CLOCK: already set (%lld), RTC %u (error %d), offset file error %d: left alone\n",
++		    (long long)now, rtc, rtc_error, file_error);
++	} else {
++		clock_set_calendar_microtime((clock_sec_t)t, 0);
++		printf("HOTDOGB CLOCK: RTC %u (error %d), offset %lld (file error %d): set to %lld from %s\n",
++		    rtc, rtc_error, clk_have_offset ? (long long)clk_saved_offset : 0ll, file_error, (long long)t, source);
++	}
++
++	if (rtc_error == 0) {
++		thread_t thread;
++		if (kernel_thread_start(clk_saver, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++}
++
++static int
++sysctl_sweetrtc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t rtc = 0;
++	if (clk_rtc_read(&rtc) != 0) {
++		return EIO;
++	}
++	int64_t value = rtc;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetrtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetrtc, "Q",
++    "PM8150 RTC counter in seconds; wall clock = it + /private/var/db/sweet-rtc-offset (0131)");
++#else
++void
++sweet_clock_boot(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..295de93 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -87,10 +87,11 @@ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* 0131: and the RTC counter (0x60, read only, sweet_clock.c) */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..274430f 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1039,6 +1039,10 @@ bsd_init(void)
+ #endif /* CONFIG_IMAGEBOOT */
+ #endif /* CONFIG_BASESYSTEMROOT */
+ 
++	/* 0131 (OnePlus 7T): the wall clock from the PMIC RTC, before launchd and its daemons start */
++	extern void sweet_clock_boot(void);
++	sweet_clock_boot();
++
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
