@@ -1,0 +1,374 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 09:30:00 -0500
+Subject: [PATCH] op7t-0181: audio: APR pipe and register pipe for userland
+
+The audio DSP is up since 0180 (stage 6: GLINK, QRTR, APR, AVCS state 1).
+Sound on the speakers needs, per HackiOS vayu (same SM8150): the
+quaternary MI2S bit clock through the AFE service, AFE port 0x1006 set up
+and started, the DSP reaching our memory (apps SMMU stream 0x1b21), and
+on the 7T two NXP TFA98xx amplifiers on I2C (QUP0 SE4 0x890000, 0x34
+right / 0x35 left, reset GPIO 37 / 100). To work that out without a
+kernel build per try, two root-only pipes:
+
+  kern.sweetapr   write one APR packet (32..512 bytes, header included),
+                  read back what the DSP sent as records (u32 length +
+                  packet). The adsp thread no longer exits after step 1:
+                  at stage 6 it keeps GLINK serviced (IOSleep(1), not
+                  IODelay) and sends what userland queued.
+  kern.sweetmmio  one 32-bit register read/write/masked write per call,
+                  only in GCC, TLMM and QUPv3 wrap0, for a userland I2C
+                  driver on SE4 and the amplifiers' reset pins.
+
+Apply after 0180.
+---
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -5,14 +5,33 @@
+  *                               4 up (SMP2P READY), 5 apr_audio_svc open, 6 audio services up;
+  *                               negative: stopped at that stage (the log says why)
+  * Writing needs root.
++ *
++ * 0181, two pipes for userland experiments (root only):
++ *   kern.sweetapr    write: one APR packet (header included, 32..512 bytes), sent on apr_audio_svc by the adsp
++ *                    thread; read: what the DSP sent since the last read, as records (u32 length + packet).
++ *                    Open once kern.sweetadsp reads 6.
++ *   kern.sweetmmio   one 32-bit register access per call, in and out the same struct sweet_mmio_req:
++ *                    op 0 read, 1 write val, 2 write (old & ~mask) | (val & mask); the value read after the
++ *                    access comes back in val. Only GCC, TLMM and QUPv3 wrap0 (I2C for the amplifiers).
++ *                    A serial engine's registers need its AHB clocks on first, or the read faults.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/kauth.h>
+ #include <sys/sysctl.h>
++#include <kern/locks.h>
++#include <mach/mach_types.h>
+ 
+ extern int sweet_adsp_start(void);
+ extern int sweet_adsp_stage(void);
++extern int sweet_adsp_apr_send(const void *p, size_t n);
++extern int sweet_adsp_apr_recv(void *dst, size_t cap, size_t *got);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static LCK_GRP_DECLARE(sweet_adsp_group, "sweet-adsp");
++static LCK_MTX_DECLARE(sweet_apr_lock, &sweet_adsp_group);
++static LCK_MTX_DECLARE(sweet_mmio_lock, &sweet_adsp_group);
+ 
+ static int
+ sysctl_sweetadsp SYSCTL_HANDLER_ARGS
+@@ -34,3 +53,108 @@ sysctl_sweetadsp SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetadsp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetadsp, "I",
+     "1: start the audio DSP (0152); reads how far it got");
++
++static int
++sysctl_sweetapr SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static uint8_t buf[4096];
++	int error = 0;
++
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	lck_mtx_lock(&sweet_apr_lock);
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t n = req->newlen;
++
++		if (n > 512) {
++			error = E2BIG;
++		} else if ((error = SYSCTL_IN(req, buf, n)) == 0) {
++			error = sweet_adsp_apr_send(buf, n);
++		}
++	}
++	if (error == 0 && req->oldptr != USER_ADDR_NULL) {
++		size_t got = 0;
++
++		error = sweet_adsp_apr_recv(buf, req->oldlen < sizeof(buf) ? req->oldlen : sizeof(buf), &got);
++		if (error == 0) {
++			error = SYSCTL_OUT(req, buf, got);
++		}
++	} else if (error == 0 && req->newptr == USER_ADDR_NULL) {
++		error = SYSCTL_OUT(req, NULL, sizeof(buf));     /* (size query) */
++	}
++	lck_mtx_unlock(&sweet_apr_lock);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetapr, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetapr, "S",
++    "APR packets to/from the audio DSP (0181; write sends one, read takes what came in)");
++
++struct sweet_mmio_req {
++	uint32_t op;            /* 0 read, 1 write, 2 masked write */
++	uint32_t width;         /* 4 */
++	uint64_t pa;
++	uint32_t val, mask;
++};
++
++static const struct {
++	uint64_t pa, len;
++} sweet_mmio_ok[] = {
++	{ 0x00100000, 0x001f0000 },     /* GCC */
++	{ 0x00880000, 0x00050000 },     /* QUPv3 wrap0: SE0..7 (0x880000..0x89ffff) and its common block (0x8c0000) */
++	{ 0x03000000, 0x00e00000 },     /* TLMM, all four tiles */
++};
++static vm_offset_t sweet_mmio_va[sizeof(sweet_mmio_ok) / sizeof(sweet_mmio_ok[0])];
++
++static int
++sysctl_sweetmmio SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct sweet_mmio_req r;
++	volatile uint32_t *reg;
++	unsigned i, n = sizeof(sweet_mmio_ok) / sizeof(sweet_mmio_ok[0]);
++	int error;
++
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newptr == USER_ADDR_NULL || req->newlen != sizeof(r)) {
++		return EINVAL;
++	}
++	if ((error = SYSCTL_IN(req, &r, sizeof(r))) != 0) {
++		return error;
++	}
++	if (r.width != 4 || (r.pa & 3) != 0 || r.op > 2) {
++		return EINVAL;
++	}
++	for (i = 0; i < n; i++) {
++		if (r.pa >= sweet_mmio_ok[i].pa && r.pa + 4 <= sweet_mmio_ok[i].pa + sweet_mmio_ok[i].len) {
++			break;
++		}
++	}
++	if (i == n) {
++		return EACCES;
++	}
++	lck_mtx_lock(&sweet_mmio_lock);
++	if (sweet_mmio_va[i] == 0) {
++		sweet_mmio_va[i] = ml_io_map((vm_offset_t)sweet_mmio_ok[i].pa, (vm_size_t)sweet_mmio_ok[i].len);
++	}
++	if (sweet_mmio_va[i] == 0) {
++		lck_mtx_unlock(&sweet_mmio_lock);
++		return ENOMEM;
++	}
++	reg = (volatile uint32_t *)(sweet_mmio_va[i] + (vm_offset_t)(r.pa - sweet_mmio_ok[i].pa));
++	if (r.op == 1) {
++		*reg = r.val;
++	} else if (r.op == 2) {
++		*reg = (*reg & ~r.mask) | (r.val & r.mask);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	r.val = *reg;
++	lck_mtx_unlock(&sweet_mmio_lock);
++	return SYSCTL_OUT(req, &r, sizeof(r));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetmmio, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetmmio, "S",
++    "one 32-bit register access in GCC / TLMM / QUPv3 wrap0 (0181; root)");
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6599,12 +6599,60 @@ adsp_qrtr_rx(const uint8_t *p, uint32_t len)
+ 	}
+ }
+ 
++/*
++ * 0181: APR pipe for userland (kern.sweetapr, bsd/dev/sweet_adsp.c). Every APR packet from the DSP is also kept
++ * here as a record (u32 length, then the packet); when the buffer is full new ones are counted as drops. Packets
++ * written by userland are queued and sent by the adsp thread, which keeps GLINK serviced after step 1.
++ */
++#define APR_PIPE_SLOTS      16
++#define APR_PIPE_MAX        512             /* the DSP's apr_audio_svc intents are 0x200 */
++#define APR_PIPE_RX         32768
++
++static struct {
++	IOLock *lock;
++	bool live;
++	uint8_t tx[APR_PIPE_SLOTS][APR_PIPE_MAX];
++	uint32_t txn[APR_PIPE_SLOTS];
++	unsigned txh, txc;
++	uint8_t rx[APR_PIPE_RX];
++	uint32_t rxh, rxc;                      /* first byte held, bytes held */
++	uint32_t drops, sent;
++} apr_pipe;
++
++static void
++apr_pipe_rx_in(const void *src, uint32_t n)
++{
++	const uint8_t *s = (const uint8_t *)src;
++
++	for (uint32_t i = 0; i < n; i++) {
++		apr_pipe.rx[(apr_pipe.rxh + apr_pipe.rxc + i) % APR_PIPE_RX] = s[i];
++	}
++	apr_pipe.rxc += n;
++}
++
++static void
++apr_pipe_put(const uint8_t *p, uint32_t len)
++{
++	if (apr_pipe.lock == NULL) {
++		return;
++	}
++	IOLockLock(apr_pipe.lock);
++	if (apr_pipe.rxc + 4 + len > APR_PIPE_RX) {
++		apr_pipe.drops++;
++	} else {
++		apr_pipe_rx_in(&len, 4);
++		apr_pipe_rx_in(p, len);
++	}
++	IOLockUnlock(apr_pipe.lock);
++}
++
+ static void
+ adsp_apr_rx(const uint8_t *p, uint32_t len)
+ {
+ 	const struct apr_hdr *h = (const struct apr_hdr *)p;
+ 
+ 	adsp.apr_in++;
++	apr_pipe_put(p, len);                   /* 0181 */
+ 	if (len < sizeof(*h)) {
+ 		return;
+ 	}
+@@ -6645,6 +6693,34 @@ adsp_apr_ask(uint8_t svc, uint32_t opcode)
+ 	return sent;
+ }
+ 
++/* 0181, adsp thread only: what userland queued goes out on apr_audio_svc */
++static void
++apr_pipe_send_queued(void)
++{
++	uint8_t pkt[APR_PIPE_MAX];
++	uint32_t n;
++
++	for (;;) {
++		IOLockLock(apr_pipe.lock);
++		if (apr_pipe.txc == 0) {
++			IOLockUnlock(apr_pipe.lock);
++			return;
++		}
++		n = apr_pipe.txn[apr_pipe.txh];
++		memcpy(pkt, apr_pipe.tx[apr_pipe.txh], n);
++		IOLockUnlock(apr_pipe.lock);
++		if (!adsp_send(ADSP_CH_APR, pkt, n)) {
++			return;                         /* no free intent from the DSP yet: next round */
++		}
++		adsp.apr_out++;
++		IOLockLock(apr_pipe.lock);
++		apr_pipe.txh = (apr_pipe.txh + 1) % APR_PIPE_SLOTS;
++		apr_pipe.txc--;
++		apr_pipe.sent++;
++		IOLockUnlock(apr_pipe.lock);
++	}
++}
++
+ static bool
+ adsp_rx_one(void)
+ {
+@@ -7018,6 +7094,23 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 	    adsp_chan_up(ADSP_CH_QRTR) ? "open" : "NOT OPEN", adsp_chan_up(ADSP_CH_APR) ? "open" : "NOT OPEN",
+ 	    adsp.qrtr_hello_rx ? "in" : "-", adsp.qrtr_hello_sent ? "out" : "-", adsp.apr_in, adsp.apr_out,
+ 	    (int)adsp.state_rsp - 1, adsp.others[0], adsp.others[1], adsp.others[2], adsp.others[3]);
++	/* 0181: the DSP stays up and GLINK stays serviced (sleeping, not spinning), for the APR pipe */
++	if (adsp_stage == 6 && !adsp.broken) {
++		IOLockLock(apr_pipe.lock);
++		apr_pipe.live = true;
++		IOLockUnlock(apr_pipe.lock);
++		ALOG("APR pipe open (kern.sweetapr): GLINK serviced every ms from here on");
++		while (!adsp.broken) {
++			adsp.ms++;
++			adsp_glink_poll();
++			apr_pipe_send_queued();
++			IOSleep(1);
++		}
++		IOLockLock(apr_pipe.lock);
++		apr_pipe.live = false;
++		IOLockUnlock(apr_pipe.lock);
++		ALOG("APR pipe closed: GLINK RX stopped (%u sent, %u dropped)", apr_pipe.sent, apr_pipe.drops);
++	}
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -7030,6 +7123,9 @@ sweet_adsp_start(void)
+ 	if (adsp_started) {
+ 		return EALREADY;
+ 	}
++	if (apr_pipe.lock == NULL) {
++		apr_pipe.lock = IOLockAlloc();      /* 0181 */
++	}
+ 	adsp_started = true;
+ 	if (kernel_thread_start(adsp_thread, NULL, &t) != KERN_SUCCESS) {
+ 		adsp_started = false;
+@@ -7045,8 +7141,71 @@ sweet_adsp_stage(void)
+ 	return adsp_stage;
+ }
+ 
++/* 0181: kern.sweetapr. One APR packet (header included) queued for the DSP. */
++extern "C" int
++sweet_adsp_apr_send(const void *p, size_t n)
++{
++	int error = 0;
++
++	if (apr_pipe.lock == NULL) {
++		return ENXIO;
++	}
++	if (n < sizeof(struct apr_hdr) || n > APR_PIPE_MAX) {
++		return EINVAL;
++	}
++	IOLockLock(apr_pipe.lock);
++	if (!apr_pipe.live) {
++		error = ENXIO;
++	} else if (apr_pipe.txc == APR_PIPE_SLOTS) {
++		error = ENOSPC;
++	} else {
++		unsigned at = (apr_pipe.txh + apr_pipe.txc) % APR_PIPE_SLOTS;
++
++		memcpy(apr_pipe.tx[at], p, n);
++		apr_pipe.txn[at] = (uint32_t)n;
++		apr_pipe.txc++;
++	}
++	IOLockUnlock(apr_pipe.lock);
++	return error;
++}
++
++/* 0181: kern.sweetapr. What the DSP sent, as whole records (u32 length + packet), as many as fit. */
++extern "C" int
++sweet_adsp_apr_recv(void *dst, size_t cap, size_t *got)
++{
++	uint8_t *d = (uint8_t *)dst;
++	size_t at = 0;
++
++	*got = 0;
++	if (apr_pipe.lock == NULL) {
++		return ENXIO;
++	}
++	IOLockLock(apr_pipe.lock);
++	while (apr_pipe.rxc >= 4) {
++		uint32_t len = 0;
++
++		for (unsigned i = 0; i < 4; i++) {
++			((uint8_t *)&len)[i] = apr_pipe.rx[(apr_pipe.rxh + i) % APR_PIPE_RX];
++		}
++		if (at + 4 + len > cap) {
++			break;
++		}
++		for (uint32_t i = 0; i < 4 + len; i++) {
++			d[at + i] = apr_pipe.rx[(apr_pipe.rxh + i) % APR_PIPE_RX];
++		}
++		at += 4 + len;
++		apr_pipe.rxh = (apr_pipe.rxh + 4 + len) % APR_PIPE_RX;
++		apr_pipe.rxc -= 4 + len;
++	}
++	IOLockUnlock(apr_pipe.lock);
++	*got = at;
++	return 0;
++}
++
+ #else
+ extern "C" void sweet_modem_init(void) {}
+ extern "C" int sweet_adsp_start(void) { return 19; }      /* ENODEV */
+ extern "C" int sweet_adsp_stage(void) { return 0; }
++extern "C" int sweet_adsp_apr_send(const void *p __unused, size_t n __unused) { return 19; }
++extern "C" int sweet_adsp_apr_recv(void *p __unused, size_t cap __unused, size_t *got) { *got = 0; return 19; }
+ #endif
