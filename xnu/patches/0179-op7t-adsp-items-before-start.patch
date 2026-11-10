@@ -1,0 +1,85 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 07:00:00 -0500
+Subject: [PATCH] op7t-0179: audio DSP: our shared-memory items before the start
+
+Boot of 0178 (2026-11-10, captured with tools/adsp-capture.sh): TrustZone
+authenticates and starts the DSP (auth_and_reset ret=0), 5 s later its
+crash reason (SMEM 423) reads "SFR Init: wdog or kernel error suspected."
+(the placeholder a Qualcomm DSP writes early in its own init), and its
+SMP2P item 429 never appears. So it runs, then dies or hangs in its init.
+
+HackiOS vayu (same SoC, SM8150; its ADSP works on hardware) and Linux make
+everything of ours before the start: the SMP2P item 443 with one entry,
+"master-kernel" = 0 (Linux makes it when qcom,smp2p probes at boot), and
+GLINK's descriptor (478) and our FIFO (479) (vayu_glink_prepare() before
+vayu_pas_start()). 0152 made 443 only after auth_and_reset, with no entry
+at all, and 478/479 only after "ready", which never came.
+
+Now: 443 (with "master-kernel"), 478 and 479 are made before the AOP
+load_state message and the TrustZone calls. The ready path finds 478/479
+there (smem_alloc returns an existing item) and goes on as before.
+
+Apply after 0154.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6435,7 +6435,13 @@ adsp_smp2p_out(void)
+ 	o->local_pid = 0;
+ 	o->remote_pid = ADSP_PID;
+ 	o->total = SMP2P_MAX_ENTRY;
+-	o->valid = 0;
++	{
++		struct smp2p_entry *e = (struct smp2p_entry *)(o + 1);
++		bzero(e, sizeof(*e));
++		strlcpy(e->name, "master-kernel", sizeof(e->name));  /* 0179: Linux's outbound entry, value 0 */
++		e->value = 0;
++	}
++	o->valid = 1;
+ 	o->features[0] = 1;                         /* SSR_ACK */
+ 	mb();
+ 	o->version = 1;
+@@ -6970,6 +6976,25 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
++	/*
++	 * 0179: everything of ours in the shared memory before the DSP is started, as Linux and HackiOS vayu
++	 * have it: our SMP2P item (443, with "master-kernel"), GLINK's descriptor (478) and our FIFO (479).
++	 * 0178 boot: made after the start, the DSP died in its init ("SFR Init: wdog or kernel error suspected.").
++	 */
++	adsp.out = adsp_smp2p_out();
++	ALOG("our SMP2P item %u: %p (before the start, entry \"master-kernel\")", ADSP_ITEM_SMP2P_OUT, adsp.out);
++	adsp.desc = (volatile uint32_t *)smem_alloc(adsp.part, SMEM_GLINK_DESC, 32);
++	adsp.tx = (uint8_t *)smem_alloc(adsp.part, SMEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
++	if (adsp.out == NULL || adsp.desc == NULL || adsp.tx == NULL) {
++		ALOG("SMEM alloc before the start failed (smp2p %p desc %p tx %p): not started", adsp.out, adsp.desc, adsp.tx);
++		adsp_stage = -1;
++		thread_terminate(current_thread());
++		return;
++	}
++	adsp.desc[1] = 0;
++	adsp.desc[2] = 0;
++	mb();
++	ALOG("glink: descriptor (%u) and our FIFO (%u, %u bytes) made before the start", SMEM_GLINK_DESC, SMEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
+ 	(void)aop_send("{class: image, res: load_state, name: adsp, val: on}");
+ 	ALOG("rpmh: cx.lvl proxy vote: %d", vote_retry(sweet_rpmh_arc_level, "cx.lvl", 0x181));
+ 	adsp_stage = 2;
+@@ -6979,8 +7004,6 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		return;
+ 	}
+ 	adsp_stage = 3;
+-	adsp.out = adsp_smp2p_out();
+-	ALOG("our SMP2P item %u: %p", ADSP_ITEM_SMP2P_OUT, adsp.out);
+ 	adsp.features = GLINK_FEATURES;
+ 	adsp.next_intent = 1;
+ 	adsp.ch[ADSP_CH_QRTR].name = "IPCRTR";
+@@ -7034,7 +7057,7 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 				adsp_stage = -4;
+ 				break;
+ 			}
+-			ALOG("glink: descriptors %s, our FIFO %u bytes", existed ? "made by the DSP" : "ours", GLINK_TX_SIZE);
++			ALOG("glink: descriptors %s, our FIFO %u bytes", existed ? "there (made before the start)" : "made now", GLINK_TX_SIZE);
+ 			adsp.desc[2] = 0;
+ 			adsp.desc[1] = 0;
+ 			mb();

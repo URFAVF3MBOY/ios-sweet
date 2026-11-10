@@ -17,9 +17,13 @@ fi
 echo "chip: stage $stage"
 [ "$stage" -ge 6 ] || { echo "chip not up"; exit 1; }
 # (Apple's job answers to system/, user/501/ and user/foreground/ alike; bootstrap goes to user/501)
-for d in user/501 user/foreground system; do launchctl bootout $d/com.apple.BlueTool 2>/dev/null; done
-sleep 1
-launchctl bootstrap user/501 /var/jb/usr/libexec/bluetool-stub-user.plist 2>&1 | tail -1
+# Right after boot the bootstrap can fail with "17: File exists" while Apple's job stays loaded: retry.
+for try in 1 2 3; do
+	for d in user/501 user/foreground system; do launchctl bootout $d/com.apple.BlueTool 2>/dev/null; done
+	sleep 2
+	launchctl bootstrap user/501 /var/jb/usr/libexec/bluetool-stub-user.plist 2>&1 | tail -1
+	launchctl print user/501/com.apple.BlueTool 2>/dev/null | grep -q 'program = /var/jb/usr/bin/python3' && break
+done
 launchctl print user/501/com.apple.BlueTool 2>/dev/null | grep -m1 'program'
 killall -9 bluetoothd 2>/dev/null
 echo "bluetoothd restarted"
