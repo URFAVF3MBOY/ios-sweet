@@ -7,6 +7,9 @@
   sweetaudio.py rd ADDR REG   one 16-bit TFA register (hex)
   sweetaudio.py apr-state     AVCS "are the audio services up" through kern.sweetapr, and the answer
   sweetaudio.py apr-read      everything the DSP sent since the last read
+  sweetaudio.py afe-start [LINES]  quaternary MI2S: bit clock 0x106 on (1.536 MHz), port 0x1006 I2S 48 kHz 16-bit
+                              stereo, word select ours, data on LINES (default 2 = SD1, the 7T DT's rx-lines 0x2), start
+  sweetaudio.py afe-stop      port 0x1006 stopped, bit clock off
 
 Numbers: live DT (i2c@890000, tfa98xx_right@34 reset gpio37, tfa98xx_left@35 reset gpio100,
 qupv3_se4_i2c_active gpio51/52 function qup4); Linux pinctrl-sm8150.c (51, 52, 100 on SOUTH, 37 on NORTH,
@@ -15,9 +18,13 @@ qup4 = function 1); Linux gcc-sm8150.c (wrap0 votes in 0x5200c: m_ahb bit 6, s_a
 The amplifiers' reset pins are only read here: TFA98xx reset is active high, nothing drives them yet.
 """
 import ctypes
+import os
 import struct
 import sys
 import time
+
+# 0181's kern.sweetmmio maps whole ranges and panics on TLMM (14 MB): pins only with a 0183 kernel, SWEET_TLMM=1
+TLMM_OK = os.environ.get("SWEET_TLMM") == "1"
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -102,6 +109,8 @@ TILE = {37: NORTH, 51: SOUTH, 52: SOUTH, 100: SOUTH}
 
 
 def pin_cfg(n):
+    if not TLMM_OK:
+        raise OSError("TLMM needs a 0183 kernel (SWEET_TLMM=1); 0181 panics mapping it")
     return TILE[n] + n * 0x1000
 
 
@@ -112,6 +121,9 @@ def pin_show(n, what):
 
 
 def pins_i2c():
+    if not TLMM_OK:
+        print("pins: 51/52 not muxed (SWEET_TLMM=1 with a 0183 kernel): the transfer will likely fail")
+        return
     for n in (51, 52):
         setbits(pin_cfg(n), 1 << 2, 0x3ff)     # function 1 (qup4), no pull, 2 mA, input
 
@@ -237,9 +249,12 @@ def tfa_rd(addr, reg):
 APR_DOMAIN_ADSP, APR_DOMAIN_APPS = 4, 5
 
 
+APR_HDR = 20                                    # field, size, src svc/domain/port, dst svc/domain/port, token, opcode
+
+
 def apr_packet(svc, opcode, payload=b"", token=1, port=0):
-    size = 32 + len(payload)
-    field = 2 << 8 | (32 // 4) << 4             # sequenced command, 8 header words
+    size = APR_HDR + len(payload)
+    field = 2 << 8 | (APR_HDR // 4) << 4        # sequenced command, 5 header words
     return struct.pack("<HHBBHBBHII", field, size, svc, APR_DOMAIN_APPS, port, svc, APR_DOMAIN_ADSP, port,
                        token, opcode) + payload
 
@@ -255,13 +270,84 @@ def apr_read():
 
 
 def apr_show(p):
-    if len(p) < 32:
+    if len(p) < APR_HDR:
         print("apr: %d bytes: %s" % (len(p), p.hex()))
         return
     field, size, fs, fd, fp, ts, td, tp, token, opcode = struct.unpack_from("<HHBBHBBHII", p)
-    words = [struct.unpack_from("<I", p, o)[0] for o in range(32, len(p) - 3, 4)]
+    hl = max(APR_HDR, (field >> 4 & 0xf) * 4)
+    words = [struct.unpack_from("<I", p, o)[0] for o in range(hl, len(p) - 3, 4)]
     print("apr: %d.%d -> %d.%d opcode %08x token %u: %s" % (fd, fs, td, ts, opcode, token,
                                                           " ".join("%08x" % w for w in words[:12])))
+
+
+# ---- AFE (APR service 4): the quaternary MI2S port, as HackiOS vayu_audio.c (same SM8150) ----
+
+APR_SVC_AFE = 4
+APR_BASIC_RSP = 0x000110e8
+AFE_PORT_CMD_DEVICE_START, AFE_PORT_CMD_DEVICE_STOP = 0x000100e5, 0x000100e6
+AFE_PORT_CMD_SET_PARAM_V2, AFE_SVC_CMD_SET_PARAM = 0x000100ef, 0x000100f3
+AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG = 0x0001020c, 0x0001020d
+AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET = 0x0001028f, 0x00010290
+QUAT_MI2S_RX = 0x1006
+CLOCK_QUAD_MI2S_IBIT = 0x106
+RATE = 48000
+_token = [0x100]
+
+
+def apr_cmd(what, svc, opcode, payload):
+    """Send one command, wait up to 1 s for its basic response; True if status 0."""
+    _token[0] += 1
+    tok = _token[0]
+    apr_read()                                  # drop anything older
+    sysctl("kern.sweetapr", apr_packet(svc, opcode, payload, token=tok))
+    for _ in range(100):
+        for p in apr_read():
+            field, size, fs, fd, fp, ts, td, tp, token, op = struct.unpack_from("<HHBBHBBHII", p)
+            hl = max(APR_HDR, (field >> 4 & 0xf) * 4)
+            w = [struct.unpack_from("<I", p, o)[0] for o in range(hl, len(p) - 3, 4)]
+            if op == APR_BASIC_RSP and w and w[0] == opcode:
+                st = w[1] if len(w) > 1 else -1
+                print("afe: %s: %s" % (what, "done" if st == 0 else "REFUSED, status %#x" % st))
+                return st == 0
+            print("afe: (other answer: opcode %08x token %u: %s)" % (op, token, " ".join("%08x" % x for x in w[:6])))
+        time.sleep(0.01)
+    print("afe: %s: NO ANSWER" % what)
+    return False
+
+
+def afe_param_hdr(module, param, size):
+    return struct.pack("<IIHH", module, param, size, 0)
+
+
+def afe_service_param(what, module, param, data):
+    body = afe_param_hdr(module, param, len(data)) + data
+    return apr_cmd(what, APR_SVC_AFE, AFE_SVC_CMD_SET_PARAM, struct.pack("<IIII", len(body), 0, 0, 0) + body)
+
+
+def afe_port_param(what, port, module, param, data):
+    body = afe_param_hdr(module, param, len(data)) + data
+    return apr_cmd(what, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, struct.pack("<HHIII", port, len(body), 0, 0, 0) + body)
+
+
+def afe_clock(on):
+    clock = struct.pack("<IIIHHI", 1, CLOCK_QUAD_MI2S_IBIT, RATE * 16 * 2, 1, 0, 1 if on else 0)
+    return afe_service_param("quaternary MI2S bit clock 0x106 %s" % ("on (1.536 MHz)" if on else "off"),
+                             AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, clock)
+
+
+def afe_start(lines=2):
+    if not afe_clock(True):
+        return False
+    i2s = struct.pack("<IHHHHIHH", 1, 16, lines, 1, 1, RATE, 0, 0)    # version, bits, lines, stereo, ws ours, rate
+    if not afe_port_param("port 0x1006: I2S, lines %d, stereo, 16 bits, 48 kHz, word select ours" % lines,
+                          QUAT_MI2S_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, i2s):
+        return False
+    return apr_cmd("port 0x1006 started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, struct.pack("<HH", QUAT_MI2S_RX, 0))
+
+
+def afe_stop():
+    apr_cmd("port 0x1006 stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, struct.pack("<HH", QUAT_MI2S_RX, 0))
+    afe_clock(False)
 
 
 def main(argv):
@@ -271,8 +357,11 @@ def main(argv):
         print("gcc: wrap0 vote %#x: m_ahb %d s_ahb %d s4 %d core %d/%d" % (
             v, v >> 6 & 1, v >> 7 & 1, v >> 14 & 1, v >> 8 & 1, v >> 9 & 1))
         print("gcc: s4 rcg %#x cfg %#x dfsr %#x, branch %#x" % (rd(S4_RCG), rd(S4_RCG + 4), rd(S4_RCG + 0x14), rd(S4_BR)))
-        for n, what in ((51, "SE4 SDA"), (52, "SE4 SCL"), (37, "TFA right reset"), (100, "TFA left reset")):
-            pin_show(n, what)
+        if TLMM_OK:
+            for n, what in ((51, "SE4 SDA"), (52, "SE4 SCL"), (37, "TFA right reset"), (100, "TFA left reset")):
+                pin_show(n, what)
+        else:
+            print("pins: not read (SWEET_TLMM=1 with a 0183 kernel)")
         if v & (VOTE_MAHB | VOTE_SAHB) == VOTE_MAHB | VOTE_SAHB and not rd(MAHB_BR) >> 31:
             se_info()
         else:
@@ -293,6 +382,10 @@ def main(argv):
         time.sleep(0.2)
         for p in apr_read():
             apr_show(p)
+    elif cmd == "afe-start":
+        afe_start(int(argv[2]) if len(argv) > 2 else 2)
+    elif cmd == "afe-stop":
+        afe_stop()
     elif cmd == "apr-read":
         for p in apr_read():
             apr_show(p)
