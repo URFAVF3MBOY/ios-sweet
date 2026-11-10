@@ -10,6 +10,8 @@
   sweetaudio.py afe-start [LINES]  quaternary MI2S: bit clock 0x106 on (1.536 MHz), port 0x1006 I2S 48 kHz 16-bit
                               stereo, word select ours, data on LINES (default 2 = SD1, the 7T DT's rx-lines 0x2), start
   sweetaudio.py afe-stop      port 0x1006 stopped, bit clock off
+  sweetaudio.py fetch PATH OUT    a file from the vendor partition's ext4 (0184 kern.sweetpart, read only),
+                              e.g. fetch /firmware/tfa98xx.cnt /var/root/tfa98xx.cnt
 
 Numbers: live DT (i2c@890000, tfa98xx_right@34 reset gpio37, tfa98xx_left@35 reset gpio100,
 qupv3_se4_i2c_active gpio51/52 function qup4); Linux pinctrl-sm8150.c (51, 52, 100 on SOUTH, 37 on NORTH,
@@ -350,6 +352,96 @@ def afe_stop():
     afe_clock(False)
 
 
+# ---- kern.sweetpart (0184) and a read-only ext4 reader, for /vendor/firmware/tfa98xx.cnt ----
+
+def part_read(name, off, n):
+    out = b""
+    while n > 0:
+        k = min(n, 65536)
+        req = struct.pack("<32sQII", name.encode(), off, k, 0)
+        out += sysctl("kern.sweetpart", req, k)
+        off += k
+        n -= k
+    return out
+
+
+class Ext4:
+    def __init__(self, part):
+        self.part = part
+        sb = part_read(part, 1024, 1024)
+        if struct.unpack_from("<H", sb, 56)[0] != 0xEF53:
+            raise OSError("%s: no ext4 superblock" % part)
+        self.bs = 1024 << struct.unpack_from("<I", sb, 24)[0]
+        self.ipg = struct.unpack_from("<I", sb, 40)[0]
+        self.isz = struct.unpack_from("<H", sb, 88)[0] if struct.unpack_from("<I", sb, 76)[0] >= 1 else 128
+        incompat = struct.unpack_from("<I", sb, 96)[0]
+        self.is64 = bool(incompat & 0x80)
+        self.dsz = struct.unpack_from("<H", sb, 254)[0] if self.is64 else 32
+        self.gdt = (2 if self.bs == 1024 else 1) * self.bs
+
+    def block(self, n, count=1):
+        return part_read(self.part, n * self.bs, count * self.bs)
+
+    def inode(self, ino):
+        g, i = (ino - 1) // self.ipg, (ino - 1) % self.ipg
+        d = part_read(self.part, self.gdt + g * self.dsz, self.dsz)
+        table = struct.unpack_from("<I", d, 8)[0] | ((struct.unpack_from("<I", d, 0x28)[0] << 32) if self.is64 and self.dsz >= 64 else 0)
+        return part_read(self.part, table * self.bs + i * self.isz, self.isz)
+
+    def extents(self, node):
+        magic, entries, _, depth = struct.unpack_from("<HHHH", node, 0)
+        if magic != 0xF30A:
+            raise OSError("bad extent header")
+        out = []
+        for e in range(entries):
+            o = 12 + 12 * e
+            if depth == 0:
+                lblk, ln, hi, lo = struct.unpack_from("<IHHI", node, o)
+                if ln > 32768:
+                    ln -= 32768             # uninitialized extent: reads as zeros, length still counts
+                out.append((lblk, ln, hi << 32 | lo))
+            else:
+                lblk, lo, hi = struct.unpack_from("<IIH", node, o)
+                out += self.extents(self.block(hi << 32 | lo))
+        return out
+
+    def data(self, ino):
+        inode = self.inode(ino)
+        size = struct.unpack_from("<I", inode, 4)[0] | struct.unpack_from("<I", inode, 108)[0] << 32
+        flags = struct.unpack_from("<I", inode, 32)[0]
+        iblock = inode[40:100]
+        buf = bytearray()
+        if flags & 0x80000:                 # extents
+            for lblk, ln, phys in sorted(self.extents(iblock)):
+                if len(buf) < lblk * self.bs:
+                    buf += bytes(lblk * self.bs - len(buf))
+                buf += self.block(phys, ln)
+        elif flags & 0x10000000:            # inline data
+            buf += iblock
+        else:                               # direct blocks only (enough for small directories/files)
+            for b in struct.unpack_from("<12I", iblock, 0):
+                if b:
+                    buf += self.block(b)
+        return bytes(buf[:size])
+
+    def lookup(self, path):
+        ino = 2
+        for name in [x for x in path.split("/") if x]:
+            d, at, found = self.data(ino), 0, None
+            while at + 8 <= len(d):
+                child, rec, nlen = struct.unpack_from("<IHB", d, at)
+                if rec < 8:
+                    break
+                if child and d[at + 8:at + 8 + nlen].decode(errors="replace") == name:
+                    found = child
+                    break
+                at += rec
+            if found is None:
+                raise OSError("%s: %s not found" % (path, name))
+            ino = found
+        return ino
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "status"
     if cmd == "status":
@@ -386,6 +478,11 @@ def main(argv):
         afe_start(int(argv[2]) if len(argv) > 2 else 2)
     elif cmd == "afe-stop":
         afe_stop()
+    elif cmd == "fetch":
+        fs = Ext4(argv[4] if len(argv) > 4 else "vendor_a")
+        data = fs.data(fs.lookup(argv[2]))
+        open(argv[3], "wb").write(data)
+        print("%s: %d bytes -> %s (block size %d)" % (argv[2], len(data), argv[3], fs.bs))
     elif cmd == "apr-read":
         for p in apr_read():
             apr_show(p)
