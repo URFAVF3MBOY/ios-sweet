@@ -1,0 +1,103 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 12:10:00 -0500
+Subject: [PATCH] op7t-0191: GPU address window up to 4 GiB (3840 MiB, was 768)
+
+The RedwoodGPU address window was 0x10000000..0x3fffffff, as far as the
+shim's one L2 table reaches. At idle on 2026-11-10 (0170 stats) it already
+held 386 MB in 414 buffers with 58 holes, and 2026-11-08's backboardd crash
+loop ("no addresses left for a buffer of 6-12 MiB") came from running out
+of it. ios-flame (same A640) gives its GPU a far larger window (their 0105
+VA reuse + 0106 more page tables).
+
+The shim's GPU table is T0SZ 25 (1 GiB per L1 entry) and only L1[0] is
+used, so VA 1..4 GiB gets one L2 table per GiB, made on first use from
+kernel memory exactly like the L3 tables (zeroed, cleaned out of the cache,
+then hung in L1; never valid before, so no TLB maintenance). Addresses stay
+below 4 GiB. Worst case 1920 L3 + 3 L2 tables = 7.5 MB, never freed (as
+before). Boot-arg sweetgpuva=MB (768..3840, default 3840); 768 = the old
+window. New log lines: "GPU address window ..", "L2 table for GPU VA N..N+1
+GiB made".
+
+Apply after 0170.
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 7a677f9..4c68f75 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -348,8 +348,19 @@ static void map_framebuffer(void)
+ #define SL_K1_LEN		0x30000UL
+ #define K1_TEST_PA		(SL_K1_PA + 0x20000UL)		/* 16 test pages */
+ #define K1_VA_BASE		0x10000000ULL
+-#define K1_VA_SIZE		0x30000000ULL			/* up to L2 index 511: the shim's one L2 */
+-#define K1_NTABLES		((uint32_t)(K1_VA_SIZE >> 21))	/* one L3 table per 2 MiB */
++/*
++ * 0191: the window runs to 4 GiB (0x10000000-0xffffffff, 3840 MiB; was 768 MiB up to the shim's one L2).
++ * L1[1..3] of the shim's table (GPU_PT_PA, T0SZ 25: 1 GiB per L1 entry) are empty, so VA 1..4 GiB gets
++ * an L2 table per GiB, made on first use like the L3 tables. Neither was ever valid before it is hung,
++ * so no TLB maintenance is needed for it. At 11-10 idle the 768 MiB window already held 386 MB in
++ * 414 buffers with 58 holes, and 11-08's "no addresses left" crash loop came from running out of it.
++ * Boot-arg sweetgpuva=MB (768..3840, default 3840) picks the size; 768 = the old window.
++ * Addresses stay below 4 GiB (Mesa and HackiOS's code only ever saw 32-bit-sized ones).
++ */
++#define K1_VA_MAX		0xf0000000ULL
++#define K1_VA_SIZE		k1_va_size
++#define K1_NTABLES		((uint32_t)(K1_VA_MAX >> 21))	/* one L3 table per 2 MiB */
++#define K1_NL2			4U				/* L1 entries 0..3; [0] is the shim's L2 */
+ #define K1_PTE_RO		(1ULL << 7)			/* AP[2]: read-only */
+ #define K1_FENCE_OFF		0x180U				/* scratch word, after 0084's */
+ #define K1_SMMU_PA		0x02ca0000UL
+@@ -364,6 +375,8 @@ static void map_framebuffer(void)
+ static vm_offset_t sl_k1, k1_cb;
+ static uint64_t *k1_l3[K1_NTABLES];		/* table t (VA 2 MiB block t), kernel VA; NULL: not made yet */
+ static unsigned k1_l3_made;
++static uint64_t k1_va_size = 0x30000000ULL;	/* 0191: set in k1_setup from sweetgpuva */
++static uint64_t *k1_l2[K1_NL2];			/* 0191: L2 for VA GiB 1..3, kernel VA; [0] unused (shim's) */
+ /*
+  * 0170: 1024 free ranges, not 64. With 64, once that many holes existed every further free that
+  * merged with no neighbour was "lost" (counted, never handed out again): the window drained until
+@@ -490,7 +503,28 @@ int sweet_gpu_map(uint64_t va, uint64_t pa, int read_only)
+ 		if (tpa == 0 || (tpa & 0xfffULL))
+ 			return 0;
+ 		k1_clean(tab, 4096);			/* its zeroes in memory before the L2 points at it */
+-		*sp64(GPU_PT_PA + 0x1000 + (uintptr_t)((va >> 21) & 0x1ffU) * 8) = tpa | PTE_TABLE;
++		uint32_t l1i = (uint32_t)(va >> 30);
++		if (l1i == 0) {
++			*sp64(GPU_PT_PA + 0x1000 + (uintptr_t)((va >> 21) & 0x1ffU) * 8) = tpa | PTE_TABLE;
++		} else {
++			/* 0191: VA 1..4 GiB: this GiB's own L2 (kernel memory), made and hung in L1 first */
++			uint64_t *l2 = k1_l2[l1i];
++			if (l2 == NULL) {
++				l2 = k1_new_table();
++				if (l2 == NULL)
++					return 0;
++				uint64_t l2pa = kvtophys((vm_offset_t)l2);
++				if (l2pa == 0 || (l2pa & 0xfffULL))
++					return 0;
++				k1_clean(l2, 4096);
++				*sp64(GPU_PT_PA + (uintptr_t)l1i * 8) = l2pa | PTE_TABLE;
++				__asm__ volatile("dsb sy" ::: "memory");
++				k1_l2[l1i] = l2;
++				printf("HOTDOGB K1: L2 table for GPU VA %u..%u GiB made (0191)\n", l1i, l1i + 1);
++			}
++			l2[(va >> 21) & 0x1ffU] = tpa | PTE_TABLE;
++			k1_clean(&l2[(va >> 21) & 0x1ffU], 8);
++		}
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		k1_l3[t] = tab;
+ 		k1_l3_made++;
+@@ -740,6 +774,15 @@ static int k1_setup(int want_tcr2)
+ 			printf("HOTDOGB K1: setup failed (slice %#lx cb %#lx)\n", (unsigned long)sl_k1, (unsigned long)k1_cb);
+ 			return 0;
+ 		}
++		uint32_t mb = 3840;
++		(void)PE_parse_boot_argn("sweetgpuva", &mb, sizeof(mb));
++		if (mb < 768)
++			mb = 768;
++		if ((uint64_t)mb << 20 > K1_VA_MAX)
++			mb = (uint32_t)(K1_VA_MAX >> 20);
++		k1_va_size = ((uint64_t)mb << 20) & ~0x1fffffULL;
++		printf("HOTDOGB K1: GPU address window %#llx..%#llx (%u MiB, 0191)\n",
++		    K1_VA_BASE, K1_VA_BASE + k1_va_size - 1, mb);
+ 		k1_free[0].start = K1_VA_BASE;
+ 		k1_free[0].size = K1_VA_SIZE;
+ 		k1_nfree = 1;
