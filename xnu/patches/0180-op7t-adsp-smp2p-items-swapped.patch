@@ -1,0 +1,34 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 08:20:00 -0500
+Subject: [PATCH] op7t-0180: audio DSP: SMP2P items the right way round (443 its, 429 ours)
+
+0152 had the audio DSP's SMP2P items swapped: it made 443 as our item
+and waited for 429 from the DSP. The device tree's qcom,smp2p-adsp says
+qcom,smem = <0x1bb 0x1ad> = <443 429>, and that binding lists the
+inbound item first (Linux qcom_smp2p.c: smem_items[SMP2P_INBOUND],
+then [SMP2P_OUTBOUND]): 443 is the DSP's, 429 is ours. The modem path
+(0096) reads its <435 428> the same way (ITEM_SMP2P_IN 435, OUT 428)
+and works. HackiOS vayu (SM8150): .smp2p_theirs = 443, .smp2p_ours = 429.
+
+So far we took 443 for ourselves before the DSP could make it; the DSP
+then died in its init: SMEM 423 "SFR Init: wdog or kernel error
+suspected.", no item from it, on 0178 and on 0179 (which made 443 even
+earlier).
+
+Apply after 0179.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6136,8 +6136,9 @@ sweet_modem_init(void)
+ #define ADSP_CARVEOUT       0x8BE00000u
+ #define ADSP_CARVEOUT_SIZE  0x01E00000u
+ #define ADSP_PID            2
+-#define ADSP_ITEM_SMP2P_OUT 443
+-#define ADSP_ITEM_SMP2P_IN  429
++/* 0180: dt qcom,smp2p-adsp qcom,smem = <443 429> = <inbound outbound>; 0152 had them swapped */
++#define ADSP_ITEM_SMP2P_OUT 429
++#define ADSP_ITEM_SMP2P_IN  443
+ #define ADSP_ITEM_CRASH     423
+ #define ADSP_SMP2P_BIT      10
+ #define ADSP_GLINK_BIT      8
