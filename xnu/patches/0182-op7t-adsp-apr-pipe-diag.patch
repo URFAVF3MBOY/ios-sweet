@@ -1,0 +1,182 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 10:00:00 -0500
+Subject: [PATCH] op7t-0182: audio DSP: APR pipe diagnostics
+
+0181 booted (Intel-built kernel): the DSP comes up as before and the APR
+pipe opens, but packets written to kern.sweetapr get no answer, and the
+send queue stops draining after about 6 packets (ENOSPC at 16 queued):
+the DSP's intents are not given back, as if it never consumed our data.
+The GLINK messages that would say why were silent.
+
+Now logged (first 30 each) and counted: our RX_INTENT_REQ, every data
+send and the intent it went into, the DSP's INTENT, RX_DONE (and those
+that match no intent of ours), RX_INTENT_REQ_ACK. New read-only
+kern.sweetaprstat: one line with the FIFO heads/tails, the APR channel's
+ids and intents, the pipe and those counters.
+
+Apply after 0181.
+---
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -27,6 +27,7 @@ extern int sweet_adsp_start(void);
+ extern int sweet_adsp_stage(void);
+ extern int sweet_adsp_apr_send(const void *p, size_t n);
+ extern int sweet_adsp_apr_recv(void *dst, size_t cap, size_t *got);
++extern int sweet_adsp_stat(char *buf, size_t cap);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ static LCK_GRP_DECLARE(sweet_adsp_group, "sweet-adsp");
+@@ -158,3 +159,19 @@ sysctl_sweetmmio SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetmmio, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetmmio, "S",
+     "one 32-bit register access in GCC / TLMM / QUPv3 wrap0 (0181; root)");
++
++static int
++sysctl_sweetaprstat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[768];
++	int n = sweet_adsp_stat(line, sizeof(line));
++
++	if (n < 0) {
++		return EIO;
++	}
++	return SYSCTL_OUT(req, line, strnlen(line, sizeof(line)) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetaprstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetaprstat, "A",
++    "audio DSP GLINK/APR pipe state (0182)");
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -6494,6 +6494,12 @@ adsp_chan_up(unsigned c)
+ 	return adsp.ch[c].remote_open && adsp.ch[c].open_acked;
+ }
+ 
++
++/* 0182: GLINK traffic that was silent so far, counted and (the first 30 of each) logged */
++static struct {
++	unsigned intent_req_sent, intents_in, intent_ids_in, rx_done, rx_done_reuse, rx_done_unmatched, req_acks, sends;
++} adsp_dbg;
++
+ /* one message on channel c, into one of the DSP's intents; false: no intent for it (yet) */
+ static bool
+ adsp_send(unsigned c, const void *data, uint32_t len)
+@@ -6509,9 +6515,17 @@ adsp_send(unsigned c, const void *data, uint32_t len)
+ 		}
+ 	}
+ 	if (i == adsp.ch[c].ri_count) {
++		if (adsp_dbg.intent_req_sent++ < 30) {
++			ALOG("t=%u ms: glink: no free intent of the DSP's on \"%s\" for %u bytes (%u known): RX_INTENT_REQ",
++			    adsp.ms, adsp.ch[c].name, len, adsp.ch[c].ri_count);
++		}
+ 		adsp_cmd(CMD_RX_INTENT_REQ, adsp.ch[c].lcid, len);
+ 		return false;
+ 	}
++	if (adsp_dbg.sends++ < 30) {
++		ALOG("t=%u ms: glink: data on \"%s\", %u bytes, into intent %u (size %u)", adsp.ms, adsp.ch[c].name, len,
++		    adsp.ch[c].ri[i].id, adsp.ch[c].ri[i].size);
++	}
+ 	adsp.ch[c].ri[i].used = true;
+ 	struct glink_data_hdr h = { { CMD_TX_DATA, adsp.ch[c].lcid, adsp.ch[c].ri[i].id }, len, 0 };
+ 	return adsp_tx_write(&h, sizeof(h), data, len);
+@@ -6797,6 +6811,11 @@ adsp_rx_one(void)
+ 			return false;
+ 		}
+ 		c = adsp_chan_of_rcid(m.p1);
++		if (adsp_dbg.intents_in++ < 30) {
++			ALOG("t=%u ms: glink: INTENT x%u from the DSP for rcid %u (%s)", adsp.ms, m.p2, m.p1,
++			    c >= 0 ? adsp.ch[c].name : "not ours");
++		}
++		adsp_dbg.intent_ids_in += m.p2;
+ 		for (uint32_t i = 0; i < m.p2; i++) {
+ 			uint32_t pair[2];
+ 			adsp_rx_peek(8 + 8 * i, pair, 8);
+@@ -6810,11 +6829,19 @@ adsp_rx_one(void)
+ 		adsp_rx_advance(n);
+ 		break;
+ 	case CMD_RX_DONE:
+-	case CMD_RX_DONE_W_REUSE:
++	case CMD_RX_DONE_W_REUSE: {
++		bool matched = false;
++
+ 		adsp_rx_advance(8);
++		if (m.cmd == CMD_RX_DONE_W_REUSE) {
++			adsp_dbg.rx_done_reuse++;
++		} else {
++			adsp_dbg.rx_done++;
++		}
+ 		if ((c = adsp_chan_of_rcid(m.p1)) >= 0) {
+ 			for (unsigned i = 0; i < adsp.ch[c].ri_count; i++) {
+ 				if (adsp.ch[c].ri[i].id == m.p2) {
++					matched = true;
+ 					if (m.cmd == CMD_RX_DONE_W_REUSE) {
+ 						adsp.ch[c].ri[i].used = false;
+ 					} else {
+@@ -6824,7 +6851,12 @@ adsp_rx_one(void)
+ 				}
+ 			}
+ 		}
++		if (!matched && adsp_dbg.rx_done_unmatched++ < 30) {
++			ALOG("t=%u ms: glink: RX_DONE%s for p1 %u intent %u matched nothing of ours", adsp.ms,
++			    m.cmd == CMD_RX_DONE_W_REUSE ? "_W_REUSE" : "", m.p1, m.p2);
++		}
+ 		break;
++	}
+ 	case CMD_RX_INTENT_REQ:
+ 		adsp_rx_advance(8);
+ 		if ((c = adsp_chan_of_rcid(m.p1)) >= 0) {
+@@ -6833,6 +6865,11 @@ adsp_rx_one(void)
+ 		}
+ 		break;
+ 	case CMD_RX_INTENT_REQ_ACK:
++		if (adsp_dbg.req_acks++ < 30) {
++			ALOG("t=%u ms: glink: RX_INTENT_REQ_ACK p1 %u granted %u", adsp.ms, m.p1, m.p2);
++		}
++		adsp_rx_advance(8);
++		break;
+ 	case CMD_CLOSE_ACK:
+ 	case CMD_SIGNALS:
+ 		adsp_rx_advance(8);
+@@ -7141,6 +7178,34 @@ sweet_adsp_stage(void)
+ 	return adsp_stage;
+ }
+ 
++/* 0182: kern.sweetaprstat, one line of state for the APR pipe's debugging */
++extern "C" int
++sweet_adsp_stat(char *buf, size_t cap)
++{
++	unsigned used = 0, qused = 0;
++
++	for (unsigned i = 0; i < adsp.ch[ADSP_CH_APR].ri_count; i++) {
++		used += adsp.ch[ADSP_CH_APR].ri[i].used;
++	}
++	for (unsigned i = 0; i < adsp.ch[ADSP_CH_QRTR].ri_count; i++) {
++		qused += adsp.ch[ADSP_CH_QRTR].ri[i].used;
++	}
++	return snprintf(buf, cap,
++	    "stage %d ms %u broken %d | glink %u in %u out | tx head %u tail %u, rx head %u tail %u (len %u) | "
++	    "apr: rcid %u lcid %u up %d, DSP intents %u (%u used, first size %u) | qrtr: DSP intents %u (%u used) | "
++	    "APR %u in %u out | pipe live %d queued %u sent %u drops %u | intent reqs %u, intents in %u (%u ids), "
++	    "rx_done %u + reuse %u (%u unmatched), req acks %u, data sends %u\n",
++	    adsp_stage, adsp.ms, adsp.broken, adsp.rx_msgs, adsp.tx_msgs,
++	    adsp.desc ? adsp.desc[1] : 0, adsp.desc ? adsp.desc[0] : 0, adsp.desc ? adsp.desc[3] : 0,
++	    adsp.desc ? adsp.desc[2] : 0, adsp.rx_len,
++	    adsp.ch[ADSP_CH_APR].rcid, adsp.ch[ADSP_CH_APR].lcid, adsp_chan_up(ADSP_CH_APR),
++	    adsp.ch[ADSP_CH_APR].ri_count, used, adsp.ch[ADSP_CH_APR].ri_count ? adsp.ch[ADSP_CH_APR].ri[0].size : 0,
++	    adsp.ch[ADSP_CH_QRTR].ri_count, qused, adsp.apr_in, adsp.apr_out,
++	    apr_pipe.live, apr_pipe.txc, apr_pipe.sent, apr_pipe.drops, adsp_dbg.intent_req_sent, adsp_dbg.intents_in,
++	    adsp_dbg.intent_ids_in, adsp_dbg.rx_done, adsp_dbg.rx_done_reuse, adsp_dbg.rx_done_unmatched,
++	    adsp_dbg.req_acks, adsp_dbg.sends);
++}
++
+ /* 0181: kern.sweetapr. One APR packet (header included) queued for the DSP. */
+ extern "C" int
+ sweet_adsp_apr_send(const void *p, size_t n)
+@@ -7208,4 +7273,5 @@ extern "C" int sweet_adsp_start(void) { return 19; }      /* ENODEV */
+ extern "C" int sweet_adsp_stage(void) { return 0; }
+ extern "C" int sweet_adsp_apr_send(const void *p __unused, size_t n __unused) { return 19; }
+ extern "C" int sweet_adsp_apr_recv(void *p __unused, size_t cap __unused, size_t *got) { *got = 0; return 19; }
++extern "C" int sweet_adsp_stat(char *buf, size_t cap) { return snprintf(buf, cap, "no adsp\n"); }
+ #endif
