@@ -1,0 +1,91 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 10:45:00 -0500
+Subject: [PATCH] op7t-0184: kern.sweetpart, read-only firmware partition bytes for userland
+
+The 7T's speaker amplifiers (two NXP TFA98xx) want their container
+/vendor/firmware/tfa98xx.cnt (patch, settings, speaker presets) loaded
+over I2C before they play. It lives on vendor's ext4; iOS only sees its
+own root. The kernel already reads partitions by name, read-only
+(sweet_ufs_read_part, 0096; 0172 reads bluetooth_a's FAT with it).
+
+kern.sweetpart: in struct sweet_part_req (name, offset, length <= 64 KB),
+out the bytes. Root only; only vendor, dsp, modem and bluetooth (a/b):
+never persist, modemst or fsg (IMEI, calibration). The ext4 is read in
+userland (tools/sweetaudio.py).
+
+Apply after 0183.
+---
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -28,6 +28,7 @@ extern int sweet_adsp_stage(void);
+ extern int sweet_adsp_apr_send(const void *p, size_t n);
+ extern int sweet_adsp_apr_recv(void *dst, size_t cap, size_t *got);
+ extern int sweet_adsp_stat(char *buf, size_t cap);
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ static LCK_GRP_DECLARE(sweet_adsp_group, "sweet-adsp");
+@@ -196,3 +197,62 @@ sysctl_sweetaprstat SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetaprstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetaprstat, "A",
+     "audio DSP GLINK/APR pipe state (0182)");
++
++/*
++ * 0184: kern.sweetpart, read-only bytes of a firmware partition for userland (the amplifiers' container
++ * /vendor/firmware/tfa98xx.cnt is on vendor's ext4; iOS sees only its own root). In: struct sweet_part_req;
++ * out: the bytes. Only the partitions below: never persist / modemst / fsg (IMEI, calibration).
++ */
++struct sweet_part_req {
++	char name[32];
++	uint64_t off;
++	uint32_t len;           /* at most 64 KB */
++	uint32_t reserved;
++};
++
++static const char *const sweet_part_ok[] = {
++	"vendor_a", "vendor_b", "dsp_a", "dsp_b", "modem_a", "modem_b", "bluetooth_a", "bluetooth_b",
++};
++static LCK_MTX_DECLARE(sweet_part_lock, &sweet_adsp_group);
++
++static int
++sysctl_sweetpart SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static uint8_t buf[65536];
++	struct sweet_part_req r;
++	unsigned i;
++	int error;
++
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newptr == USER_ADDR_NULL || req->newlen != sizeof(r) || req->oldptr == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	if ((error = SYSCTL_IN(req, &r, sizeof(r))) != 0) {
++		return error;
++	}
++	r.name[sizeof(r.name) - 1] = '\0';
++	for (i = 0; i < sizeof(sweet_part_ok) / sizeof(sweet_part_ok[0]); i++) {
++		if (strcmp(r.name, sweet_part_ok[i]) == 0) {
++			break;
++		}
++	}
++	if (i == sizeof(sweet_part_ok) / sizeof(sweet_part_ok[0])) {
++		return EACCES;
++	}
++	if (r.len == 0 || r.len > sizeof(buf) || r.len > req->oldlen) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_part_lock);
++	error = sweet_ufs_read_part(r.name, r.off, buf, r.len);
++	if (error == 0) {
++		error = SYSCTL_OUT(req, buf, r.len);
++	}
++	lck_mtx_unlock(&sweet_part_lock);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetpart, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetpart, "S",
++    "read-only bytes of vendor/dsp/modem/bluetooth partitions (0184; root)");
