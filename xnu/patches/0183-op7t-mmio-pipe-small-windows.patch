@@ -1,0 +1,67 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 10:20:00 -0500
+Subject: [PATCH] op7t-0183: kern.sweetmmio maps 64 KB windows, not whole ranges
+
+0181's kern.sweetmmio mapped each allowed range whole on first use. The
+first TLMM access asked ml_io_map for 14 MB and the phone panicked:
+"kmem_alloc(.., 14680064, 0x100021): failed with 3 @vm_kern.c:178"
+(user photo, 2026-11-10). Now an access maps the 64 KB window around it,
+once, up to 32 windows; more gives ENOSPC instead of a panic.
+
+Apply after 0182.
+---
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -106,7 +106,16 @@ static const struct {
+ 	{ 0x00880000, 0x00050000 },     /* QUPv3 wrap0: SE0..7 (0x880000..0x89ffff) and its common block (0x8c0000) */
+ 	{ 0x03000000, 0x00e00000 },     /* TLMM, all four tiles */
+ };
+-static vm_offset_t sweet_mmio_va[sizeof(sweet_mmio_ok) / sizeof(sweet_mmio_ok[0])];
++/*
++ * 0183: mapped in 64 KB windows, on demand. 0181 mapped each range whole on first use, and the 14 MB of TLMM
++ * do not fit the kernel's I/O map: ml_io_map panicked ("kmem_alloc(.., 14680064, ..) failed with 3").
++ */
++#define SWEET_MMIO_WINDOW       0x10000ull
++#define SWEET_MMIO_WINDOWS      32
++static struct {
++	uint64_t pa;
++	vm_offset_t va;
++} sweet_mmio_win[SWEET_MMIO_WINDOWS];
+ 
+ static int
+ sysctl_sweetmmio SYSCTL_HANDLER_ARGS
+@@ -138,14 +147,26 @@ sysctl_sweetmmio SYSCTL_HANDLER_ARGS
+ 		return EACCES;
+ 	}
+ 	lck_mtx_lock(&sweet_mmio_lock);
+-	if (sweet_mmio_va[i] == 0) {
+-		sweet_mmio_va[i] = ml_io_map((vm_offset_t)sweet_mmio_ok[i].pa, (vm_size_t)sweet_mmio_ok[i].len);
+-	}
+-	if (sweet_mmio_va[i] == 0) {
+-		lck_mtx_unlock(&sweet_mmio_lock);
+-		return ENOMEM;
++	{
++		uint64_t base = r.pa & ~(SWEET_MMIO_WINDOW - 1);
++		unsigned w;
++
++		for (w = 0; w < SWEET_MMIO_WINDOWS && sweet_mmio_win[w].va != 0 && sweet_mmio_win[w].pa != base; w++) {
++		}
++		if (w == SWEET_MMIO_WINDOWS) {
++			lck_mtx_unlock(&sweet_mmio_lock);
++			return ENOSPC;          /* 32 windows (2 MB) used: enough for GCC, SE4 and a few pin tiles */
++		}
++		if (sweet_mmio_win[w].va == 0) {
++			sweet_mmio_win[w].va = ml_io_map((vm_offset_t)base, (vm_size_t)SWEET_MMIO_WINDOW);
++			if (sweet_mmio_win[w].va == 0) {
++				lck_mtx_unlock(&sweet_mmio_lock);
++				return ENOMEM;
++			}
++			sweet_mmio_win[w].pa = base;
++		}
++		reg = (volatile uint32_t *)(sweet_mmio_win[w].va + (vm_offset_t)(r.pa - base));
+ 	}
+-	reg = (volatile uint32_t *)(sweet_mmio_va[i] + (vm_offset_t)(r.pa - sweet_mmio_ok[i].pa));
+ 	if (r.op == 1) {
+ 		*reg = r.val;
+ 	} else if (r.op == 2) {
