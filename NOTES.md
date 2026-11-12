@@ -221,7 +221,7 @@
     - Read Local Version: HCI 8 (4.2), manufacturer 0x1d (Qualcomm).
     - LE setup OK.
     - **"Stack: STACK_BUSY -> STACK_READY", "Stack did start"**; about 20 Apple vendor commands answered by the hook; **bluetoothd stays up** (pid 2171, 38 s+, no crash); Settings queries its power state.
-  - **User (2026-11-10): Settings shows Bluetooth ON; a BT speaker appears in the device list (scanning works).** Connecting to the speaker failed.
+  - **User (2026-11-10): Settings shows Bluetooth ON; a BT speaker appears in the device list (scanning works).** (Correction 2026-11-11, user: they never tried to connect the speaker; the 02:48 crash was not a speaker connect, most likely the power-off crash fixed on 11-11.)
     - bluetoothd crashed at 02:48:38 phone time (ips bluetoothd-2026-11-10-024838): SIGSEGV, a call through a NULL pointer from 0x100089094, inside "Terminating stack..." (0x100089030 -> 0x1000f3970 teardown).
     - So something made the stack shut down during the connect, and the teardown then crashed. The trigger is not logged: oslog is live-only and nothing was capturing.
     - Also seen: "Failed to parse AD response with error STATUS 4059" and "Invalid advertising response data size (1 + 172)" (LE advertising reports).
