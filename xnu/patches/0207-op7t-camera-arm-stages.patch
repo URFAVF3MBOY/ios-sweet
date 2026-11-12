@@ -1,0 +1,109 @@
+op7t-0207: camera arm step in stages (kern.sweetcamstop)
+
+0206 froze the phone completely during kern.sweetcam=4, after the 2 MiB
+buffer allocation that failed on 0205 started to succeed; the batched UDP
+log lost the arm step's lines. kern.sweetcamstop=N makes =4 stop after stage
+N and say so (1 PLLs/clocks, 2 buffer, 3 SMMU window, 4 fill, 5 CSIPHY1,
+6 IFE0, 7 CSID0 = all); =4 can be run again with a higher N (the stages are
+repeatable: PLLs/GDSC/buffer/window are only set up once). Run one stage per
+ssh call and read kern.sweetcamlog in between, so a hang points at a stage.
+
+Apply after 0206.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index cf7196b..80e26ed 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -888,6 +888,9 @@ extern int sweet_smmu_bank_fault(int bank, uint32_t *fsr, uint64_t *far);
+ #define PHY_STATUS(n)           (0x8b0 + 4 * (n))
+ 
+ static vm_offset_t cam_phy, cam_live_va;
++static int cam_arm_stop = 7;     /* 0207: kern.sweetcamstop: =4 stops after this stage (1 clocks .. 7 all) */
++#define CAM_ARM_STAGE(n, what) do { cam_say("[stage %d done: %s]", (n), (what)); \
++	if (cam_arm_stop <= (n)) { cam_say("stopping after stage %d (kern.sweetcamstop)", (n)); return; } } while (0)
+ static uint64_t cam_live_pa;
+ static int cam_live_bank = -1;
+ static uint32_t cam_buf_off;
+@@ -975,7 +978,7 @@ cam_live_arm(void)
+ 		return;
+ 	}
+ 
+-	cam_say("PLLs:");
++	cam_say("PLLs (stage 1):");
+ 	if (!cam_pll_trion(0x0000, pll0, "pll0") || !cam_pll_trion(0x3000, pll3, "pll3")) {
+ 		cam_say("stopping (a PLL did not lock)");
+ 		return;
+@@ -993,6 +996,7 @@ cam_live_arm(void)
+ 		cam_say("stopping (a clock did not start)");
+ 		return;
+ 	}
++	CAM_ARM_STAGE(1, "PLLs and clocks");
+ 
+ 	if (cam_live_va == 0) {
+ 		e = sweet_cam_dma_buffer_2m(&cam_live_pa, &cam_live_va);
+@@ -1000,6 +1004,10 @@ cam_live_arm(void)
+ 			cam_say("no 2 MiB buffer (%d)", e);
+ 			return;
+ 		}
++	}
++	cam_say("buffer %#llx", cam_live_pa);
++	CAM_ARM_STAGE(2, "2 MiB buffer");
++	if (cam_live_bank < 0) {
+ 		cam_live_bank = sweet_smmu_window_group(0x840, 0x620, cam_live_pa);
+ 	}
+ 	cam_say("buffer %#llx (2 MiB), IFE SMMU group 0x840/0x620 -> window bank %d", cam_live_pa, cam_live_bank);
+@@ -1007,10 +1015,12 @@ cam_live_arm(void)
+ 		cam_say("stopping (no bounded SMMU window)");
+ 		return;
+ 	}
++	CAM_ARM_STAGE(3, "SMMU window");
+ 	for (uint32_t i = 0; i < CAM_LIVE_SIZE; i += 4) {
+ 		*(volatile uint32_t *)(cam_live_va + i) = 0xa5a5a5a5u;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	CAM_ARM_STAGE(4, "buffer filled with 0xa5");
+ 
+ 	cam_phy = ml_io_map(CAM_CSIPHY1_PA, 0x1000);
+ 	cam_ife = ml_io_map(CAM_IFE0_PA, 0x4000);
+@@ -1038,6 +1048,7 @@ cam_live_arm(void)
+ 		wr32(cam_phy, PHY_CMN(n), 0);
+ 	}
+ 	cam_say("  lanes 0/1/2 + clock on, settle %#x", PHY_SETTLE);
++	CAM_ARM_STAGE(5, "CSIPHY1");
+ 
+ 	cam_say("IFE0:");
+ 	wr32(cam_ife, VFE_IRQ_MASK_0, 1u << 31);
+@@ -1066,6 +1077,7 @@ cam_live_arm(void)
+ 	wr32(cam_ife, VFE_BUS_WM_FRAME_INC(0), 0);
+ 	wr32(cam_ife, VFE_BUS_WM_CFG(0), 1u | (1u << 1));
+ 	wr32(cam_ife, VFE_REG_UPDATE_CMD, 1u << 1);
++	CAM_ARM_STAGE(6, "IFE0 WM0");
+ 
+ 	cam_say("CSID0:");
+ 	wr32(cam_csid, CSID_TOP_IRQ_CLEAR, 1u);
+@@ -1179,6 +1191,25 @@ sysctl_sweetcambuf SYSCTL_HANDLER_ARGS
+ 	return SYSCTL_OUT(req, chunk, n);
+ }
+ 
++static int
++sysctl_sweetcamstop SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = cam_arm_stop, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error == 0 && changed) {
++		if (value < 1 || value > 7) {
++			return EINVAL;
++		}
++		cam_arm_stop = value;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcamstop, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcamstop, "I",
++    "0207: kern.sweetcam=4 stops after stage N (1 clocks, 2 buffer, 3 SMMU window, 4 fill, 5 CSIPHY, 6 IFE, 7 CSID = all)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweetcambuf, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweetcambuf, "S", "camera capture buffer (0205): write a u32 offset, read 4096 bytes from it");
+ 
