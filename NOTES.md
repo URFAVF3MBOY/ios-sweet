@@ -35,6 +35,16 @@
   - **Boot-line room:** the user prefers hard-coding over raising the limit. BOOT_LINE_LENGTH 608 is the size of the boot_args CommandLine that the kernel, shim and mkpayload all share.
     - Plan: a kernel patch giving the 7T defaults to the always-set kernel-only args (sweetk1, sweetk1b, sweetgpu4, sweetmodem, sweetwifi, sweetusb=3, sweetscan, sweetgpudirty=0, sweetfb_noconsole, sweetfb_hz=60, sweetgpu4delay=0, ...). About 70+ bytes free, so sweetddr=1 and the bluetoothd hook fit together.
     - The shim reads sweetgpu, sweetgmu, sweetgpufreq, sweetcpufreq, sweetddr (and g3*/mdp*/trust ones not in the line): those stay on the line.
+- **2026-11-11: 0192 built-in boot-arg defaults, booted (observed).** Patch `xnu/patches/0192-op7t-boot-arg-defaults.patch` (pexpert/gen/bootargs.c, base xnu-8796.141.3): an argument missing from the boot line is parsed from a built-in 7T string; the line wins, NAME=0 turns a default off.
+  - Defaults: sweetfb_noconsole=1 sweetfb_hz=60 sweetgpu4=1 sweetk1=1 sweetk1b=1 sweetgpu4delay=0 sweetscan=1 sweetmodem=1 sweetwifi=1 sweetusb=3 sweetgpudirty=0 sweetbdf=bdwlan.b0a.
+  - CI run 43135684723 (commit c033296), kernel a5010798 now in `xnu/out` (0191 kept as `.0191`).
+  - **Image `shim/out/shim-boot-0192-7g-bt-ddr.img`**: line in scratchpad `bootline-0192.txt`, **440 bytes** (was 597). It has the bluetoothd hook and `sweetddr=1`; the shim args, injection lists and sweetwifi5g are still on the line.
+  - Checked on the phone:
+    - USB RNDIS answers (sweetusb=3 from the default).
+    - Wi-Fi driver up and scanning, Naja2025 heard at -54..-60 dBm, so bdwlan.b0a is loaded.
+    - GPU runs: `addresses: ... longest run free 3608 MB`; DDR on, 13952 KB per submission in 431 us.
+    - `bt_up.sh` (plus the usual "File exists" re-bootstrap, scratchpad run2.sh) -> **bluetoothd "Stack did start"** with the hook.
+  - **Wi-Fi auto-join never worked** (user, 2026-11-11: they always rejoin by hand). The log shows "Join candidate ... not allowed (Below minimum RSSI threshold)" for some Naja2025 BSSIDs even at -54/-60. Not a 0192 regression; open.
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
