@@ -2,7 +2,12 @@
 
 ## Agent handoff / active work (2026-11-09, latest)
 
-### >>> RESUME HERE (2026-11-11, user switching Claude accounts) <<<
+### >>> RESUME HERE (2026-11-12, latest) <<<
+- **Phone now runs 0204** (`shim/out/shim-boot-0204-7g-bt-ddr.img`; kernels 0196..0203 kept as `xnu/out/kernel.development.sweet.0NNN`). Every image since 0196 uses the 0192 line (440 bytes; re-extractable from any of these images' payload) + `shim/out/sweet-bt-7g.adt` + `--ramdisk shim/out/prep-cores.drop`, repacked on the previous image with `tools/repack_bootv2.py`. Reboot to fastboot over ssh: `sysctl -w kern.sweetreboot=2`.
+- **Today (2026-11-12):** 0197 BT from boot (phone pairing checked in logs), slim bthook (built with `C:\Program Files\LLVM\bin`), 0198 scaled scanout (whole iPhone X picture, user: looks right), 0199 DisplayPipePlaneBaseAlignment dict, 0200 sandbox container ENOENT (Safari.History/syncdefaultsd crash loops gone), **camera 0201-0204** (see "2026-11-12: CAMERA bring-up": IMX586 answers, I2C pipe, capture path proven with the CSID test pattern, sensor streams on defaults; stopped before real frames until a bounded SMMU map exists).
+- **Open:** Safari still black ~25 s (not WebKit's layout; next: spindump MobileSafari/backboardd while black); video: H264SW SIGBUS in mediaserverd; app-launch hang right after boot sometimes (runningboardd's OSLaunchdJob start never returns; reboot clears it); first-0197-boot crash at ~22:35 unexplained. CI: the Intel workflow (`gh workflow run xnu-intel.yml`) often gets a runner when the arm64 one queues.
+
+### >>> 2026-11-11 resume pointer (older) <<<
 - **0197 BOOTED: Bluetooth comes up from the kernel at boot (2026-11-12).** Patch `xnu/patches/0197-op7t-bt-from-boot.patch` (commit e0c6379, CI run 43157518478, kernel 82716d28, 0196 kept as `xnu/out/kernel.development.sweet.0196`), image **`shim/out/shim-boot-0197-7g-bt-ddr.img`** (the 0192 line, same recipe as 0196).
   - What moved into sweet_bt.c / kern_exec.c: a boot thread (sweet_bt_init from sweet_ufs_init; sweetbtdelay 12 s, up to 3 tries 10 s apart; then kern.sweetbt=1 says EALREADY), the kernel control also as `com.sweet.bt`, bluetoothd exec'd with `BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt,115200` (next to sweetinject's variable), bthook's HCI edits in the io thread (whole H4 packets; 0x1002 octet 18 bit 3, 0x0C5B status 0, vendor-command 4-byte status-1 replies -> 36 bytes status 0 + first param byte). Boot-args: sweetbt=0, sweetbtdelay=N, sweetbtfix=0, sweetbtenv=0.
   - Made without a compiler (none on this PC): sweet_bt.c rebuilt from 0168-0178 in Git Bash, kern_exec.c / sweet_ufs.c as stand-ins built from 0091+0112 / 0196's hunks; `git apply` checked on those. CI compiled it first try.
