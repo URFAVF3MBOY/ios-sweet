@@ -21,6 +21,7 @@
                               speakers, SECS (0 = until stopped), GAIN_DB (default -12, at most 0); amps unmuted
                               while it runs. Needs the same set-up as play-tone, kern.sweetaudiodev=1 and the plug-in.
   sweetaudio.py feed-stat     kern.sweetaudiostat
+  sweetaudio.py dsp-reset     close a stream/path/buffer map a killed feed or play-tone left open in the DSP
   sweetaudio.py buf-info      kern.sweetaudiobuf (0194): the DSP's buffer, its PA and the SMMU bank of stream 0x1b21
   sweetaudio.py play-tone [SECS] [DBFS]  1 kHz (default 3 s at -30 dBFS, never above -12) through ASM session 1 ->
                               ADM (no processing) -> port 0x1006; the amps unmuted once the DSP takes the first
@@ -360,10 +361,11 @@ def tfa_up():
         tfa_status(addr, side)
 
 
-def tfa_mute(on):
+def tfa_mute(on, show=True):
     for addr, side in TFAS:
         tfa_bf(addr, 0x00, 3, 1, 0 if on else 1)    # AMPE
-        tfa_status(addr, side)
+        if show:
+            tfa_status(addr, side)
 
 
 def tfa_down():
@@ -489,6 +491,7 @@ ASM_SESSION_EVENT_RX_UNDERFLOW, ASM_STREAM_CMD_CLOSE = 0x00010c17, 0x00010bcd
 ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 = 0x00010c68, 0x00010da5
 SESSION, STREAM_PORT = 1, 1 << 8 | 1
 WRITE_TOKEN = 0x80000000
+MAP_FILE = "/var/tmp/sweetaudio.map"             # the live buffer map's handle, for dsp-reset
 PERIOD_FRAMES = 960                             # 20 ms at 48 kHz
 PERIOD_BYTES = PERIOD_FRAMES * 4                # 2 channels of 16 bits; one 4096-byte page per period
 PERIODS = 8
@@ -565,6 +568,10 @@ def play_stream(source, secs=3.0, unmute=True, report=0):
     if not m:
         return False
     handle = m[0]
+    try:                                        # for dsp-reset, should this process die without its cleanup
+        open(MAP_FILE, "w").write("%#x\n" % handle)
+    except OSError:
+        pass
     copp = None
     opened = False
     unmuted = False
@@ -636,6 +643,10 @@ def play_stream(source, secs=3.0, unmute=True, report=0):
         if copp is not None:
             apr_call("device path closed", APR_SVC_ADM, copp, ADM_CMD_DEVICE_CLOSE_V5, b"")
         apr_call("buffer unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, struct.pack("<I", handle))
+        try:
+            os.unlink(MAP_FILE)
+        except OSError:
+            pass
 
 
 def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
@@ -671,6 +682,10 @@ def feed(secs=0.0, gain_db=-12.0):
     import array
     scale = 10 ** (gain_db / 20)
     stats = {"short": 0, "clipped": 0}
+    # the amps on only while there is sound: on at the first loud-enough period, off after QUIET_PERIODS of silence
+    # (no hiss while nothing plays; as HackiOS's watcher does)
+    amp = {"on": False, "quiet": 0}
+    QUIET_PERIODS = 150                         # 3 s
 
     def source():
         got = sysctl("kern.sweetaudioring", oldlen=PERIOD_BYTES)
@@ -678,12 +693,25 @@ def feed(secs=0.0, gain_db=-12.0):
             stats["short"] += 1
             got += bytes(PERIOD_BYTES - len(got))
         a = array.array("h", got)
+        peak = 0
         for i, v in enumerate(a):
             w = int(v * scale)
             if w > 32767 or w < -32768:
                 stats["clipped"] += 1
                 w = 32767 if w > 0 else -32768
             a[i] = w
+            if abs(w) > peak:
+                peak = abs(w)
+        if peak > 8:
+            amp["quiet"] = 0
+            if not amp["on"]:
+                tfa_mute(False, show=False)
+                amp["on"] = True
+        elif amp["on"]:
+            amp["quiet"] += 1
+            if amp["quiet"] >= QUIET_PERIODS:
+                tfa_mute(True, show=False)
+                amp["on"] = False
         return a.tobytes()
     import signal
 
@@ -692,10 +720,33 @@ def feed(secs=0.0, gain_db=-12.0):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)  # (ignored by default in a background job: set it again)
     print("feed: %s; gain %+.1f dB" % (feed_stat(), gain_db), flush=True)
-    sysctl("kern.sweetaudioring", oldlen=4096)      # (old frames out)
-    ok = play_stream(source, secs, True, report=5)
+    while sysctl("kern.sweetaudioring", oldlen=4096):   # (old frames out)
+        pass
+    tfa_mute(True, show=False)
+    try:
+        ok = play_stream(source, secs, False, report=int(os.environ.get("SWEET_FEED_REPORT", "0")))
+    finally:
+        tfa_mute(True, show=False)
     print("feed: %d periods short of iOS frames (padded), %d samples clipped" % (stats["short"], stats["clipped"]))
     return ok
+
+
+def dsp_reset():
+    """Close what a stream left behind when its process died without its cleanup (SIGKILL, a crash): ASM session 1,
+    COPP 0, and the buffer map whose handle play_stream wrote to MAP_FILE. Refusals are fine (nothing was open)."""
+    apr_read()
+    apr_call("leftover stream closed", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_CLOSE, b"")
+    apr_call("leftover device path closed", APR_SVC_ADM, 0, ADM_CMD_DEVICE_CLOSE_V5, b"")
+    try:
+        handle = int(open(MAP_FILE).read().strip(), 16)
+    except (OSError, ValueError):
+        return
+    apr_call("leftover buffer map %#x removed" % handle, APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS,
+             struct.pack("<I", handle))
+    try:
+        os.unlink(MAP_FILE)
+    except OSError:
+        pass
 
 
 def afe_stop():
@@ -757,6 +808,8 @@ def main(argv):
         play_tone(float(argv[2]) if len(argv) > 2 else 3.0, float(argv[3]) if len(argv) > 3 else -30.0)
     elif cmd == "feed":
         feed(float(argv[2]) if len(argv) > 2 else 0.0, float(argv[3]) if len(argv) > 3 else -12.0)
+    elif cmd == "dsp-reset":
+        dsp_reset()
     elif cmd == "feed-stat":
         print(feed_stat())
     elif cmd == "afe-stop":

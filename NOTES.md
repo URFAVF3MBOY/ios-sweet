@@ -124,6 +124,23 @@
     - Make that a boot job (launchd plist or prep.sh); create the node at boot (kernel init) so no mediaserverd restart is needed.
     - Amps: mute when silent (HackiOS's guard/watcher) instead of always-on hiss.
     - Gain/tuning; speaker protection; the microphone (Codec device, /dev/redwood-mic).
+- **2026-11-11: Bluetooth + speakers start by themselves at boot (script version), logging quiet.**
+  - `tools/sweet-media.sh` -> phone `/var/jb/sweet-media.sh`, started in the background from prep.sh (`/private/preboot/jb/procursus/prep.sh`, line added before its first `exit 0`; old copy `prep.sh.before-media`). Steps:
+    1. Wait for SpringBoard/bluetoothd/mediaserverd (+10 s).
+    2. `bt_up.sh`.
+    3. DSP (`kern.sweetadsp=1`), amps, pins, port; `kern.sweetaudiodev=1` + `killall mediaserverd`.
+    4. The feeder, restarted with `dsp-reset` whenever it ends.
+    5. One line per step to `/var/root/sweet-media.log` (rewritten each boot).
+  - Helpers: `/var/jb/usr/libexec/sweet-audio/{sweetaudio.py,tfacnt.py,tfa98xx.cnt}` (SWEET_TFA_CNT), `/var/jb/usr/libexec/bt_up.sh`.
+  - **Feeder:** amps on only while there is sound (on at the first period above 8, off after 3 s of silence); no status lines unless SWEET_FEED_REPORT=N. The buffer-map handle is kept in /var/tmp/sweetaudio.map for `dsp-reset` (closes ASM session 1, COPP 0, the map left by a killed run).
+  - **Quiet logging:** bthook logs only "loaded" and the H4-entry error unless BTHOOK_LOG is set. bluetool_stub.py logs only its failure unless BLUETOOL_STUB_LOG is set, and the plist's StandardErrorPath is now /dev/null. Old /var/root and /var/tmp test logs removed.
+  - **Hands-off reboot (19:45):**
+    - 19:46:17 bluetooth up; 19:46:21 audio set up; 19:46:22 node + mediaserverd; 19:46:33 feeder.
+    - bluetoothd stable, iOS writing (500k frames).
+  - **User's direction next (2026-11-11): move this into the kernel instead of scripts** (instant, less reliance on files in the image):
+    - **audio:** DSP start, TFA9874 set-up over I2C (container values built in), pins, AFE, ASM stream fed from /dev/redwood-audio at boot, amp gating, as HackiOS's in-kernel sound=5.
+    - **BT:** power + firmware at boot, a second kctl name, BT_HCI_TRANSPORT through sweetinject, the HCI fix-ups in sweet_bt.c's I/O thread.
+    - **Stays userland:** the HAL plug-in + VirtualAudio (files only), the BlueTool XPC stand-in, a tiny hook for bluetoothd's H4 teardown slot.
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 

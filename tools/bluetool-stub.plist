@@ -19,7 +19,7 @@
 	<key>UserName</key>
 	<string>mobile</string>
 	<key>StandardErrorPath</key>
-	<string>/var/tmp/bluetool_stub.log</string>
+	<string>/dev/null</string>
 	<key>EnableTransactions</key>
 	<false/>
 </dict>

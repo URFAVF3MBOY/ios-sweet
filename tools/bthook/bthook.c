@@ -30,6 +30,10 @@ extern const char *_dyld_get_image_name(uint32_t);
 #define LOG_NOTICE 5
 
 
+/* quiet unless BTHOOK_LOG is set in bluetoothd's environment: every H4 packet and option otherwise reaches the log */
+static int verbose;
+#define VLOG(...) do { if (verbose) syslog(__VA_ARGS__); } while (0)
+
 static int bt_fd = -1;
 static int bt_fresh;	/* new H4 connection: drop the receive parser's and queue's leftovers before the next read */
 static unsigned bt_logged;
@@ -54,7 +58,7 @@ static int my_set(int s, int lvl, int opt, const void *v, socklen_t l)
 		int e = r < 0 ? *__error() : 0;
 		char h[160];
 		hex(h, sizeof h, v, l);
-		syslog(LOG_NOTICE, "bthook: setsockopt fd %d opt %#x len %u -> %d errno %d%s : %s", s, (unsigned)opt, l, r, e,
+		VLOG(LOG_NOTICE, "bthook: setsockopt fd %d opt %#x len %u -> %d errno %d%s : %s", s, (unsigned)opt, l, r, e,
 		    (r < 0 && e == ENOPROTOOPT) ? " (faked 0)" : "", h);
 		if (r < 0 && e == ENOPROTOOPT) {
 			return 0;
@@ -72,7 +76,7 @@ static int my_get(int s, int lvl, int opt, void *v, socklen_t *l)
 		int e = r < 0 ? *__error() : 0;
 		char h[160];
 		hex(h, sizeof h, r == 0 ? v : NULL, l ? *l : 0);
-		syslog(LOG_NOTICE, "bthook: getsockopt fd %d opt %#x want %u -> %d errno %d len %u : %s", s, (unsigned)opt, want, r, e,
+		VLOG(LOG_NOTICE, "bthook: getsockopt fd %d opt %#x want %u -> %d errno %d len %u : %s", s, (unsigned)opt, want, r, e,
 		    l ? *l : 0, h);
 		if (r < 0 && e == ENOPROTOOPT && v != NULL && l != NULL) {
 			/* faked answer: zeros of the size asked for (what bluetoothd does with it shows next) */
@@ -80,7 +84,7 @@ static int my_get(int s, int lvl, int opt, void *v, socklen_t *l)
 				((uint8_t *)v)[i] = 0;
 			}
 			*l = want;
-			syslog(LOG_NOTICE, "bthook: getsockopt opt %#x faked: %u zero bytes", (unsigned)opt, want);
+			VLOG(LOG_NOTICE, "bthook: getsockopt opt %#x faked: %u zero bytes", (unsigned)opt, want);
 			return 0;
 		}
 		*__error() = e;
@@ -130,7 +134,7 @@ static int my_ioctl(int fd, unsigned long req, ...)
 			name[i] = 0;
 			r = ioctl(fd, req, arg);
 			e = r < 0 ? *__error() : 0;
-			syslog(LOG_NOTICE, "bthook: CTLIOCGINFO %s -> %s: %d errno %d id %u", BT_FAKE_NAME, BT_KERNEL_NAME, r, e,
+			VLOG(LOG_NOTICE, "bthook: CTLIOCGINFO %s -> %s: %d errno %d id %u", BT_FAKE_NAME, BT_KERNEL_NAME, r, e,
 			    *(uint32_t *)arg);
 			*__error() = e;
 			return r;
@@ -144,12 +148,12 @@ static void tap(const char *dir, int fd, const void *b, ssize_t n)
 {
 	char h[160];
 
-	if (fd != bt_fd || n <= 0 || bt_logged >= 400) {
+	if (!verbose || fd != bt_fd || n <= 0 || bt_logged >= 400) {
 		return;
 	}
 	bt_logged++;
 	hex(h, sizeof h, b, (size_t)n);
-	syslog(LOG_NOTICE, "bthook: %s %ld: %s", dir, (long)n, h);
+	VLOG(LOG_NOTICE, "bthook: %s %ld: %s", dir, (long)n, h);
 }
 
 /*
@@ -193,10 +197,10 @@ static void pk_done(void)
 		uint16_t op = (uint16_t)(p[4] | p[5] << 8);
 
 		if (op == 0x1002 && pk.n > 7 + 18 && !(p[7 + 18] & 0x08)) {
-			syslog(LOG_NOTICE, "bthook: supported commands octet 18 %#x -> %#x (0x0C5B)", p[7 + 18], p[7 + 18] | 0x08);
+			VLOG(LOG_NOTICE, "bthook: supported commands octet 18 %#x -> %#x (0x0C5B)", p[7 + 18], p[7 + 18] | 0x08);
 			p[7 + 18] |= 0x08;
 		} else if (op == 0x0c5b && p[6] != 0) {
-			syslog(LOG_NOTICE, "bthook: 0x0C5B status %#x -> 0", p[6]);
+			VLOG(LOG_NOTICE, "bthook: 0x0C5B status %#x -> 0", p[6]);
 			p[6] = 0;
 		} else if ((op >> 10) == 0x3f && p[2] == 4 && p[6] == 0x01) {
 			uint8_t out[7 + VSC_PAD];
@@ -208,7 +212,7 @@ static void pk_done(void)
 			out[6] = 0;
 			out[7] = vsc_first[op & 63];
 			if (vsc_said++ < 60) {
-				syslog(LOG_NOTICE, "bthook: VSC %#06x (first byte %#x): status 1 -> 0, + %d bytes", op, out[7], VSC_PAD);
+				VLOG(LOG_NOTICE, "bthook: VSC %#06x (first byte %#x): status 1 -> 0, + %d bytes", op, out[7], VSC_PAD);
 			}
 			q_put(out, sizeof out);
 			pk.n = pk.need = 0;
@@ -243,7 +247,7 @@ static void rx_feed(const uint8_t *b, ssize_t n)
 		}
 		if (pk.need != 0 && pk.n >= pk.need) {
 			if (pk.need > sizeof pk.buf) {	/* too big to hold: should not happen; drop the framing */
-				syslog(LOG_NOTICE, "bthook: packet of %u bytes too big, passed on", pk.need);
+				VLOG(LOG_NOTICE, "bthook: packet of %u bytes too big, passed on", pk.need);
 				pk.n = pk.need = 0;
 				continue;
 			}
@@ -271,7 +275,7 @@ static ssize_t h4_read(int fd, void *b, size_t n, int f, int use_recv)
 
 	if (bt_fresh) {
 		if (pk.n != 0 || qn != 0) {
-			syslog(LOG_NOTICE, "bthook: new connection: dropped %u queued + %u partial bytes from the old one", qn, pk.n);
+			VLOG(LOG_NOTICE, "bthook: new connection: dropped %u queued + %u partial bytes from the old one", qn, pk.n);
 		}
 		pk.n = pk.need = 0;
 		qh = qn = 0;
@@ -358,7 +362,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
  */
 static int h4_slot60(void)
 {
-	syslog(LOG_NOTICE, "bthook: H4 transport +0x60 called (stack teardown): nothing to do");
+	VLOG(LOG_NOTICE, "bthook: H4 transport +0x60 called (stack teardown): nothing to do");
 	return 0;
 }
 
@@ -392,24 +396,25 @@ static void fix_h4_teardown(void)
 		for (const uint64_t *w = (const uint64_t *)(const void *)(mh + 0x834000);
 		    w < (const uint64_t *)(const void *)(mh + 0x848000) && hits < 4; w++) {
 			if (*w == (uint64_t)(uintptr_t)name) {
-				syslog(LOG_NOTICE, "bthook: pointer to \"%s\" at +%#lx ([-1] %#llx)", name,
+				VLOG(LOG_NOTICE, "bthook: pointer to \"%s\" at +%#lx ([-1] %#llx)", name,
 				    (unsigned long)((const uint8_t *)w - mh), (unsigned long long)w[-1]);
 				hits++;
 			}
 		}
-		syslog(LOG_NOTICE, "bthook: name bytes %02x %02x %02x, %u pointers found", name[0], name[1], name[2], hits);
+		VLOG(LOG_NOTICE, "bthook: name bytes %02x %02x %02x, %u pointers found", name[0], name[1], name[2], hits);
 		syslog(LOG_NOTICE, "bthook: H4 transport entry not where 20F66 has it (mh %p, [0] %#llx, [1] %#llx, want %p): "
 		    "teardown slot left alone", mh, (unsigned long long)ent[0], (unsigned long long)ent[1], name);
 		return;
 	}
 	if (ent[12] == 0) {
 		ent[12] = (uint64_t)(uintptr_t)h4_slot60;
-		syslog(LOG_NOTICE, "bthook: H4 transport +0x60 was NULL: filled (power-off crash fix)");
+		VLOG(LOG_NOTICE, "bthook: H4 transport +0x60 was NULL: filled (power-off crash fix)");
 	}
 }
 
 __attribute__((constructor)) static void init(void)
 {
+	verbose = getenv("BTHOOK_LOG") != NULL;
 	fix_h4_teardown();
 	if (getenv("BT_HCI_TRANSPORT") == NULL) {
 		setenv("BT_HCI_TRANSPORT", "H4:POSIX:" BT_FAKE_NAME ",115200", 1);

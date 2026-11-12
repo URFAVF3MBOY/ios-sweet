@@ -14,7 +14,7 @@ compiler: the two event handlers are hand-made global blocks.
 Run by launchd as the job com.apple.BlueTool (MachServices com.apple.BlueTool), see tools/bluetool-stub.plist.
 Every request is logged to stderr in full.
 """
-import ctypes, sys
+import ctypes, os, sys
 
 xpc = ctypes.CDLL('/usr/lib/system/libxpc.dylib')
 dispatch = ctypes.CDLL('/usr/lib/system/libdispatch.dylib')
@@ -48,8 +48,12 @@ TYPE_DICTIONARY = ctypes.addressof(ctypes.c_char.in_dll(xpc, '_xpc_type_dictiona
 GLOBAL_BLOCK_ISA = ctypes.addressof(ctypes.c_char.in_dll(blocks_rt, '_NSConcreteGlobalBlock'))
 
 
-def log(*a):
-    print('bluetool_stub:', *a, file=sys.stderr, flush=True)
+VERBOSE = bool(os.environ.get('BLUETOOL_STUB_LOG'))     # quiet unless set (sweet-media.sh starts it at every boot)
+
+
+def log(*a, always=False):
+    if VERBOSE or always:
+        print('bluetool_stub:', *a, file=sys.stderr, flush=True)
 
 
 def describe(obj):
@@ -116,7 +120,7 @@ def on_listener_event(obj):
 def main():
     listener = xpc.xpc_connection_create_mach_service(b'com.apple.BlueTool', None, XPC_CONNECTION_MACH_SERVICE_LISTENER)
     if not listener:
-        log('cannot listen on com.apple.BlueTool')
+        log('cannot listen on com.apple.BlueTool', always=True)
         sys.exit(1)
     xpc.xpc_connection_set_event_handler(listener, make_block(on_listener_event))
     xpc.xpc_connection_resume(listener)
