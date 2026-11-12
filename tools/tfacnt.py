@@ -89,5 +89,43 @@ def dump(path):
             else:
                 print("  %2d: %s" % (k, item(data, o, tt)))
 
+def lists(path):
+    """{i2c address: (device writes, {profile name: writes})}; a write is ("reg", reg, value, mask) or
+    ("bf", reg, pos, length, value). Other items (patch, files, default, live-data) are left out: on a TFA9874
+    (probus, no CoolFlux) the patch is a dummy and the files are messages for the host DSP's speaker protection."""
+    data = open(path, "rb").read()
+    out = {}
+
+    def writes(off, length, first):
+        got = []
+        for k in range(length):
+            o, tt = ptr(data, off + first + 4 * k)
+            if tt == 2:
+                addr, value, mask = struct.unpack_from("<BHH", data, o)
+                got.append(("reg", addr, value, mask))
+            elif tt == 16:
+                value, field = struct.unpack_from("<HH", data, o)
+                got.append(("bf", field >> 8, field >> 4 & 0xf, (field & 0xf) + 1, value))
+        return got
+
+    at = 46
+    while at + 4 <= len(data):
+        off, t = ptr(data, at)
+        at += 4
+        if t == 6 or off == 0xa5a5a5:
+            break
+        if t != 0:
+            continue
+        length, bus, dev, func, devid = struct.unpack_from("<BBBBI", data, off)
+        profiles = {}
+        for k in range(length):
+            o, tt = ptr(data, off + 12 + 4 * k)
+            if tt == 1:
+                name_off, _ = ptr(data, o + 4)
+                profiles.setdefault(cstr(data, name_off), writes(o, data[o], 8))
+        out[dev] = (writes(off, length, 12), profiles)
+    return out
+
+
 if __name__ == "__main__":
     dump(sys.argv[1] if len(sys.argv) > 1 else "backup/vendor-audio/tfa98xx.cnt")

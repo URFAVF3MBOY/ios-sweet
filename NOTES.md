@@ -62,6 +62,26 @@
     - Reset pins 37/100 read 0 (TFA reset is active-high, so out of reset).
     - **tfa 0x34 (right) and 0x35 (left): register 0x03 = 0x0c74 -> TFA9874** (the low byte is the type: 0x74 = TFA9874, 0x94 would be TFA9894), even though the vendor module is named audio_tfa9894.ko (NXP's driver covers both).
     - Next: TFA9874 init from the container (backup/vendor-audio/tfa98xx.cnt; NXP open tfa98xx tfa2 rules: patch/config/preset for the 9874), MI2S pins 137-142 to function 1, then the data path (AFE port 0x1006 SD1, ASM stream).
+- **2026-11-11: both speaker amps (TFA9874) run on our I2S clock, muted (userland only, 0193 boot).**
+  - Sources: NXP's open tfa98xx driver (Goodix-vas/tfa98xx on GitHub): tfa_init.c `tfa9874_specific` (rev 0x0c74 "V1.16" values), tfa_dsp.c `tfaRunStartup`, `tfa_dev_set_state`, `tfa98xx_set_mute_tfa2` (TFA2 mute = AMPE). The TFA9874 is a "probus" device without CoolFlux: speaker protection would run on the host DSP, so plain playback needs no patch or .msg files.
+  - **Tools:**
+    - `tools/tfacnt.py` has `lists()`: per-device and per-profile register/bitfield writes.
+    - `tools/sweetaudio.py` has new commands: `mi2s-pins` (gpio137 SCK, 138 WS, 140 SD1, function 1, 8 mA), `afe-start LINES BITS`, `tfa-init [PROFILE]`, `tfa-up`, `tfa-mute`/`tfa-unmute`/`tfa-down`/`tfa-status`.
+    - On the phone: /var/root/{sweetaudio.py, tfacnt.py, tfa98xx.cnt}, run with `SWEET_TLMM=1`.
+  - **Sequence that worked:**
+    1. `sysctl -w kern.sweetadsp=1` (stage 6). `apr-state` said ENXIO right after; a minute later it answered AVCS 1.
+    2. `tfa-init`: I2CR, keys, the 13 rev writes, 51 device + 6 speaker-profile writes; PWDN 1, AMPE 0.
+    3. `mi2s-pins`.
+    4. `afe-start 2 32`: clock 3.072 MHz, I2S 32-bit stereo on SD1, port started (all "done"). The container sets 32-bit slots/samples (TDMSLLN/TDMSSIZE 31, TDMNBCK 2); amp 0x34 takes slot 0, 0x35 slot 1.
+    5. `tfa-up` (MANSCONF 1, PWDN 0).
+  - **Result, both amps:** CLKS 1, PLLS 1 (PLL locked to our BCK), MANSTATE 9 (operating), AMPS 1 / SWS 1, MANALARM 0.
+    - The chip set AMPE 1 by itself on entering operating (the amp ran on the DSP's silence; no stream is open).
+    - `tfa-mute` (AMPE 0) holds: SWS 0, still MANSTATE 9 with clocks locked.
+    - Reg 0x10 reads 0x0016 (OTDS/UVDS bits set) with MANALARM 0: those seem to be OK-polarity flags (guess).
+  - **No sound yet: nothing feeds the AFE port.** Next is the data path:
+    - an ASM stream (open, shared-memory map, write PCM) -> ADM (copp) -> AFE port 0x1006.
+    - It needs memory the ADSP can reach (apps SMMU stream for LPASS, as vayu_audio.c does): a kernel patch.
+    - Then a quiet test tone (low amplitude), unmute.
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 

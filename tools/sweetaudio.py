@@ -10,6 +10,13 @@
   sweetaudio.py afe-start [LINES]  quaternary MI2S: bit clock 0x106 on (1.536 MHz), port 0x1006 I2S 48 kHz 16-bit
                               stereo, word select ours, data on LINES (default 2 = SD1, the 7T DT's rx-lines 0x2), start
   sweetaudio.py afe-stop      port 0x1006 stopped, bit clock off
+  sweetaudio.py afe-start 2 32     the same with 32-bit samples (3.072 MHz), what the TFA9874s are set up for
+  sweetaudio.py mi2s-pins     gpio137 SCK, 138 WS, 140 SD1 to function qua_mi2s (DT quat_mi2s_active, _sd1_active)
+  sweetaudio.py tfa-init [PROFILE]  both TFA9874s: reset, keys, rev 0x0c74 settings, the container's device and
+                              PROFILE (default speaker) registers from /var/root/tfa98xx.cnt (tfacnt.py next to this
+                              file); left in powerdown, muted
+  sweetaudio.py tfa-up        MANSCONF 1, PWDN 0, wait for CLKS (needs the bit clock); still muted
+  sweetaudio.py tfa-unmute / tfa-mute / tfa-down / tfa-status
 
 Numbers: live DT (i2c@890000, tfa98xx_right@34 reset gpio37, tfa98xx_left@35 reset gpio100,
 qupv3_se4_i2c_active gpio51/52 function qup4); Linux pinctrl-sm8150.c (51, 52, 100 on SOUTH, 37 on NORTH,
@@ -105,7 +112,7 @@ def clocks_on():
 # ---- pins (TLMM) ----
 
 NORTH, SOUTH = 0x03900000, 0x03d00000
-TILE = {37: NORTH, 51: SOUTH, 52: SOUTH, 100: SOUTH}
+TILE = {37: NORTH, 51: SOUTH, 52: SOUTH, 100: SOUTH, 137: SOUTH, 138: SOUTH, 140: SOUTH}
 
 
 def pin_cfg(n):
@@ -118,6 +125,16 @@ def pin_show(n, what):
     cfg, io = rd(pin_cfg(n)), rd(pin_cfg(n) + 4)
     print("pin %3d %-22s cfg %#05x (func %d, pull %d, drive %d mA, %s) level %d" % (
         n, what, cfg, cfg >> 2 & 0xf, cfg & 3, ((cfg >> 6 & 7) + 1) * 2, "out" if cfg & 0x200 else "in", io & 1))
+
+
+MI2S_PINS = ((137, "QUAT MI2S SCK"), (138, "QUAT MI2S WS"), (140, "QUAT MI2S SD1 (speakers)"))
+
+
+def pins_mi2s():
+    """DT quat_mi2s_active + quat_mi2s_sd1_active: gpio137/138/140, function qua_mi2s (1), 8 mA, no pull."""
+    for n, what in MI2S_PINS:
+        setbits(pin_cfg(n), (1 << 2) | (3 << 6), 0x3ff)
+        pin_show(n, what)
 
 
 def pins_i2c():
@@ -244,6 +261,110 @@ def tfa_rd(addr, reg):
     return b[0] << 8 | b[1]                     # TFA98xx registers: 16 bits, big endian
 
 
+def tfa_wr(addr, reg, val):
+    msg(addr, bytes([reg, val >> 8 & 0xff, val & 0xff]))
+
+
+def tfa_bf(addr, reg, pos, length, val):
+    mask = ((1 << length) - 1) << pos
+    old = tfa_rd(addr, reg)
+    tfa_wr(addr, reg, (old & ~mask) | ((val << pos) & mask))
+
+
+def tfa_get(addr, reg, pos, length=1):
+    return tfa_rd(addr, reg) >> pos & ((1 << length) - 1)
+
+
+# ---- TFA9874 bring-up: NXP's open tfa98xx driver (Goodix-vas/tfa98xx: tfa_init.c tfa9874_specific, tfa_dsp.c
+# tfaRunStartup / tfa_dev_set_state / tfa98xx_set_mute_tfa2), fields from tfa9874_tfafieldnames.h ----
+
+TFAS = ((0x34, "right"), (0x35, "left"))
+CNT = os.environ.get("SWEET_TFA_CNT", "/var/root/tfa98xx.cnt")     # the phone's /vendor/firmware/tfa98xx.cnt
+TFA9874_C74 = ((0x02, 0x22c8), (0x52, 0x57dc), (0x53, 0x003e), (0x56, 0x0400), (0x61, 0x0110), (0x6f, 0x00a5),
+               (0x70, 0x07f8), (0x73, 0x0047), (0x74, 0x5098), (0x75, 0x8d28), (0x80, 0x0000), (0x83, 0x0799),
+               (0x84, 0x0081))                  # tfa9874_specific, rev 0x0c74 ("V1.16")
+
+
+def tfa_apply(addr, writes):
+    for w in writes:
+        if w[0] == "reg":
+            _, reg, val, mask = w
+            tfa_wr(addr, reg, val if mask == 0xffff else (tfa_rd(addr, reg) & ~mask) | (val & mask))
+        else:
+            _, reg, pos, length, val = w
+            tfa_bf(addr, reg, pos, length, val)
+
+
+def tfa_status(addr, side):
+    r10, r11, r13, r14 = (tfa_rd(addr, r) for r in (0x10, 0x11, 0x13, 0x14))
+    r0, r1 = tfa_rd(addr, 0x00), tfa_rd(addr, 0x01)
+    print("tfa %#x (%s): PWDN %d AMPE %d DCA %d MANSCONF %d | CLKS %d PLLS %d AMPS %d SWS %d | MANSTATE %d "
+          "| alarms: NOCLK %d UVDS %d OCDS %d OTDS %d TDMERR %d MANALARM %d | regs 00=%04x 10=%04x 11=%04x 13=%04x 14=%04x" % (
+              addr, side, r0 & 1, r0 >> 3 & 1, r0 >> 4 & 1, r1 >> 2 & 1, r11 >> 7 & 1, r11 >> 6 & 1, r11 >> 14 & 1,
+              r11 >> 13 & 1, r14 >> 3 & 0xf, r10 >> 7 & 1, r10 >> 4 & 1, r10 >> 3 & 1, r10 >> 2 & 1, r10 >> 6 & 1,
+              r10 >> 5 & 1, r0, r10, r11, r13, r14))
+
+
+def tfa_init(profile="speaker"):
+    """tfaRunStartup up to (not including) leaving powerdown: reset, keys, rev settings, container device and
+    profile registers. Leaves the amp in powerdown, muted (AMPE 0)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tfacnt
+    lists = tfacnt.lists(CNT)
+    for addr, side in TFAS:
+        rev = tfa_rd(addr, 0x03)
+        if rev != 0x0c74:
+            print("tfa %#x (%s): revision %#06x, not the 0x0c74 these settings are for: skipped" % (addr, side, rev))
+            continue
+        if addr not in lists:
+            print("tfa %#x (%s): not in %s: skipped" % (addr, side, CNT))
+            continue
+        dev, profiles = lists[addr]
+        if profile not in profiles:
+            print("tfa %#x (%s): no profile %r (has %s): skipped" % (addr, side, profile, ", ".join(profiles)))
+            continue
+        tfa_wr(addr, 0x00, 1 << 1)              # I2CR: all I2C registers to their defaults (auto clear)
+        time.sleep(0.01)
+        tfa_wr(addr, 0x0f, 0x5a6b)              # unhide the key registers; key 1 = reg 0xFB ^ 0x5A
+        tfa_wr(addr, 0xa0, tfa_rd(addr, 0xfb) ^ 0x005a)
+        tfa_wr(addr, 0xa1, 0x005a)              # key 2 (MTPKEY2) open
+        tfa_wr(addr, 0x0f, 0)
+        for reg, val in TFA9874_C74:
+            tfa_wr(addr, reg, val)
+        tfa_apply(addr, dev)                    # tfaContWriteRegsDev
+        tfa_apply(addr, profiles[profile])      # tfaContWriteRegsProf
+        tfa_bf(addr, 0x00, 3, 1, 0)             # AMPE 0: muted (tfa98xx_set_mute_tfa2)
+        print("tfa %#x (%s): reset, rev 0x0c74 settings, %d device + %d %r writes" % (
+            addr, side, len(dev), len(profiles[profile]), profile))
+        tfa_status(addr, side)
+
+
+def tfa_up():
+    """tfa_dev_set_state INIT_CF / OPERATING|MUTE for a probus device: MANSCONF 1, PWDN 0, wait for CLKS.
+    Needs the I2S bit clock running (afe-start + mi2s-pins): the amp's PLL runs from BCK."""
+    for addr, side in TFAS:
+        tfa_bf(addr, 0x01, 2, 1, 1)             # MANSCONF: I2C configured, leave wait-for-source-settings
+        tfa_bf(addr, 0x00, 0, 1, 0)             # PWDN 0
+        for _ in range(50):
+            if tfa_get(addr, 0x11, 7):          # CLKS
+                break
+            time.sleep(0.01)
+        tfa_status(addr, side)
+
+
+def tfa_mute(on):
+    for addr, side in TFAS:
+        tfa_bf(addr, 0x00, 3, 1, 0 if on else 1)    # AMPE
+        tfa_status(addr, side)
+
+
+def tfa_down():
+    for addr, side in TFAS:
+        tfa_bf(addr, 0x00, 3, 1, 0)
+        tfa_bf(addr, 0x00, 0, 1, 1)             # PWDN 1
+        tfa_status(addr, side)
+
+
 # ---- kern.sweetapr ----
 
 APR_DOMAIN_ADSP, APR_DOMAIN_APPS = 4, 5
@@ -329,17 +450,19 @@ def afe_port_param(what, port, module, param, data):
     return apr_cmd(what, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, struct.pack("<HHIII", port, len(body), 0, 0, 0) + body)
 
 
-def afe_clock(on):
-    clock = struct.pack("<IIIHHI", 1, CLOCK_QUAD_MI2S_IBIT, RATE * 16 * 2, 1, 0, 1 if on else 0)
-    return afe_service_param("quaternary MI2S bit clock 0x106 %s" % ("on (1.536 MHz)" if on else "off"),
+def afe_clock(on, bits=16):
+    hz = RATE * bits * 2
+    clock = struct.pack("<IIIHHI", 1, CLOCK_QUAD_MI2S_IBIT, hz, 1, 0, 1 if on else 0)
+    return afe_service_param("quaternary MI2S bit clock 0x106 %s" % ("on (%.3f MHz)" % (hz / 1e6) if on else "off"),
                              AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, clock)
 
 
-def afe_start(lines=2):
-    if not afe_clock(True):
+def afe_start(lines=2, bits=16):
+    """bits 32 for the TFA9874s: their container sets 32-bit slots, 32-bit samples (TDMSLLN/TDMSSIZE 31)."""
+    if not afe_clock(True, bits):
         return False
-    i2s = struct.pack("<IHHHHIHH", 1, 16, lines, 1, 1, RATE, 0, 0)    # version, bits, lines, stereo, ws ours, rate
-    if not afe_port_param("port 0x1006: I2S, lines %d, stereo, 16 bits, 48 kHz, word select ours" % lines,
+    i2s = struct.pack("<IHHHHIHH", 1, bits, lines, 1, 1, RATE, 0, 0)    # version, bits, lines, stereo, ws ours, rate
+    if not afe_port_param("port 0x1006: I2S, lines %d, stereo, %d bits, 48 kHz, word select ours" % (lines, bits),
                           QUAT_MI2S_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, i2s):
         return False
     return apr_cmd("port 0x1006 started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, struct.pack("<HH", QUAT_MI2S_RX, 0))
@@ -383,7 +506,20 @@ def main(argv):
         for p in apr_read():
             apr_show(p)
     elif cmd == "afe-start":
-        afe_start(int(argv[2]) if len(argv) > 2 else 2)
+        afe_start(int(argv[2]) if len(argv) > 2 else 2, int(argv[3]) if len(argv) > 3 else 16)
+    elif cmd == "mi2s-pins":
+        pins_mi2s()
+    elif cmd == "tfa-init":
+        tfa_init(argv[2] if len(argv) > 2 else "speaker")
+    elif cmd == "tfa-up":
+        tfa_up()
+    elif cmd == "tfa-status":
+        for addr, side in TFAS:
+            tfa_status(addr, side)
+    elif cmd in ("tfa-mute", "tfa-unmute"):
+        tfa_mute(cmd == "tfa-mute")
+    elif cmd == "tfa-down":
+        tfa_down()
     elif cmd == "afe-stop":
         afe_stop()
     elif cmd == "apr-read":
