@@ -1,0 +1,59 @@
+op7t-0200: the sandbox container-path stand-in fails when there is no container
+
+2026-11-12: Safari stays black ~25 s before a page shows; the watchdog then
+killed MobileSafari (0x8badf00d) with its main thread in CloudTabStore
+dispatch_sync, waiting on iCloud tabs / the key-value store. Meanwhile
+com.apple.Safari.History and syncdefaultsd abort every ~10 s:
+  -[NSURL initFileURLWithPath:isDirectory:]: nil string parameter
+from SafariCore -[NSFileManager _safari_getMobileSafariContainerDirectoryURL:
+isContainerized:], which (disassembled on the phone) calls
+sandbox_container_path_for_pid(getpid(), buf, 1024) and, on success, builds
+the URL from buf; on failure it asks LaunchServices instead.
+
+0177's stand-in (Sandbox op 4) returned 0 without writing anything for every
+process with no CFFIXED_USER_HOME (daemons, XPC services: not containerized)
+and on its early exits. Now ENOENT unless a path was copied out, as the real
+sandbox fails for uncontainerized processes. Containerized apps (0177's
+PlugInKit / file picker case) still get their path.
+
+Apply after 0199.
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 2fa42da..76e8ecc 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -365,7 +365,7 @@ sweet_sandbox_container_path(user_addr_t arg)
+ 	task = proc_task(p);
+ 	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
+ 		proc_rele(p);
+-		return 0;
++		return ENOENT;                  /* 0200: no container known (was 0 = "success", nothing written) */
+ 	}
+ 	/* as sysctl_procargsx(): the task keeps the map alive once the process is let go */
+ 	task_reference(task);
+@@ -373,7 +373,7 @@ sweet_sandbox_container_path(user_addr_t arg)
+ 	map = get_task_map_reference(task);
+ 	task_deallocate(task);
+ 	if (map == VM_MAP_NULL) {
+-		return 0;
++		return ENOENT;
+ 	}
+ 	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
+ 	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+@@ -389,8 +389,15 @@ sweet_sandbox_container_path(user_addr_t arg)
+ 			vm_map_copy_discard(copy);
+ 		}
+ 		kmem_free(kernel_map, strings, strings_size);
+-		return 0;                       /* on its way out, or its stack unmapped */
++		return ENOENT;                  /* on its way out, or its stack unmapped */
+ 	}
++	/*
++	 * 0200: no CFFIXED_USER_HOME = not containerized: fail as the real sandbox does. Returning 0 with nothing
++	 * written made SafariCore (_safari_getMobileSafariContainerDirectoryURL) build a URL from an empty path ->
++	 * "-[NSURL initFileURLWithPath:isDirectory:]: nil string": com.apple.Safari.History and syncdefaultsd
++	 * crash-looped, and MobileSafari's main thread waited on them (CloudTabStore, 2026-11-12).
++	 */
++	error = ENOENT;
+ 	end = (const char *)(strings + strings_size);
+ 	for (s = end - argslen; s < end; s += len + 1) {
+ 		len = strnlen(s, (size_t)(end - s));
