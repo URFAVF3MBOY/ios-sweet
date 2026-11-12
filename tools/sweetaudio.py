@@ -17,6 +17,10 @@
                               file); left in powerdown, muted
   sweetaudio.py tfa-up        MANSCONF 1, PWDN 0, wait for CLKS (needs the bit clock); still muted
   sweetaudio.py tfa-unmute / tfa-mute / tfa-down / tfa-status
+  sweetaudio.py feed [SECS] [GAIN_DB]  what iOS plays (RedwoodAudio.driver -> /dev/redwood-audio, 0195) through the
+                              speakers, SECS (0 = until stopped), GAIN_DB (default -12, at most 0); amps unmuted
+                              while it runs. Needs the same set-up as play-tone, kern.sweetaudiodev=1 and the plug-in.
+  sweetaudio.py feed-stat     kern.sweetaudiostat
   sweetaudio.py buf-info      kern.sweetaudiobuf (0194): the DSP's buffer, its PA and the SMMU bank of stream 0x1b21
   sweetaudio.py play-tone [SECS] [DBFS]  1 kHz (default 3 s at -30 dBFS, never above -12) through ASM session 1 ->
                               ADM (no processing) -> port 0x1006; the amps unmuted once the DSP takes the first
@@ -543,13 +547,11 @@ def tone_period(start, dbfs=-30.0, hz=1000):
     return bytes(out)
 
 
-def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
-    """1 kHz at `dbfs' (default -30 dBFS, as vayu) for `secs': buffer mapped, ADM path to 0x1006 (16-bit, no
-    processing), ASM session 1 opened, routed, run; periods written as the DSP gives them back. The amplifiers are
-    unmuted after the DSP has taken the first periods and muted again at the end, whatever happens."""
-    if dbfs > -12:
-        print("refusing %.1f dBFS: no speaker protection here, keep it at -12 or below" % dbfs)
-        return False
+def play_stream(source, secs=3.0, unmute=True, report=0):
+    """Play what source() returns (PERIOD_BYTES each call) for `secs' (0: until stopped): buffer mapped, ADM path to
+    0x1006 (16-bit, no processing), ASM session 1 opened, routed, run; periods written as the DSP gives them back.
+    The amplifiers are unmuted once the DSP has taken the first periods and muted again at the end, whatever
+    happens. report: seconds between status lines (0: none)."""
     pa, size, bank = buf_info()
     dsp = pa | 1 << 32                         # the audio stream's SID bit (0194's alias)
     print("buffer: pa %#x, %d KB, SMMU bank %d -> DSP address %#x" % (pa, size // 1024, bank, dsp))
@@ -586,10 +588,8 @@ def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
             return False
         if apr_call("session run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, struct.pack("<III", 0, 0, 0)) is None:
             return False
-        frame = 0
         for k in range(PERIODS):
-            buf_write(4096 * k, tone_period(frame, dbfs))
-            frame += PERIOD_FRAMES
+            buf_write(4096 * k, source())
         def post(k):
             a = dsp + 4096 * k
             apr_post(APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_WRITE_V2,
@@ -597,8 +597,14 @@ def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
         for k in range(PERIODS):
             post(k)
         done = errors = underflows = 0
-        end = time.time() + secs
+        start = time.time()
+        end = start + secs if secs else float("inf")
+        next_report = start + report if report else float("inf")
         while time.time() < end:
+            if time.time() >= next_report:
+                next_report += report
+                print("feed: %.0f s: %d periods, %d errors, %d underflows; %s" % (
+                    time.time() - start, done, errors, underflows, feed_stat()), flush=True)
             for p in apr_read():
                 op, token, w = apr_words(p)
                 if op == ASM_DATA_EVENT_WRITE_DONE_V2 and token & WRITE_TOKEN:
@@ -609,8 +615,7 @@ def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
                     if done == 2 and unmute and not unmuted:
                         tfa_mute(False)
                         unmuted = True
-                    buf_write(4096 * k, tone_period(frame, dbfs))
-                    frame += PERIOD_FRAMES
+                    buf_write(4096 * k, source())
                     post(k)
                 elif op == ASM_SESSION_EVENT_RX_UNDERFLOW:
                     underflows += 1
@@ -618,8 +623,11 @@ def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
                     errors += 1
                     print("dsp: a write REFUSED, status %#x" % w[1])
             time.sleep(0.002)
-        print("tone: %d periods played (%.1f s), %d errors, %d underflows" % (done, done * 0.02, errors, underflows))
+        print("played: %d periods (%.1f s), %d errors, %d underflows" % (done, done * 0.02, errors, underflows))
         return done > 0
+    except KeyboardInterrupt:
+        print("stopped")
+        return True
     finally:
         if unmuted or unmute:
             tfa_mute(True)
@@ -628,6 +636,66 @@ def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
         if copp is not None:
             apr_call("device path closed", APR_SVC_ADM, copp, ADM_CMD_DEVICE_CLOSE_V5, b"")
         apr_call("buffer unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, struct.pack("<I", handle))
+
+
+def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
+    """1 kHz at `dbfs' (default -30 dBFS, as vayu; never above -12) for `secs'."""
+    if dbfs > -12:
+        print("refusing %.1f dBFS: no speaker protection here, keep it at -12 or below" % dbfs)
+        return False
+    at = [0]
+
+    def source():
+        out = tone_period(at[0], dbfs)
+        at[0] += PERIOD_FRAMES
+        return out
+    return play_stream(source, secs, unmute)
+
+
+# ---- iOS's sound: /dev/redwood-audio (0195) -> kern.sweetaudioring -> the DSP ----
+
+def feed_stat():
+    try:
+        return sysctl("kern.sweetaudiostat", oldlen=256).split(bytes(1))[0].decode()
+    except OSError as e:
+        return "no kern.sweetaudiostat (%s)" % e
+
+
+def feed(secs=0.0, gain_db=-12.0):
+    """What iOS plays (HackiOS's RedwoodAudio.driver -> /dev/redwood-audio) through the speakers, for `secs' (0: until
+    stopped). Each period: the frames waiting in the ring, silence for what is missing, scaled by gain_db (default
+    -12 dB: no speaker protection here; iOS's own volume is already in the samples) and clipped."""
+    if gain_db > 0:
+        print("refusing %+.1f dB: no speaker protection, 0 dB at most" % gain_db)
+        return False
+    import array
+    scale = 10 ** (gain_db / 20)
+    stats = {"short": 0, "clipped": 0}
+
+    def source():
+        got = sysctl("kern.sweetaudioring", oldlen=PERIOD_BYTES)
+        if len(got) < PERIOD_BYTES:
+            stats["short"] += 1
+            got += bytes(PERIOD_BYTES - len(got))
+        a = array.array("h", got)
+        for i, v in enumerate(a):
+            w = int(v * scale)
+            if w > 32767 or w < -32768:
+                stats["clipped"] += 1
+                w = 32767 if w > 0 else -32768
+            a[i] = w
+        return a.tobytes()
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt        # SIGTERM (kill) and SIGINT alike: close the stream, mute the amps
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)  # (ignored by default in a background job: set it again)
+    print("feed: %s; gain %+.1f dB" % (feed_stat(), gain_db), flush=True)
+    sysctl("kern.sweetaudioring", oldlen=4096)      # (old frames out)
+    ok = play_stream(source, secs, True, report=5)
+    print("feed: %d periods short of iOS frames (padded), %d samples clipped" % (stats["short"], stats["clipped"]))
+    return ok
 
 
 def afe_stop():
@@ -687,6 +755,10 @@ def main(argv):
         print("kern.sweetaudiobuf: pa %#x, %d KB, SMMU bank %d" % (pa, size // 1024, bank))
     elif cmd == "play-tone":
         play_tone(float(argv[2]) if len(argv) > 2 else 3.0, float(argv[3]) if len(argv) > 3 else -30.0)
+    elif cmd == "feed":
+        feed(float(argv[2]) if len(argv) > 2 else 0.0, float(argv[3]) if len(argv) > 3 else -12.0)
+    elif cmd == "feed-stat":
+        print(feed_stat())
     elif cmd == "afe-stop":
         afe_stop()
     elif cmd == "apr-read":

@@ -98,6 +98,17 @@
     - Amps unmuted after the 2nd WRITE_DONE: AMPS 1 SWS 1, MANALARM 0. Muted again, stream/path/map closed.
   - **AUDIBLE (user, 2026-11-11): the speakers play the 1 kHz tone.** A second run (5 s, 250 periods, 0 errors) was heard too. FIRST SOUND from the 7T's speakers under iOS. (After `tfa-mute`, AMPS/SWS still read 1 for a moment: the mute ramp, guess.)
   - Next for real audio: feed what iOS plays into this path. vayu_sound=4 does it with /dev/hakios-audio and a feeder; on iOS, mediaserverd/AudioToolbox expects an Apple audio device (AppleARMIISAudio / AppleCS42L.. user clients), which is the big part. A quick win before that: a userland player for WAV files (play-wav) on the same path.
+- **2026-11-11: iOS's own audio, step 1: plug-in loads, iOS does not route to it yet.**
+  - **0195** (`xnu/patches/0195-op7t-redwood-audio-device.patch`, CI 43144561653, kernel 04c33de2, `shim/out/shim-boot-0195-7g-bt-ddr.img`, the 0192 line): `/dev/redwood-audio` (ring of 65536 frames, never waits, drops when full) + the HackiOS volume ioctl. `sysctl kern.sweetaudiodev=1` makes the node; `kern.sweetaudioring` drains it; `kern.sweetaudiostat` counters.
+  - **Plug-in:** HackiOS's prebuilt `RedwoodAudio` (hackios-xnu-userland-main.zip prebuilt/userland, arm64 bundle built for iOS 16.5, needs only CoreFoundation + libSystem; source userland/src/audio_plugin.c) + its audio_plugin.plist as Info.plist, in `/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver/`, `ldid -S`.
+  - **Feeder:** `sweetaudio.py feed [SECS] [GAIN]` (default -12 dB, clip-guarded) drains the ring into the ASM stream. SIGTERM/SIGINT now close the stream and mute.
+    - One run was killed with SIGTERM before that handler existed: ASM session 1 / COPP 0 were left open on that boot.
+  - **Observed (19:35):**
+    - After kern.sweetaudiodev=1 + `killall mediaserverd`: the plug-in opens the node (opens 1), and mediaserverd activates devices Speaker (51), Hawking (57), Actuator (60), Codec (64), Null_Device (69).
+    - The feeder ran 130 s with 6264 periods, 0 errors, 0 underflows.
+    - **But "written 0" and the volume was never set:** iOS never routes to the Speaker.
+  - **Cause seen:** `-CMVAEndptMgr- vaemGetVirtualAudioDeviceIDs: vadInitializationCompleteSemaphore: Timeout occurred` -> `No Audio Device Available. This is a serious error.`, then `AudioSessionInfo.mm:674 Couldn't get the VAD...`. The virtual audio device (VirtualAudio.plugin) never finishes initializing, so nothing is routed anywhere. Next: find why (debug-level VAD logs; HackiOS's mkidentity.py / routing-table notes; what VAD waits for).
+  - User: nothing heard; videos don't load yet either (separate issue).
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
