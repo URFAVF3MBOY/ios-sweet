@@ -1,0 +1,27 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 12 Nov 2026 23:30:00 -0500
+Subject: [PATCH] op7t-0212: kern.sweetmmio also reaches the camera block and the apps SMMU
+
+0211's live capture writes only 5-6 bursts (1280/1536 bytes of real sensor
+data, also with the sensor's own test pattern), then the write master stops:
+no WM done, WM0 status reads 0. Finding why needs many register reads and
+pokes on the IFE / CSID / bus, one CI build each. kern.sweetmmio (0181/0183)
+does single 32-bit accesses from userland; now it also allows the Titan
+camera block (CSIPHY, CCI, CAMNOC, IFE, CSID, 0x0ac00000..) with camcc
+(0x0ad00000) and the apps SMMU (0x15000000). A block whose clocks or GDSC
+are off faults on access: arm the camera (kern.sweetcam=4) first.
+
+Apply after 0211.
+---
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -105,6 +105,8 @@ static const struct {
+ 	{ 0x00100000, 0x001f0000 },     /* GCC */
+ 	{ 0x00880000, 0x00050000 },     /* QUPv3 wrap0: SE0..7 (0x880000..0x89ffff) and its common block (0x8c0000) */
+ 	{ 0x03000000, 0x00e00000 },     /* TLMM, all four tiles */
++	{ 0x0ac00000, 0x00140000 },     /* 0212: Titan camera block (CSIPHY, CCI, CAMNOC, IFE, CSID) and camcc */
++	{ 0x15000000, 0x00100000 },     /* 0212: apps SMMU (global + context banks) */
+ };
+ /*
+  * 0183: mapped in 64 KB windows, on demand. 0181 mapped each range whole on first use, and the 14 MB of TLMM
