@@ -4,7 +4,7 @@ sweet_keys.c still read the Redmi's keys: volume up from PM6150L (SPMI SID 4)
 GPIO 2 at 0xc110, volume down from the PON's RESIN bit. On the 7T that GPIO
 does not exist (volume up was withheld), and pressing the volume keys never
 set RESIN (2026-11-11: four presses of power/volume all logged as key 0).
-User report: the keys did not act separately.
+Seen on the phone: the keys did not act separately.
 
 Live DT (dtb/hotdogb-live.dts) gpio_keys: vol_up = PM8150 GPIO 6, vol_down =
 PM8150 GPIO 7, both active-low, pinctrl@c000 of qcom,pm8150@0 (SID 0).

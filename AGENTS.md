@@ -1,16 +1,15 @@
 # Working on ios-sweet
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
-  after each milestone and before stopping. Record commits, CI run IDs, exact
-  build/boot results and unfinished work. Distinguish observations from guesses.
-- Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.
-  Local single-file cross-compiles are useful before spending a CI run.
-- Device bring-up uses temporary `fastboot boot` images. Preserve the Android
-  installation and partition backups. The user approved (2026-10-15) using
-  internal UFS for iOS and said Android may be deleted: the iOS root goes
-  into the existing `userdata` partition (no GPT changes). Keep bootloaders,
-  recovery, modem, persist and the backups intact, and confirm each
-  destructive step with the user before running it.
-- Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+- Read `NOTES.md` first: project goal, hardware facts, current blocker, where the
+  local artifacts are, and the next concrete step.
+- Keep the status section at the top of `NOTES.md` current after each milestone
+  and before stopping: commits, CI run IDs, exact build/boot results and what is
+  unfinished. Keep observations apart from guesses.
+- Commit completed changes. Kernel builds run on GitHub Actions (`gh` for runs
+  and logs). A local single-file cross-compile is a cheap check before a CI run.
+- Device bring-up uses temporary `fastboot boot` images. Keep the partition
+  backups. Decided 2026-10-15: internal UFS is used for iOS and Android may be
+  deleted; the iOS root lives in the existing `userdata` partition (no GPT
+  changes). Bootloaders, recovery, modem, persist and the backups stay intact;
+  every destructive step gets a second look before it runs.
+- Device dumps, serial numbers and downloaded Apple files stay out of git.

@@ -1,7 +1,7 @@
 op7t-0195: /dev/redwood-audio, the device iOS's audio goes to
 
 2026-11-11: the speakers play a tone the DSP takes from kern.sweetaudiobuf
-(0194, user heard it). For iOS's own sound: HackiOS's RedwoodAudio.driver
+(0194, audible). For iOS's own sound: HackiOS's RedwoodAudio.driver
 (an AudioServerPlugIn for /System/Library/Audio/Plug-Ins/HAL, built for iOS
 16.5; its "Speaker" is the device the virtual audio device routes to)
 writes 16-bit stereo at 48 kHz to /dev/redwood-audio from the audio

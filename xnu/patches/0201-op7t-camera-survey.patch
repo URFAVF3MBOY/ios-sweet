@@ -1,6 +1,6 @@
 op7t-0201: cameras, step 1: a read-only survey of the rear main sensor's power, clocks and pins
 
-2026-11-12, user: camera next. Before switching anything on, read what the
+2026-11-12: camera next. Before switching anything on, read what the
 rear main sensor (live DT qcom,cam-sensor@0) depends on and in what state ABL
 left it, so the power-up (step 2) is built on facts:
 - GCC camera clocks (ahb/hf axi/sf axi/xo);

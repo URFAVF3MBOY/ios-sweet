@@ -1,6 +1,6 @@
 op7t-0198: show the whole iPhone X picture, shrunk to the panel, instead of cropping it
 
-2026-11-12, user: the keyboard's Q and P keys go off the screen. The UI is
+2026-11-12: the keyboard's Q and P keys go off the screen. The UI is
 the iPhone X's 1125x2436 (0061); since 0108 the panel scans it out directly
 and crops the centred 1080x2400: 22 columns left, 23 right, 18 rows top and
 bottom. iOS leaves ~9 px between Q/P and the edge, so half of them is gone.

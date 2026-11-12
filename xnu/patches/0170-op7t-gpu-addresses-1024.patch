@@ -2,7 +2,7 @@ From: fish <lunarisfelix02@gmail.com>
 Date: Tue, 10 Nov 2026 05:30:00 -0500
 Subject: [PATCH] op7t-0170: GPU addresses: 1024 free ranges, double frees refused, stats on
 
-HANDOFF-5 (2026-11-08): backboardd crash-looped in OSMesa after
+Notes (2026-11-08): backboardd crash-looped in OSMesa after
 "RedwoodGPU: no addresses left for a buffer of N bytes" (403 times), with
 the kept cache empty. The GPU address allocator (sweet_gpu.c, 0086/0089)
 keeps at most 64 free ranges: once that many holes exist, every free that

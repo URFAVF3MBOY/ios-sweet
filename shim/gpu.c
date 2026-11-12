@@ -3032,7 +3032,7 @@ static void step14_g2_draw(void)
 /*
  * Step 15: G3, the 2D blitter (BLIT_OP_SCALE) copies and scales an image.
  *
- * Sources (the files are in the G3 handoff bundle):
+ * Sources (the files are in the G3 notes bundle):
  *   Mesa fd6_blitter.cc  handle_rgba_blit -> emit_setup, emit_blit_texture
  *                        (emit_blit_texture_setup, emit_blit_setup,
  *                        emit_blit_src, emit_blit_dst, emit_blit_fini), then

@@ -4,7 +4,7 @@ Subject: [PATCH] op7t-0137: answer EAPOL-Key frames after the join (group rekey,
 
 w_eapol_rx dropped every EAPOL-Key frame once the link was up. So the AP's
 group key handshake (most routers rekey the group key every 10-60 minutes)
-went unanswered, and so did a message 3 sent again because our message 4 was
+went unanswered, and so did a message 3 sent again because my message 4 was
 lost; in both cases the AP retries, gives up and deauthenticates the phone:
 the random Wi-Fi drops of STATE 2026-10-24. Now, while up: group key message 1
 -> unwrap, install the new GTK, send message 2 (protected); message 3 again ->

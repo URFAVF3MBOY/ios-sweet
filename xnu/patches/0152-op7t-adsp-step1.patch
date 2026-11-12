@@ -12,7 +12,7 @@ PAS id 1, carveout 0x8BE00000+0x1E00000, SMP2P items 443/429 (pid 2,
 APCS IPC bit 10), GLINK edge pid 2 APCS bit 8, channels IPCRTR and
 apr_audio_svc; AOP load_state adsp, cx.lvl 0x181.
 Sequence: refuse if the DSP has run since power-on (its SMP2P item 429
-exists), load + authenticate, our SMP2P item, wait for slave-kernel READY
+exists), load + authenticate, my SMP2P item, wait for slave-kernel READY
 (or FATAL + crash reason, item 423), GLINK version/open/intents, answer
 QRTR HELLO, then AVCS_CMD_ADSP_EVENT_GET_STATE every 500 ms until the
 audio services say up, then AVCS_GET_VERSIONS. Everything logged as

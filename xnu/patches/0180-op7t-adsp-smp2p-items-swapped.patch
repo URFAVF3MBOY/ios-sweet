@@ -2,7 +2,7 @@ From: fish <lunarisfelix02@gmail.com>
 Date: Tue, 10 Nov 2026 08:20:00 -0500
 Subject: [PATCH] op7t-0180: audio DSP: SMP2P items the right way round (443 its, 429 ours)
 
-0152 had the audio DSP's SMP2P items swapped: it made 443 as our item
+0152 had the audio DSP's SMP2P items swapped: it made 443 as my item
 and waited for 429 from the DSP. The device tree's qcom,smp2p-adsp says
 qcom,smem = <0x1bb 0x1ad> = <443 429>, and that binding lists the
 inbound item first (Linux qcom_smp2p.c: smem_items[SMP2P_INBOUND],
@@ -10,7 +10,7 @@ then [SMP2P_OUTBOUND]): 443 is the DSP's, 429 is ours. The modem path
 (0096) reads its <435 428> the same way (ITEM_SMP2P_IN 435, OUT 428)
 and works. HackiOS vayu (SM8150): .smp2p_theirs = 443, .smp2p_ours = 429.
 
-So far we took 443 for ourselves before the DSP could make it; the DSP
+So far the kernel took 443 for itself before the DSP could make it; the DSP
 then died in its init: SMEM 423 "SFR Init: wdog or kernel error
 suspected.", no item from it, on 0178 and on 0179 (which made 443 even
 earlier).

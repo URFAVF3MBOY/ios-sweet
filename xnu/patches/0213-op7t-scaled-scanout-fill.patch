@@ -4,7 +4,7 @@ Subject: [PATCH] op7t-0213: scaled scanout fills the panel (no black bars)
 
 0198 shows the whole 1125x2436 iPhone X picture at true aspect, 0.96 both
 ways: 1080x2339, black bars of 30/31 rows, and the status bar (time,
-battery) moved in from the panel's corners. User, 2026-11-12: the two
+battery) moved in from the panel's corners. Seen 2026-11-12: the two
 black bars and the shifted time/battery look wrong.
 
 Now the default (sweetscale=2) scales the 2436 rows onto all 2400 panel

@@ -5,7 +5,7 @@ Subject: [PATCH] op7t-0183: kern.sweetmmio maps 64 KB windows, not whole ranges
 0181's kern.sweetmmio mapped each allowed range whole on first use. The
 first TLMM access asked ml_io_map for 14 MB and the phone panicked:
 "kmem_alloc(.., 14680064, 0x100021): failed with 3 @vm_kern.c:178"
-(user photo, 2026-11-10). Now an access maps the 64 KB window around it,
+(photo, 2026-11-10). Now an access maps the 64 KB window around it,
 once, up to 32 windows; more gives ENOSPC instead of a panic.
 
 Apply after 0182.

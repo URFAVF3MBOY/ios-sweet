@@ -5,10 +5,10 @@ Subject: [PATCH] op7t-0182: audio DSP: APR pipe diagnostics
 0181 booted (Intel-built kernel): the DSP comes up as before and the APR
 pipe opens, but packets written to kern.sweetapr get no answer, and the
 send queue stops draining after about 6 packets (ENOSPC at 16 queued):
-the DSP's intents are not given back, as if it never consumed our data.
+the DSP's intents are not given back, as if it never consumed my data.
 The GLINK messages that would say why were silent.
 
-Now logged (first 30 each) and counted: our RX_INTENT_REQ, every data
+Now logged (first 30 each) and counted: my RX_INTENT_REQ, every data
 send and the intent it went into, the DSP's INTENT, RX_DONE (and those
 that match no intent of ours), RX_INTENT_REQ_ACK. New read-only
 kern.sweetaprstat: one line with the FIFO heads/tails, the APR channel's

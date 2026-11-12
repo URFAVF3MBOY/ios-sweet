@@ -15,7 +15,7 @@ Subject: [PATCH] op7t-0171: Bluetooth, step 3: rampatch and NVM from the modem p
   product, rom build, patch version); TLV sent in 243-byte EDL segments
   (01 00 fc len 1e seg data); vendor event rtype 4 awaited per segment
   unless the download mode skips it (the last segment always waits);
-- NVM: HCI tag 17 with in-band sleep off (bit 7 of byte 0; our driver does
+- NVM: HCI tag 17 with in-band sleep off (bit 7 of byte 0; my driver does
   not speak IBS) and UART speed 0 (115200), as logged;
 - 10 ms between patch and NVM, HCI_Reset, HCI_Read_Local_Version.
 Stages: 5 patch sent, 6 NVM sent, 7 reset after firmware OK; -5/-6 if a

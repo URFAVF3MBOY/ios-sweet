@@ -5,7 +5,7 @@ Subject: [PATCH] op7t-0181: audio: APR pipe and register pipe for userland
 The audio DSP is up since 0180 (stage 6: GLINK, QRTR, APR, AVCS state 1).
 Sound on the speakers needs, per HackiOS vayu (same SM8150): the
 quaternary MI2S bit clock through the AFE service, AFE port 0x1006 set up
-and started, the DSP reaching our memory (apps SMMU stream 0x1b21), and
+and started, the DSP reaching my memory (apps SMMU stream 0x1b21), and
 on the 7T two NXP TFA98xx amplifiers on I2C (QUP0 SE4 0x890000, 0x34
 right / 0x35 left, reset GPIO 37 / 100). To work that out without a
 kernel build per try, two root-only pipes:

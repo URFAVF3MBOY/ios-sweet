@@ -1,12 +1,12 @@
 # Adreno 640 bring-up on OnePlus 7T (hotdogb, SM8150)
 
 Working notes for GPU acceleration on the OP7T port. Keep this file current;
-`NOTES.md` links here from the active handoff.
+`NOTES.md` links here from the status section.
 
-## Goal and honest scope
+## Goal and scope
 
 1. **Milestone G1 - GPU alive:** GMU firmware booted, GPU powered, CP (command
-   processor) running our ringbuffer and writing a fence value to memory.
+   processor) running my ringbuffer and writing a fence value to memory.
 2. **Milestone G2 - useful work:** GPU blits/fills (e.g. the IOMFB present copy
    that NOTES.md identifies as a big per-frame cost).
 3. **Milestone G3 - iOS rendering on the GPU:** needs a Metal-compatible driver
@@ -15,7 +15,7 @@ Working notes for GPU acceleration on the OP7T port. Keep this file current;
 
 ## Decision 2026-10-20: no read-only probe stage
 
-User wants to skip the "stage 0" read-only hardware probe proposed earlier
+Decided to skip the "stage 0" read-only hardware probe planned earlier
 (`shim/out/what u were doing.txt`). All bring-up values below come from the
 live DT + kernel sources instead.
 
@@ -62,7 +62,7 @@ GMU: 200 MHz. Highest bank bit 15, UBWC mode 3, GMEM 1 MB.
 Plan: `tools/mkadt.py` embeds the blobs as properties of a new ADT node from
 `gpu_accel/`, so they never enter the published patches.
 
-## Windows DSDT reference (user's working WoA DSDT_5.aml, 2026-10-20)
+## Windows DSDT reference (my working WoA DSDT_5.aml, 2026-10-20)
 
 Disassembled with iasl (built from acpica git; DSDT file kept out of git).
 - `\_SB.MMU1` (`QCOM0509`) = the GPU SMMU at 0x02CA0000 size 0x10000, IRQs
@@ -75,8 +75,8 @@ Disassembled with iasl (built from acpica git; DSDT file kept out of git).
   **BUSARB `ICBID_MASTER_GFX3D` -> `ICBID_SLAVE_EBI1`** (GPU->DDR bandwidth
   vote). F1 (off) reverses it. Neither `gcc_gpu_snoc_dvm_gfx_clk` nor
   `gcc_gpu_cfg_ahb_clk` appears anywhere in the DSDT.
-- => Our steps 1 + 3a match Windows' GPU power-on except the **BUSARB
-  bandwidth vote**, which we don't do yet. Best current lead for the step 3b
+- => My steps 1 + 3a match Windows' GPU power-on except the **BUSARB
+  bandwidth vote**, which I don't do yet. Best current lead for the step 3b
   SMMU read hang (unconfirmed).
 - GPU0 MMUINFO: Miniport `ArmSmmuV2`, PAGETABLEUSAGE has a separate
   `GraphicsGmuPT` (type 3, 0x03030008) besides global/per-process/secure
@@ -151,7 +151,7 @@ photograph the GPU lines. Expected good result: every line `ok`, CX GDSC
 
 ### Boot results
 
-- 2026-10-20 boot 1 (`sweetgpu=1`): user read the summary line as
+- 2026-10-20 boot 1 (`sweetgpu=1`): the summary line read
   `done fails=00000001` (the `0000000A` was the 10 s hold value), so 1 step
   timed out; which one was not read off the screen. The shim then continued.
   The summary now prints `GPU FAIL <step>` lines / `GPU OK` instead.
@@ -179,7 +179,7 @@ photograph the GPU lines. Expected good result: every line `ok`, CX GDSC
   empty symbols. Firmware stays out of git (only in the local image).
 - `sweetgpu=2` runs step 1 then step 2: walks the GMU blocks and checks the
   SQE version. No hardware access in step 2.
-- Expected screen with the files we have (computed here from the same files):
+- Expected screen with the files I have (computed here from the same files):
   `GMU FW ok bytes=00009330 blocks=00000007`, `GMU TCM itcm=00000003
   dtcm=00000002`, `GMU VA icache=00000001 dcache=00000001`,
   `SQE FW ok bytes=00007E30 ver=00000190`, then `GPU OK`.
@@ -208,7 +208,7 @@ photograph the GPU lines. Expected good result: every line `ok`, CX GDSC
 
 - Why: DT marks the GPU SMMU `qcom,skip-init` (firmware pre-configured it)
   and doesn't say which stream-match (SMR/S2CR) entries or context banks are
-  already in use. Read them before claiming any. Agreed with user 2026-10-20.
+  already in use. Read them before claiming any (decided 2026-10-20).
 - `sweetgpu=4` (runs only if steps 1-3a had no failure): prints sCR0/IDR0/
   IDR1, page size, number of SMRs/CBs; for valid SMRs matching GPU SIDs
   0/0x400 or GMU SIDs 4/5 (max 6): `SMR nn smr= s2cr=` and, if it translates,
@@ -219,7 +219,7 @@ photograph the GPU lines. Expected good result: every line `ok`, CX GDSC
   stage-1 table for the GMU buffers.
 - 2026-10-20 boot 6 (`sweetgpu=4`): steps 1-3a ok again (same values). Screen
   stops right after `step 4: GPU SMMU state (read only)`: no SMMU lines, no
-  blue exception screen; phone reset later on its own (user: "crashed after
+  blue exception screen; phone reset later on its own (it "crashed after
   the wait"). Observation: the first read of the SMMU global space (sCR0 @
   0x02ca0000) never completed. Guess: SMMU global registers are not
   accessible from the shim's EL1 in this state (firmware-owned, matching

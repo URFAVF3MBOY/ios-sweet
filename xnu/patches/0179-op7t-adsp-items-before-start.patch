@@ -1,6 +1,6 @@
 From: fish <lunarisfelix02@gmail.com>
 Date: Tue, 10 Nov 2026 07:00:00 -0500
-Subject: [PATCH] op7t-0179: audio DSP: our shared-memory items before the start
+Subject: [PATCH] op7t-0179: audio DSP: my shared-memory items before the start
 
 Boot of 0178 (2026-11-10, captured with tools/adsp-capture.sh): TrustZone
 authenticates and starts the DSP (auth_and_reset ret=0), 5 s later its
@@ -11,7 +11,7 @@ SMP2P item 429 never appears. So it runs, then dies or hangs in its init.
 HackiOS vayu (same SoC, SM8150; its ADSP works on hardware) and Linux make
 everything of ours before the start: the SMP2P item 443 with one entry,
 "master-kernel" = 0 (Linux makes it when qcom,smp2p probes at boot), and
-GLINK's descriptor (478) and our FIFO (479) (vayu_glink_prepare() before
+GLINK's descriptor (478) and my FIFO (479) (vayu_glink_prepare() before
 vayu_pas_start()). 0152 made 443 only after auth_and_reset, with no entry
 at all, and 478/479 only after "ready", which never came.
 

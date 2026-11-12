@@ -1,9 +1,9 @@
 op7t-0197: Bluetooth from boot, in the kernel (bsd/dev/sweet_bt.c, kern_exec.c)
 
 2026-11-11: Bluetooth works with the chip brought up by sysctl kern.sweetbt=1
-from bt_up.sh, bluetoothd pointed at our kernel control by bthook's
+from bt_up.sh, bluetoothd pointed at my kernel control by bthook's
 BT_HCI_TRANSPORT + CTLIOCGINFO rewrite, and bthook editing the chip's replies
-for bluetoothd's Broadcom expectations. The user wants it straight from the
+for bluetoothd's Broadcom expectations. It should come straight from the
 image. This moves into the kernel:
 
 - a thread from sweet_ufs_init (sweet_bt_init), after sweetbtdelay s (12):

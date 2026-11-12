@@ -3,7 +3,7 @@ Date: Tue, 10 Nov 2026 02:50:00 -0500
 Subject: [PATCH] op7t-0167: Wi-Fi: link quality at once on link-up, then every 2 s
 
 0166 works (2026-11-10): wifid logs "Rssi: -63 ... Snr: 32" from event 39
-and the status bar shows bars. The user wants them sooner. Now: the first
+and the status bar shows bars. They should come sooner. Now: the first
 event is posted at link-up itself, the next 1 s later, then every 2 s
 (was 1 s after link-up, then 5 s). wifid's handler only drops events
 under 1 s apart. Per-core RSSI is filled too (both cores = RSSI): wifid

@@ -5,7 +5,7 @@ everything camera is off: TITAN_TOP_GDSC collapsed, MCLK1/CCI/cpas/camnoc
 off; GCC camera_xo off although Linux keeps it on; all camera pins in their
 reset state; cmd-db files ldoc1 (XOB, aux 0002) at 0x43400, bobc1 at
 0x40300 (listed twice), ldof1 at 0x41f00, all as VRM; the PMIC LDO/BOB
-peripherals have no SPMI channel for us (only RPMh votes).
+peripherals have no SPMI channel for the apps processor (only RPMh votes).
 
 kern.sweetcam=2 (once per boot), each stage checked before the next and the
 CCI only touched once its power domain and clocks report on: reset gpio30
