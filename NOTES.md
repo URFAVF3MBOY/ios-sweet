@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work (2026-11-09, latest)
 
+### >>> RESUME HERE (2026-11-11, user switching Claude accounts) <<<
+- **0196 kernel BUILT OK:** CI run 43151858000 (URFAVF3MBOY/ios-sweet, build 6m30s, artifacts `xnu-kernel` + `xnu-buildtree`). Not downloaded, not booted yet.
+- **Next, in order:** `gh run download 43151858000 -R URFAVF3MBOY/ios-sweet -n xnu-kernel` into a fresh dir; keep the current `xnu/out/kernel.development.sweet` as `.0195`; check the 0196 strings (sweet_sound / kern.sweetsound) are in it; build the image with the 0192 line (scratchpad bootline-0192.txt; if that scratchpad is gone, take the line from `shim/out/shim-boot-0195-7g-bt-ddr.img`) via `tools/mkpayload.py` + repack; `fastboot boot`; `sysctl kern.sweetsound` should reach stage 7; play something.
+- Uncommitted at this point (left as found): `shim/build.sh`, `shim/shim.c` modified, `shim/shim.zip` deleted; untracked `handoff/`, `tools/bthook/bthook.{o,dylib}`, `xnu/patches/patches.zip`.
+- Details of 0196 and the sp.dylib work: see "2026-11-11 (paused here)" further down.
+
 ### >>> 2026-11-10: Redfin / Metal (ios-redfin-main.zip, performance fixes, metal2vulkan) <<<
 - **What the zip is:** extracted to `C:\Users\Felix\Documents\redfin-extract\ios-redfin-main` (outside the repo, untrusted, nothing in it was run). Its README describes ios-redfin (Pixel 5, SM7250/A620), but the zip's `main` branch is the inherited **ios-flame base = Pixel 4, SM8150, Adreno 640: our SoC and GPU**, iOS 16.7.16, xnu-8796 + ios-sweet 0001-0081, flame patches 0082-0124. Redfin's own patches (0900-1030: 90 Hz, DVFS governor, direct scanout) are on branches that are not in the zip. HackiOS (`~/Downloads/hakios-sm8150-main`) has no Metal code.
 - **Their GPU stack is not ours:** their own A640 core (`bsd/dev/sweet_a6xx.c`) + `SweetAccelerator` (IOAcceleratorES); CA renders through **Metal** (v1: host-made pipeline templates; v2: metal2vulkan + Turnip). Ours: HackiOS RedwoodGPU + Mesa freedreno GL (libredwood-gl/OSMesa) under CA's OGL path. So their kernel GPU code does not drop in; their findings and their userland Metal bundle do.
