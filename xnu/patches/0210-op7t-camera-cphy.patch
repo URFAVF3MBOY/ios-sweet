@@ -1,0 +1,109 @@
+op7t-0210: camera: CSIPHY1 and CSID in MIPI C-PHY mode (the IMX586 module is C-PHY)
+
+0209 (2026-11-12): every arm stage passes (no freeze), the sensor streams
+(frame_count 40), but the CSID sees nothing (RX/RDI0 IRQ status and byte
+counters 0) and the buffer stays 0xa5. The decoded init table writes 0x0111
+= 3: CSI signalling mode C-PHY. The 7T's main camera module runs MIPI C-PHY
+with 3 trios (hence "3 lanes" in every mode); 0205 set the PHY up as D-PHY.
+
+Now CSIPHY v1.1 (live DT qcom,csiphy-v1.1) as Qualcomm's downstream
+cam_csiphy_core.c cam_csiphy_config_dev does 3-phase (OnePlus SM8150 kernel
+source, cam_csiphy_1_1_hwreg.h csiphy_common_reg_1_1 / csiphy_3ph_v1_1_reg /
+csiphy_irq_reg_1_1): lane enable 0x2a (bit 2i+1 per trio), 0x818/0x81c,
+0x800 pulse, the 43 writes for each of trios 0..2 (settle 0x12), IRQ masks;
+CSID RX CFG0 PHY type bit 24 = C-PHY. sweetcamdphy=1 keeps 0205's D-PHY.
+
+Apply after 0209.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index e6b5d46..1d27066 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -28,6 +28,7 @@
+ #include <kern/clock.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_spmi_init(void);
+@@ -962,6 +963,24 @@ static const uint16_t cam_phy_table[][2] = {      /* Linux lane_regs_sdm845 (DNP
+ };
+ #define PHY_SETTLE      0x14u
+ 
++/*
++ * 0210: the 7T's IMX586 runs MIPI C-PHY (its init table writes 0x0111 = 3), 3 trios. CSIPHY v1.1 (live DT
++ * qcom,csiphy-v1.1) in 3-phase mode as Qualcomm's downstream cam_csiphy_core.c cam_csiphy_config_dev does it:
++ * common 0x814 = lane enable (bit 2i+1 per trio: 0x2a), 0x818 = 1, 0x81c = 2, 0x800 = 1 (1 ms), 0x800 = 0, then
++ * each trio's 43 writes (settle count 0x12, the table's default), then the IRQ masks. sweetcamdphy=1: 0205's D-PHY.
++ */
++static const uint16_t cam_cphy_v11[3][43][2] = {      /* downstream cam_csiphy_1_1_hwreg.h csiphy_3ph_v1_1_reg; 0xffff = settle low, 0xfffe = settle high */
++	{ {0x0144, 0xB6}, {0x015C, 0x40}, {0x0990, 0x00}, {0x0994, 0x00}, {0x0998, 0x00}, {0x0990, 0x48}, {0x0994, 0x0F}, {0x0998, 0x0A}, {0x098C, 0x50}, {0x098C, 0x5F}, {0x0168, 0x8E}, {0x016C, 0x59}, {0x0104, 0x06}, {0x010C, 0xffff}, {0x0108, 0xfffe}, {0x0114, 0x20}, {0x0150, 0x00}, {0x0188, 0x00}, {0x018C, 0x7f}, {0x0190, 0x7f}, {0x0118, 0x3e}, {0x011C, 0x41}, {0x0120, 0x41}, {0x0124, 0x7F}, {0x0128, 0x00}, {0x012C, 0x00}, {0x0144, 0x32}, {0x0160, 0x02}, {0x01CC, 0x41}, {0x0164, 0x00}, {0x01DC, 0x50}, {0x09B0, 0x40}, {0x015C, 0x40}, {0x09B0, 0x40}, {0x0980, 0x00}, {0x09B0, 0x23}, {0x015C, 0x40}, {0x0984, 0x00}, {0x0988, 0x04}, {0x09AC, 0x55}, {0x01DC, 0xA0}, {0x0164, 0x2B}, {0x0800, 0x02} },
++	{ {0x0344, 0xB6}, {0x035C, 0x40}, {0x0A90, 0x00}, {0x0A94, 0x00}, {0x0A98, 0x00}, {0x0A90, 0x48}, {0x0A94, 0x0F}, {0x0A98, 0x0A}, {0x0A8C, 0x50}, {0x0A8C, 0x5F}, {0x0368, 0x8E}, {0x036C, 0x59}, {0x0304, 0x06}, {0x030C, 0xffff}, {0x0308, 0xfffe}, {0x0314, 0x20}, {0x0350, 0x00}, {0x0388, 0x00}, {0x038C, 0x7f}, {0x0390, 0x7f}, {0x0318, 0x3e}, {0x031C, 0x41}, {0x0320, 0x41}, {0x0324, 0x7F}, {0x0328, 0x00}, {0x032C, 0x00}, {0x0344, 0x32}, {0x0360, 0x02}, {0x03CC, 0x41}, {0x0364, 0x00}, {0x03DC, 0x50}, {0x0AB0, 0x40}, {0x035C, 0x40}, {0x0AB0, 0x40}, {0x0A80, 0x00}, {0x0AB0, 0x23}, {0x035C, 0x40}, {0x0A84, 0x00}, {0x0A88, 0x04}, {0x0AAC, 0x55}, {0x03DC, 0xA0}, {0x0364, 0x2B}, {0x0800, 0x02} },
++	{ {0x0544, 0xB6}, {0x055C, 0x40}, {0x0B90, 0x00}, {0x0B94, 0x00}, {0x0B98, 0x00}, {0x0B90, 0x48}, {0x0B94, 0x0F}, {0x0B98, 0x0A}, {0x0B8C, 0x50}, {0x0B8C, 0x5F}, {0x0568, 0x8E}, {0x056C, 0x59}, {0x0504, 0x06}, {0x050C, 0xffff}, {0x0508, 0xfffe}, {0x0514, 0x20}, {0x0550, 0x00}, {0x0588, 0x00}, {0x058C, 0x7f}, {0x0590, 0x7f}, {0x0518, 0x3e}, {0x051C, 0x41}, {0x0520, 0x41}, {0x0524, 0x7F}, {0x0528, 0x00}, {0x052C, 0x00}, {0x0544, 0x32}, {0x0560, 0x02}, {0x05CC, 0x41}, {0x0564, 0x00}, {0x05DC, 0x50}, {0x0BB0, 0x40}, {0x055C, 0x40}, {0x0BB0, 0x40}, {0x0B80, 0x00}, {0x0BB0, 0x23}, {0x055C, 0x40}, {0x0B84, 0x00}, {0x0B88, 0x04}, {0x0BAC, 0x55}, {0x05DC, 0xA0}, {0x0564, 0x2B}, {0x0800, 0x02} },
++};
++
++#define CPHY_SETTLE     0x12u
++static const uint16_t cam_cphy_irq_v11[11][2] = {
++	{0x082c, 0xFF}, {0x0830, 0xFF}, {0x0834, 0xFB}, {0x0838, 0xFF}, {0x083c, 0x7F}, {0x0840, 0xFF},
++	{0x0844, 0xFF}, {0x0848, 0xEF}, {0x084c, 0xFF}, {0x0850, 0xFF}, {0x0854, 0xFF},
++};
++
+ static void
+ cam_live_arm(void)
+ {
+@@ -1032,7 +1051,35 @@ cam_live_arm(void)
+ 		return;
+ 	}
+ 
+-	cam_say("CSIPHY1:");
++	int dphy = 0;
++	PE_parse_boot_argn("sweetcamdphy", &dphy, sizeof(dphy));
++	if (!dphy) {
++		cam_say("CSIPHY1 (C-PHY, 3 trios):");
++		wr32(cam_phy, PHY_CMN(6), 2u);                                  /* show rev id */
++		cam_say("  hw version %02x%02x%02x%02x", rd32(cam_phy, PHY_STATUS(15)) & 0xffu,
++		    rd32(cam_phy, PHY_STATUS(14)) & 0xffu, rd32(cam_phy, PHY_STATUS(13)) & 0xffu,
++		    rd32(cam_phy, PHY_STATUS(12)) & 0xffu);
++		wr32(cam_phy, 0x814, 0x2au);                                    /* trios 0/1/2 */
++		wr32(cam_phy, 0x818, 1u);
++		wr32(cam_phy, 0x81c, 2u);
++		wr32(cam_phy, 0x800, 1u);
++		delay(1000);
++		wr32(cam_phy, 0x800, 0);
++		for (unsigned t = 0; t < 3; t++) {
++			for (unsigned i = 0; i < 43; i++) {
++				uint16_t a = cam_cphy_v11[t][i][0], v = cam_cphy_v11[t][i][1];
++
++				wr32(cam_phy, a, v == 0xffff ? CPHY_SETTLE : v == 0xfffe ? 0u : v);
++			}
++		}
++		for (unsigned i = 0; i < 11; i++) {
++			wr32(cam_phy, cam_cphy_irq_v11[i][0], cam_cphy_irq_v11[i][1]);
++		}
++		cam_say("  trios 0/1/2 on, settle %#x", CPHY_SETTLE);
++		CAM_ARM_STAGE(5, "CSIPHY1 (C-PHY)");
++		goto csiphy_done;
++	}
++	cam_say("CSIPHY1 (D-PHY):");
+ 	wr32(cam_phy, PHY_CMN(0), 1u);
+ 	delay(5000);
+ 	wr32(cam_phy, PHY_CMN(0), 0);
+@@ -1051,6 +1098,7 @@ cam_live_arm(void)
+ 	}
+ 	cam_say("  lanes 0/1/2 + clock on, settle %#x", PHY_SETTLE);
+ 	CAM_ARM_STAGE(5, "CSIPHY1");
++csiphy_done:
+ 
+ 	cam_say("IFE0:");
+ 	wr32(cam_ife, VFE_IRQ_MASK_0, 1u << 31);
+@@ -1095,7 +1143,8 @@ cam_live_arm(void)
+ 	wr32(cam_csid, CSID_IRQ_CMD, 1u);
+ 	wr32(cam_csid, CSID_RDI0_IRQ_MASK, ~0u);
+ 	wr32(cam_csid, 0x024, ~0u);                                             /* CSI2 RX IRQ mask */
+-	wr32(cam_csid, CSID_CSI2_RX_CFG0, 2u | (0x210u << 4) | (1u << 20));     /* 3 lanes, DL0..2 = 0..2, PHY 1, D-PHY */
++	/* 3 lanes/trios, DL0..2 = 0..2, PHY 1, PHY type (bit 24): C-PHY unless sweetcamdphy=1 (0210) */
++	wr32(cam_csid, CSID_CSI2_RX_CFG0, 2u | (0x210u << 4) | (1u << 20) | (dphy ? 0u : (1u << 24)));
+ 	wr32(cam_csid, CSID_CSI2_RX_CFG1, 1u | (1u << 6));
+ 	wr32(cam_csid, CSID_RDI0_CFG0, 1u | (1u << 1) | (1u << 2) | (0xfu << 12) | (0x2bu << 16));
+ 	wr32(cam_csid, CSID_RDI0_CFG1, 2u);
