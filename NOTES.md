@@ -82,6 +82,11 @@
     - an ASM stream (open, shared-memory map, write PCM) -> ADM (copp) -> AFE port 0x1006.
     - It needs memory the ADSP can reach (apps SMMU stream for LPASS, as vayu_audio.c does): a kernel patch.
     - Then a quiet test tone (low amplitude), unmute.
+  - **Data-path plan (from HackiOS vayu_audio.c sound=2/4, same SM8150):**
+    - The DSP reads PCM from our memory through apps-SMMU stream **0x1b21** (DT qcom,msm-audio-ion iommus <&apps_smmu 0x1b21>, smmu-sid-mask 0xf: Linux hands the DSP addresses with the SID's low bits (1) at bit 32).
+    - ADM open (no processing) to port 0x1006 + ASM stream open (16/32-bit PCM), shared-memory map, write buffers; vayu plays 1 kHz at -30 dBFS first, then feeds what iOS writes.
+    - **Ours already has `sweet_smmu_identity(sid)` / `sysctl kern.sweetsmmu_map=SID` (0138, USB):** a stage-1 context mapping 0x80000000-0xffffffff to itself. It needs extending with the bit-32 alias (0x1_80000000 -> 0x80000000).
+    - Still missing from userland: a physically contiguous buffer under 4 GiB + its PA + a way to fill it. That's a small kernel patch (sysctl: allocate, report PA, write PCM). After it, ASM/ADM can be driven from sweetaudio.py over kern.sweetapr.
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
