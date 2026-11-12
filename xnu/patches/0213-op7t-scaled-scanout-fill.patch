@@ -1,0 +1,120 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 12 Nov 2026 23:55:00 -0500
+Subject: [PATCH] op7t-0213: scaled scanout fills the panel (no black bars)
+
+0198 shows the whole 1125x2436 iPhone X picture at true aspect, 0.96 both
+ways: 1080x2339, black bars of 30/31 rows, and the status bar (time,
+battery) moved in from the panel's corners. User, 2026-11-12: the two
+black bars and the shifted time/battery look wrong.
+
+Now the default (sweetscale=2) scales the 2436 rows onto all 2400 panel
+rows: x 0.96, y 0.985 (the picture is 2.5% narrower than true, not
+noticeable), no bars. sweetscale=1 = 0198's letterbox, 0 = crop.
+sweet_fb_scaled carries the mode (1 letterbox, 2 fill) and touch in
+SweetHID.cpp maps panel y / 2400 in fill mode.
+
+(Apple does the same 0.96 downscale on the iPhone 12 mini: 1125x2436 onto
+its 1080x2340 panel.)
+
+Apply after 0212.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -978,10 +978,17 @@ static const uint32_t kScanSaved[] = {
+ #define SCALE_SRC_W     563u            /* columns each pipe reads: 0..562 and 562..1124 */
+ #define SCALE_SRC_X1    562u
+ #define SCALE_DST_W     540u            /* each pipe's half of the panel */
+-#define SCALE_DST_H     2339u           /* 2436 * 1080 / 1125 = 2338.6 */
+-#define SCALE_TOP       30u             /* (2400 - 2339) / 2 */
++/*
++ * 0213: two scaled layouts (boot-arg sweetscale): 2 (default) = fill, the 2436 rows onto all 2400 panel rows
++ * (x 0.96, y 0.985: 2.5% narrower than true, no black bars, the status bar back at the panel's top corners);
++ * 1 = 0198's letterbox, true aspect, 2339 rows 30 down, black bars 30/31 rows. 0 = crop.
++ */
++#define SCALE_FIT_H     2339u           /* 2436 * 1080 / 1125 = 2338.6 */
++#define SCALE_FIT_TOP   30u             /* (2400 - 2339) / 2 */
++static uint32_t scale_dst_h = 2400u, scale_top = 0;
++static int scale_mode = 2;
+ 
+-/* read by SweetHID.cpp (touch): 1 while the panel shows a scaled surface (0198) */
++/* read by SweetHID.cpp (touch): 0 cropped, 1 letterbox (y - 30) / 2339, 2 fill y / 2400 (0198, 0213) */
+ extern "C" { volatile int sweet_fb_scaled; }
+ 
+ void
+@@ -1016,8 +1023,13 @@ AppleCLCD::scanSetup(void)
+ 	}
+ 
+ 	/* 0198: ABL's pipe values for the splash buffer, and whether the scalers can be used */
+-	uint32_t scale = 1;
++	uint32_t scale = 2;
+ 	PE_parse_boot_argn("sweetscale", &scale, sizeof(scale));
++	if (scale == 1) {
++		scale_mode = 1;
++		scale_dst_h = SCALE_FIT_H;
++		scale_top = SCALE_FIT_TOP;
++	}
+ 	for (uint32_t i = 0; i < SCAN_SAVED; i++) {
+ 		fAbl[0][i] = fVig0[kScanSaved[i] / 4];
+ 		fAbl[1][i] = fVig1[kScanSaved[i] / 4];
+@@ -1030,7 +1042,9 @@ AppleCLCD::scanSetup(void)
+ 	/* 0x1002 (QSEED3 1.0.2) packs the initial phases differently; 0 / all ones: no scaler there */
+ 	fScale = scale != 0 && fLogicalW == 1125 && fLogicalH == 2436 && fWidth == 1080 && fHeight == 2400 &&
+ 	    fQseedVer != 0 && fQseedVer != 0xffffffffu && fQseedVer != 0x1002;
+-	IOLog("HOTDOGB SCAN: scaling %s\n", fScale ? "on (1125x2436 -> 1080x2339, 30 rows down)" :
++	IOLog("HOTDOGB SCAN: scaling %s\n", !fScale ? "" : scale_mode == 1 ? "on (1125x2436 -> 1080x2339, 30 rows down)" :
++	    "on (1125x2436 -> 1080x2400, fill)");
++	IOLog("HOTDOGB SCAN: %s\n", fScale ? "(sweetscale=1 letterbox, 2 fill, 0 crop)" :
+ 	    scale == 0 ? "off (sweetscale=0): cropped" : "not possible here: cropped");
+ }
+ 
+@@ -1051,13 +1065,13 @@ void
+ AppleCLCD::scanScaled(uint32_t pa, uint32_t stride)
+ {
+ 	const uint32_t step_x = (uint32_t)(((uint64_t)1125 << 21) / 1080);
+-	const uint32_t step_y = (uint32_t)(((uint64_t)2436 << 21) / SCALE_DST_H);
++	const uint32_t step_y = (uint32_t)(((uint64_t)2436 << 21) / scale_dst_h);
+ 	/* initial phase: where the first output pixel's centre falls in the pipe's first source column, minus 0.5 */
+-	const uint32_t init_y = (uint32_t)((((uint64_t)2436 << 21) / (2 * SCALE_DST_H)) - (1u << 20));
++	const uint32_t init_y = (uint32_t)((((uint64_t)2436 << 21) / (2 * scale_dst_h)) - (1u << 20));
+ 	const uint32_t init_x0 = (uint32_t)((((uint64_t)1125 << 21) / (2 * 1080)) - (1u << 20));
+ 	const uint32_t init_x1 = (uint32_t)(((((uint64_t)(2 * SCALE_DST_W + 1) * 1125) << 21) / (2 * 1080)) -
+ 	    (1u << 20) - ((uint64_t)SCALE_SRC_X1 << 21));
+-	const uint32_t src = (2436u << 16) | SCALE_SRC_W, dst = (SCALE_DST_H << 16) | SCALE_DST_W;
++	const uint32_t src = (2436u << 16) | SCALE_SRC_W, dst = (scale_dst_h << 16) | SCALE_DST_W;
+ 	volatile uint32_t *pipe[2] = { fVig0, fVig1 };
+ 
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* the pixels before the switch */
+@@ -1075,7 +1089,7 @@ AppleCLCD::scanScaled(uint32_t pa, uint32_t stride)
+ 		p[SSPP_SRC_SIZE / 4] = src;
+ 		p[SSPP_SRC_IMG_SIZE / 4] = (2436u << 16) | 1125u;
+ 		p[SSPP_OUT_SIZE / 4] = dst;
+-		p[SSPP_OUT_XY / 4] = (SCALE_TOP << 16) | (fAbl[i][3] & 0xffffu);   /* x as ABL put it in the mixer */
++		p[SSPP_OUT_XY / 4] = (scale_top << 16) | (fAbl[i][3] & 0xffffu);   /* x as ABL put it in the mixer */
+ 		p[SSPP_PE_C0_LR / 4] = 0;
+ 		p[SSPP_PE_C0_TB / 4] = 0;
+ 		p[SSPP_PE_C0_REQ / 4] = src;
+@@ -1107,7 +1121,7 @@ AppleCLCD::scanScaled(uint32_t pa, uint32_t stride)
+ 		    init_y);
+ 	}
+ 	fScaledNow = true;
+-	sweet_fb_scaled = 1;
++	sweet_fb_scaled = scale_mode;
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -361,8 +361,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * sweetscale), a panel pixel maps to the picture as x / 1080, (y - 30) / 2339; the edge zone follows the picture.
+  */
+ extern "C" volatile int sweet_fb_scaled;
+-#define SWEET_TOUCH_SCALED_TOP 30
+-#define SWEET_TOUCH_SCALED_H   2339
++/* sweet_fb_scaled 1: letterbox, rows 30..2368 (0198); 2: fill, all 2400 rows (0213) */
++#define SWEET_TOUCH_SCALED_TOP (sweet_fb_scaled == 2 ? 0 : 30)
++#define SWEET_TOUCH_SCALED_H   (sweet_fb_scaled == 2 ? 2400 : 2339)
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
