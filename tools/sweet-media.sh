@@ -40,6 +40,11 @@ else
 fi
 
 # ---- the speakers ----
+# 0196+: the kernel does all of this itself from boot (bsd/dev/sweet_sound.c; kern.sweetsound shows it)
+if sysctl -n kern.sweetsound >/dev/null 2>&1; then
+	say "audio: done by the kernel (0196): $(sysctl -n kern.sweetsound)"
+	exit 0
+fi
 sysctl -w kern.sweetadsp=1 >/dev/null 2>&1
 n=0
 while [ $n -lt 60 ]; do
