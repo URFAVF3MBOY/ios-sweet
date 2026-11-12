@@ -1,0 +1,71 @@
+op7t-0209: camera buffer used through its cached kernel address (no 2 MiB uncached map)
+
+0208 (2026-11-12): stage 2 froze the phone again with a plain 4 MiB page-
+aligned kmem_alloc_contig. 0205's 2 MiB allocation itself succeeded (it only
+failed the alignment check, no freeze); what 0206 and 0208 add after the
+allocation is ml_io_map of the 2 MiB (an uncached device mapping of RAM),
+then the freeze. The audio (512 KB) and test-pattern (64 KB) buffers use
+ml_io_map fine. Now the buffer is used at its normal cached kernel address
+with flush_dcache64 (clean + invalidate, as sweet_usb.c's DMA does) after
+the 0xa5 fill, before the report's count and before each kern.sweetcambuf
+read.
+
+Apply after 0208.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 80e26ed..e6b5d46 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -881,6 +881,7 @@ cam_capture_test(void)
+ extern int sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa);
+ extern int sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va);
+ extern int sweet_smmu_bank_fault(int bank, uint32_t *fsr, uint64_t *far);
++extern void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);   /* clean + invalidate (0209; as sweet_usb.c) */
+ 
+ #define CAM_CSIPHY1_PA          0x0ac66000u
+ #define CAM_LIVE_SIZE           0x200000u
+@@ -1019,6 +1020,7 @@ cam_live_arm(void)
+ 	for (uint32_t i = 0; i < CAM_LIVE_SIZE; i += 4) {
+ 		*(volatile uint32_t *)(cam_live_va + i) = 0xa5a5a5a5u;
+ 	}
++	flush_dcache64((addr64_t)cam_live_va, CAM_LIVE_SIZE, FALSE);    /* 0209: the buffer is cached: out to memory before the IFE */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	CAM_ARM_STAGE(4, "buffer filled with 0xa5");
+ 
+@@ -1144,6 +1146,7 @@ cam_live_stop(void)
+ 	wr32(cam_csid, CSID_RDI0_CTRL, 0);
+ 	wr32(cam_ife, VFE_BUS_WM_CFG(0), 0);
+ 	delay(50000);
++	flush_dcache64((addr64_t)cam_live_va, CAM_LIVE_SIZE, FALSE);    /* 0209: drop stale cache lines before reading the IFE's data */
+ 	for (uint32_t i = 0; i < CAM_LIVE_SIZE; i += 4) {
+ 		if (*(volatile uint32_t *)(cam_live_va + i) != 0xa5a5a5a5u) {
+ 			changed += 4;
+@@ -1184,6 +1187,7 @@ sysctl_sweetcambuf SYSCTL_HANDLER_ARGS
+ 		return ENXIO;
+ 	}
+ 	uint32_t n = MIN((uint32_t)sizeof(chunk), CAM_LIVE_SIZE - cam_buf_off);
++	flush_dcache64((addr64_t)(cam_live_va + cam_buf_off), n, FALSE);
+ 	for (uint32_t i = 0; i < n; i += 4) {
+ 		uint32_t v = *(volatile uint32_t *)(cam_live_va + cam_buf_off + i);
+ 		memcpy(chunk + i, &v, 4);
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 7cdadf8..c32c3cc 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -486,10 +486,12 @@ sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va)
+ 	if (pn == 0 || p < 0x80000000ull || aligned + 0x200000ull > p + 0x400000ull || aligned + 0x200000ull > 0x100000000ull) {
+ 		return ERANGE;
+ 	}
+-	*va = ml_io_map((vm_offset_t)aligned, 0x200000);
+-	if (*va == 0) {
+-		return ENOMEM;
+-	}
++	/*
++	 * 0209: no ml_io_map of the 2 MiB: an uncached mapping that large froze the phone (0206, 0208 stage 2; the
++	 * 512 KB audio / 64 KB test buffers are mapped that way fine). The caller uses the normal cached kernel
++	 * address and flushes the data cache around the IFE's writes (flush_dcache).
++	 */
++	*va = kva + (vm_offset_t)(aligned - p);
+ 	*pa = aligned;
+ 	return 0;
+ }
