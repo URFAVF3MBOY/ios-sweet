@@ -30,19 +30,67 @@ def v2f(segs, vm):
     return None
 
 
-def prelink_info(d, segs):
+def prelink_plist(d, segs):
+    """__PRELINK_INFO as Python objects (Apple's XML with ID= / IDREF= sharing, which plistlib rejects)."""
     seg = [s for s in segs if s[0] == '__PRELINK_INFO'][0]
-    xml = d[seg[3]:seg[3] + seg[4]].decode('latin1')
+    xml = d[seg[3]:seg[3] + seg[4]].split(b'\0')[0].decode('latin1')
+    tok = re.compile(r'<(/?)(dict|array|key|string|integer|data|true|false|date|real)([^>]*?)(/?)>')
+    ids = {}
+    pos = [0]
+
+    def text_until(tag):
+        e = xml.index('</%s>' % tag, pos[0])
+        t = xml[pos[0]:e]
+        pos[0] = e + len(tag) + 3
+        return t
+
+    def value():
+        m = tok.search(xml, pos[0])
+        pos[0] = m.end()
+        closing, tag, attrs, selfclose = m.groups()
+        idm = re.search(r'\bID="([^"]+)"', attrs)
+        ref = re.search(r'\bIDREF="([^"]+)"', attrs)
+        if ref:
+            return ids[ref.group(1)]
+        if tag == 'dict':
+            v = {}
+            if not selfclose:
+                while True:
+                    m2 = tok.search(xml, pos[0])
+                    if m2.group(1) and m2.group(2) == 'dict':
+                        pos[0] = m2.end()
+                        break
+                    pos[0] = m2.end()
+                    key = text_until('key')
+                    v[key] = value()
+        elif tag == 'array':
+            v = []
+            if not selfclose:
+                while True:
+                    m2 = tok.search(xml, pos[0])
+                    if m2.group(1) and m2.group(2) == 'array':
+                        pos[0] = m2.end()
+                        break
+                    v.append(value())
+        elif tag in ('true', 'false'):
+            v = tag == 'true'
+        elif selfclose:
+            v = '' if tag != 'integer' else 0
+        else:
+            t = text_until(tag)
+            v = int(t, 0) if tag == 'integer' else t
+        if idm:
+            ids[idm.group(1)] = v
+        return v
+    return value()
+
+
+def prelink_info(d, segs):
+    """bundle id -> (_PrelinkExecutableLoadAddr, _PrelinkExecutableSize), each top-level kext dict on its own."""
     out = {}
-    for m in re.finditer(r'<key>CFBundleIdentifier</key>\s*<string>([^<]+)</string>', xml):
-        bid = m.group(1)
-        start = xml.rfind('<dict', 0, m.start())
-        end = xml.find('<key>CFBundleIdentifier</key>', m.end())
-        chunk = xml[start:end if end > 0 else m.end() + 20000]
-        la = re.search(r'<key>_PrelinkExecutableLoadAddr</key>\s*<integer[^>]*>(0x[0-9a-f]+|\d+)</integer>', chunk)
-        sz = re.search(r'<key>_PrelinkExecutableSize</key>\s*<integer[^>]*>(0x[0-9a-f]+|\d+)</integer>', chunk)
-        if la and sz:
-            out[bid] = (int(la.group(1), 0), int(sz.group(1), 0))
+    for kd in prelink_plist(d, segs).get('_PrelinkInfoDictionary', []):
+        if '_PrelinkExecutableLoadAddr' in kd:
+            out[kd['CFBundleIdentifier']] = (kd['_PrelinkExecutableLoadAddr'], kd.get('_PrelinkExecutableSize', 0))
     return out
 
 
@@ -76,7 +124,12 @@ def main():
         if val:
             sym[val] = d[stroff + strx:stroff + strx + 300].split(b'\0')[0].decode('latin1')
     info = prelink_info(d, segs)
-    ranges = sorted((v[0], v[0] + v[1], k) for k, v in info.items())
+    ranges = []
+    for bid_, (base_, size_) in info.items():          # every segment of every kext (code/data live apart)
+        for sn, vm, vsz, _ in kext_segments(d, segs, base_):
+            if vsz:
+                ranges.append((vm, vm + vsz, bid_))
+    ranges.sort()
     text = [s for s in segs if s[0] == '__TEXT_EXEC'] or [s for s in segs if s[0] == '__TEXT']
 
     def owner(a):

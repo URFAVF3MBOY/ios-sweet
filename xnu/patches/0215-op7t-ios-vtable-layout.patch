@@ -1,0 +1,39 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Fri, 13 Nov 2026 01:10:00 -0500
+Subject: [PATCH] op7t-0215: iOS vtable layout (no reserved slots) for Apple's kexts
+
+Goal (user, option 1): load Apple's own USB device kexts from the iPhone X
+iOS 16.5 kernelcache (AppleUSBCommon -> IOUSBDeviceFamily ->
+AppleUSBDeviceMux) so the PC sees a real iPhone. Survey (tools/
+kc_imports.py with a fixed __PRELINK_INFO parser, tools/kc_symcheck.py):
+the three kexts reach 405 kernel symbols, all present in our kernel, and
+nothing unnamed. But the vtables differ: OSObject 15 entries in the iOS
+kernel vs 39 in ours, IOService 168 vs 272. By name the only difference
+is 128 reserved padding slots (_RESERVEDOSMetaClassBase*, _RESERVEDOSObject*,
+_RESERVEDIOService*): iOS kernels are built with APPLE_KEXT_VTABLE_PADDING
+0, ours (macOS SDK, XNU_TARGET_OS_OSX) with 1, so every virtual call in an
+iOS kext would hit the wrong slot.
+
+Padding off for the sweet board. All C++ in our kernel is rebuilt with it;
+the closed KDK library members we link are C/asm only (no vtables).
+APPLE_KEXT_ALIGN_CONTAINERS stays 1 (macOS arm64 rule = iOS rule here).
+
+Apply after 0214.
+---
+diff --git a/libkern/libkern/c++/OSMetaClass.h b/libkern/libkern/c++/OSMetaClass.h
+--- a/libkern/libkern/c++/OSMetaClass.h
++++ b/libkern/libkern/c++/OSMetaClass.h
+@@ -162,7 +162,12 @@ class OSInterface
+ 
+ #ifdef XNU_KERNEL_PRIVATE
+ 
+-#if !XNU_TARGET_OS_OSX
++/*
++ * op7t 0215: the sweet kernel is built with the macOS SDK (XNU_TARGET_OS_OSX) but must host Apple's iOS 16
++ * arm64 kexts (IOUSBDeviceFamily, AppleUSBDeviceMux, AppleUSBCommon from the iPhone X kernelcache). iOS
++ * kernels have no reserved vtable slots: same layout as theirs, every virtual call slot matches.
++ */
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
+ #define APPLE_KEXT_VTABLE_PADDING   0
+ #else /* !XNU_TARGET_OS_OSX */
+ #define APPLE_KEXT_VTABLE_PADDING   1
