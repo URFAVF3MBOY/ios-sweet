@@ -6,7 +6,7 @@
 #   camio.py write ADDR REG BYTES [REGLEN]   camio.py write 1a 0100 01
 #   camio.py eeprom [BYTES] [OUT]            dump the module EEPROM (16-bit addresses), default 0x2000 bytes
 #   camio.py sensor                          IMX586 id/revision/mode/frame count
-import ctypes, struct, sys
+import ctypes, struct, sys, time
 
 libc = ctypes.CDLL(None)
 libc.sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
@@ -67,6 +67,39 @@ def main(a):
         for off in range(0, min(len(buf), 0x100), 16):
             row = buf[off:off + 16]
             print("%04x  %-48s %s" % (off, row.hex(" "), "".join(chr(c) if 32 <= c < 127 else "." for c in row)))
+    elif cmd == "table":
+        # camio.py table REGS.txt N...: write tables (output of tools/chromatix_regs.py --all) to the IMX586 (0x1a)
+        lines = open(a[1]).read().splitlines()
+        want = [int(x) for x in a[2:]]
+        for n in want:
+            cur, rows = None, []
+            for line in lines:
+                if line.startswith("# table "):
+                    cur = int(line.split()[2].rstrip(":"))
+                    continue
+                if cur == n and line and not line.startswith("#"):
+                    rows.append(line.split())
+            for r in rows:
+                addr, val = int(r[0], 16), int(r[1], 16)
+                write(0x1a, addr, bytes([val]))
+                if "(delay" in " ".join(r):
+                    us = int(" ".join(r).split("(delay")[1].split()[0])
+                    time.sleep(us / 1e6)
+            print("table %d: %d writes" % (n, len(rows)))
+    elif cmd == "dumpbuf":
+        # camio.py dumpbuf OUT [BYTES]: the kernel's capture buffer (0205 kern.sweetcambuf)
+        out = a[1]
+        total = int(a[2], 0) if len(a) > 2 else 0x200000
+        buf = bytearray()
+        for off in range(0, total, 4096):
+            o = ctypes.c_uint32(off)
+            data = ctypes.create_string_buffer(4096)
+            size = ctypes.c_size_t(4096)
+            if libc.sysctlbyname(b"kern.sweetcambuf", data, ctypes.byref(size), ctypes.byref(o), 4) != 0:
+                raise OSError(ctypes.get_errno(), "sysctl kern.sweetcambuf")
+            buf += data.raw[:size.value]
+        open(out, "wb").write(buf)
+        print("%d bytes -> %s" % (len(buf), out))
     elif cmd == "sensor":
         mid = read(0x1a, 0x0016, 2)
         rev = read(0x1a, 0x0018, 1)

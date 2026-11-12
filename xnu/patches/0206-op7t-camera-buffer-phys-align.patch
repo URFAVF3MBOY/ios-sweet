@@ -1,0 +1,26 @@
+op7t-0206: the 2 MiB camera buffer really 2 MiB-aligned (physical)
+
+0205 on the phone (2026-11-12): PLL0/PLL3 locked, all capture clocks on,
+then "no 2 MiB buffer (34)": kmem_alloc_contig's mask argument aligns the
+virtual address; physical alignment is pnum_mask, in pages. The ERANGE came
+from sweet_cam_dma_buffer_2m's own check (physical address not 2 MiB
+aligned), as intended. Now pnum_mask = atop(2 MiB) - 1.
+
+Apply after 0205.
+---
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 07a569a..a620882 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -471,8 +471,9 @@ sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va)
+ 	ppnum_t pn;
+ 	uint64_t p;
+ 
+-	if (kmem_alloc_contig(kernel_map, &kva, 0x200000, 0x1fffff, (ppnum_t)(atop(0x100000000ull) - 1), 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/* 0206: physical alignment is pnum_mask (in pages); mask only aligns the virtual address */
++	if (kmem_alloc_contig(kernel_map, &kva, 0x200000, PAGE_MASK, (ppnum_t)(atop(0x100000000ull) - 1),
++	    (ppnum_t)(atop(0x200000ull) - 1), KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return ENOMEM;
+ 	}
+ 	pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
