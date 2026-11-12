@@ -3,6 +3,12 @@
  * Logs every option bluetoothd sets/gets on its kernel control (level SYSPROTO_CONTROL = 2) with its bytes,
  * and answers success where the kernel says ENOPROTOOPT, so we can see what bluetoothd's H4 driver wants
  * before changing sweet_bt.c. Logs go to syslog ("bthook:" in oslog).
+ *
+ * From kernel 0197 the kernel does the rest itself: bluetoothd starts with BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt,...
+ * already in its environment, the control is registered under that name, and sweet_bt.c makes the HCI edits. When
+ * the constructor finds that variable already set (only the kernel sets it before bluetoothd's main), every
+ * interposer passes straight through and only fix_h4_teardown (the power-off crash) is left. On older kernels the
+ * hook does everything as before.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -34,6 +40,7 @@ extern const char *_dyld_get_image_name(uint32_t);
 static int verbose;
 #define VLOG(...) do { if (verbose) syslog(__VA_ARGS__); } while (0)
 
+static int passthru;	/* 0197+ kernel: BT_HCI_TRANSPORT came from exec, the kernel does the rest */
 static int bt_fd = -1;
 static int bt_fresh;	/* new H4 connection: drop the receive parser's and queue's leftovers before the next read */
 static unsigned bt_logged;
@@ -50,6 +57,9 @@ static void hex(char *out, size_t cap, const void *p, size_t n)
 static int my_set(int s, int lvl, int opt, const void *v, socklen_t l)
 {
 	int r = setsockopt(s, lvl, opt, v, l);
+	if (passthru) {
+		return r;
+	}
 	if (lvl == SYSPROTO_CONTROL && (unsigned)opt == 0x80487414u) {
 		bt_fd = s;	/* TIOCSETA on the Bluetooth control: from here on, this fd carries H4 */
 		bt_fresh = 1;	/* (Bluetooth off/on reconnects: the old stream may have ended mid-packet) */
@@ -72,6 +82,9 @@ static int my_get(int s, int lvl, int opt, void *v, socklen_t *l)
 {
 	socklen_t want = l ? *l : 0;
 	int r = getsockopt(s, lvl, opt, v, l);
+	if (passthru) {
+		return r;
+	}
 	if (lvl == SYSPROTO_CONTROL) {
 		int e = r < 0 ? *__error() : 0;
 		char h[160];
@@ -120,7 +133,7 @@ static int my_ioctl(int fd, unsigned long req, ...)
 	__builtin_va_start(ap, req);
 	arg = __builtin_va_arg(ap, void *);
 	__builtin_va_end(ap);
-	if (req == CTLIOCGINFO && arg != NULL) {
+	if (!passthru && req == CTLIOCGINFO && arg != NULL) {
 		char *name = (char *)arg + 4;	/* struct ctl_info { u_int32_t ctl_id; char ctl_name[96]; } */
 
 		if (same(name, BT_FAKE_NAME)) {
@@ -295,7 +308,7 @@ static ssize_t h4_read(int fd, void *b, size_t n, int f, int use_recv)
 
 static ssize_t my_read(int fd, void *b, size_t n)
 {
-	if (fd == bt_fd) {
+	if (!passthru && fd == bt_fd) {
 		return h4_read(fd, b, n, 0, 0);
 	}
 	return read(fd, b, n);
@@ -316,7 +329,7 @@ static ssize_t my_write(int fd, const void *b, size_t n)
 
 static ssize_t my_recv(int fd, void *b, size_t n, int f)
 {
-	if (fd == bt_fd) {
+	if (!passthru && fd == bt_fd) {
 		return h4_read(fd, b, n, f, 1);
 	}
 	return recv(fd, b, n, f);
@@ -416,8 +429,11 @@ __attribute__((constructor)) static void init(void)
 {
 	verbose = getenv("BTHOOK_LOG") != NULL;
 	fix_h4_teardown();
-	if (getenv("BT_HCI_TRANSPORT") == NULL) {
+	if (getenv("BT_HCI_TRANSPORT") != NULL) {
+		passthru = 1;	/* set before main: by the kernel's exec (0197), which also does the HCI edits */
+	} else {
 		setenv("BT_HCI_TRANSPORT", "H4:POSIX:" BT_FAKE_NAME ",115200", 1);
 	}
-	syslog(LOG_NOTICE, "bthook: loaded (interpose), BT_HCI_TRANSPORT=%s", getenv("BT_HCI_TRANSPORT"));
+	syslog(LOG_NOTICE, "bthook: loaded (interpose), BT_HCI_TRANSPORT=%s, %s", getenv("BT_HCI_TRANSPORT"),
+	    passthru ? "kernel does the HCI part: only the H4 teardown fix" : "doing the HCI part here");
 }
