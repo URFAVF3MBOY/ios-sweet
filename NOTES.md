@@ -3,10 +3,15 @@
 ## Agent handoff / active work (2026-11-09, latest)
 
 ### >>> RESUME HERE (2026-11-11, user switching Claude accounts) <<<
-- **0196 image BUILT, not booted yet (2026-11-11 23:34):** kernel from CI run 43151858000 (sha256 8d3656ba.., matches the run's SHA256SUMS; has sweet_sound / sweetsound / sweetsoundgain / sweetsounddelay strings) is now `xnu/out/kernel.development.sweet`; 0195 (04c33de2) kept as `.0195`.
+- **0196 BOOTED, SPEAKERS WORK FROM THE KERNEL (2026-11-11, user: "audio works").** Rebooted from 0195 over ssh with `sysctl -w kern.sweetreboot=2` (fastboot after 8 s), `fastboot boot shim/out/shim-boot-0196-7g-bt-ddr.img`, ssh after ~55 s.
+  - At ~1 min uptime: `kern.sweetsound: stage 7 periods 2251 short 1919 clipped 0 amp-on 3 amp on`; /dev/redwood-audio exists at boot (no mediaserverd restart).
+  - sweet-media.log: bluetooth chip stage 6 + bluetoothd restarted; "audio: done by the kernel (0196)" (script skipped its audio part as intended).
+  - Seen once: ssh timed out about a minute after that, then came back (cause not checked; load was 65 at 1 min uptime).
+  - Next: Bluetooth into the kernel (see "paused here" below), and the sp.dylib investigation.
+- **0196 image build (2026-11-11 23:34):** kernel from CI run 43151858000 (sha256 8d3656ba.., matches the run's SHA256SUMS; has sweet_sound / sweetsound / sweetsoundgain / sweetsounddelay strings) is now `xnu/out/kernel.development.sweet`; 0195 (04c33de2) kept as `.0195`.
   - **Image `shim/out/shim-boot-0196-7g-bt-ddr.img`** = 0196 kernel + `shim/out/sweet-bt-7g.adt` + `--ramdisk shim/out/prep-cores.drop` + the 0192 line (440 bytes), repacked with `tools/repack_bootv2.py` on shim-boot-0195-7g-bt-ddr.img (shim + dtb byte-identical to 0195).
   - Recipe checked: the 0192 line was pulled out of the 0195 image's payload, and rebuilding 0195's payload with it + prep-cores.drop gave the booted one byte for byte. Windows only: `python tools/mkpayload.py K shim/out/sweet-bt-7g.adt P --cmdline "$B" --ramdisk shim/out/prep-cores.drop` then `python tools/repack_bootv2.py shim/out/shim-boot-0195-7g-bt-ddr.img P OUT`.
-- **Next:** phone into fastboot, `fastboot boot shim/out/shim-boot-0196-7g-bt-ddr.img`; ~15 s after boot (sweetsounddelay) `/var/jb/usr/sbin/sysctl kern.sweetsound` should reach stage 7; play something. sweet-media.sh should then skip its audio part (check `/var/root/sweet-media.log`). Fallback: the 0195 image.
+- Reboot to fastboot from a running phone: `ssh root@192.168.7.2 'sync; /var/jb/usr/sbin/sysctl -w kern.sweetreboot=2'` (Git Bash; fastboot.exe is on PATH). Fallback image: 0195.
 - Uncommitted at this point (left as found): `shim/build.sh`, `shim/shim.c` modified, `shim/shim.zip` deleted; untracked `handoff/`, `tools/bthook/bthook.{o,dylib}`, `xnu/patches/patches.zip`.
 - Details of 0196 and the sp.dylib work: see "2026-11-11 (paused here)" further down.
 
