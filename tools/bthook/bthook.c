@@ -21,6 +21,9 @@ extern ssize_t read(int, void *, size_t);
 extern ssize_t write(int, const void *, size_t);
 extern ssize_t recv(int, void *, size_t, int);
 extern ssize_t send(int, const void *, size_t, int);
+extern const void *_dyld_get_image_header(uint32_t);
+extern uint32_t _dyld_image_count(void);
+extern const char *_dyld_get_image_name(uint32_t);
 
 #define ENOPROTOOPT 42
 #define SYSPROTO_CONTROL 2
@@ -28,6 +31,7 @@ extern ssize_t send(int, const void *, size_t, int);
 
 
 static int bt_fd = -1;
+static int bt_fresh;	/* new H4 connection: drop the receive parser's and queue's leftovers before the next read */
 static unsigned bt_logged;
 
 static void hex(char *out, size_t cap, const void *p, size_t n)
@@ -44,6 +48,7 @@ static int my_set(int s, int lvl, int opt, const void *v, socklen_t l)
 	int r = setsockopt(s, lvl, opt, v, l);
 	if (lvl == SYSPROTO_CONTROL && (unsigned)opt == 0x80487414u) {
 		bt_fd = s;	/* TIOCSETA on the Bluetooth control: from here on, this fd carries H4 */
+		bt_fresh = 1;	/* (Bluetooth off/on reconnects: the old stream may have ended mid-packet) */
 	}
 	if (lvl == SYSPROTO_CONTROL) {
 		int e = r < 0 ? *__error() : 0;
@@ -264,6 +269,14 @@ static ssize_t h4_read(int fd, void *b, size_t n, int f, int use_recv)
 {
 	uint8_t tmp[2048];
 
+	if (bt_fresh) {
+		if (pk.n != 0 || qn != 0) {
+			syslog(LOG_NOTICE, "bthook: new connection: dropped %u queued + %u partial bytes from the old one", qn, pk.n);
+		}
+		pk.n = pk.need = 0;
+		qh = qn = 0;
+		bt_fresh = 0;
+	}
 	while (qn == 0) {
 		ssize_t r = use_recv ? recv(fd, tmp, sizeof tmp, f) : read(fd, tmp, sizeof tmp);
 
@@ -336,8 +349,68 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
 	{ (const void *)my_send, (const void *)send },
 };
 
+/*
+ * bluetoothd 16.5 (20F66) power-off crash: its transport table entry for H4 (0x100844218, type 1, name "H4")
+ * leaves the slot at +0x60 empty; the stack teardown (0x1000e656c, from "Terminating stack..." 0x100089030 ->
+ * 0x1000f3970) calls that slot for every transport but USB without a check -> jump to 0, SIGSEGV whenever
+ * Bluetooth is switched off (2026-11-10 02:48:38, 02:55:15). The H4BC/PCIe/H5 entries fill it. Real iPhones never
+ * use plain H4. Filled here with a do-nothing function, after checking it really is that table entry.
+ */
+static int h4_slot60(void)
+{
+	syslog(LOG_NOTICE, "bthook: H4 transport +0x60 called (stack teardown): nothing to do");
+	return 0;
+}
+
+static void fix_h4_teardown(void)
+{
+	const uint8_t *mh = NULL;	/* bluetoothd itself (vmaddr 0x100000000): found by name, not as image 0 */
+	uint64_t *ent;
+	const char *name;
+
+	for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++) {
+		const char *path = _dyld_get_image_name(i);
+		size_t len = 0;
+
+		while (path != NULL && path[len] != 0) {
+			len++;
+		}
+		if (len >= 11 && same(path + len - 11, "/bluetoothd")) {
+			mh = _dyld_get_image_header(i);
+			break;
+		}
+	}
+
+	if (mh == NULL) {
+		return;
+	}
+	ent = (uint64_t *)(void *)(mh + 0x844218);
+	name = (const char *)(mh + 0x70f3b5);
+	if (ent[0] != 1 || ent[1] != (uint64_t)(uintptr_t)name || name[0] != 'H' || name[1] != '4' || name[2] != 0) {
+		/* diagnostics: where (if anywhere) does __DATA point at the "H4" string */
+		unsigned hits = 0;
+		for (const uint64_t *w = (const uint64_t *)(const void *)(mh + 0x834000);
+		    w < (const uint64_t *)(const void *)(mh + 0x848000) && hits < 4; w++) {
+			if (*w == (uint64_t)(uintptr_t)name) {
+				syslog(LOG_NOTICE, "bthook: pointer to \"%s\" at +%#lx ([-1] %#llx)", name,
+				    (unsigned long)((const uint8_t *)w - mh), (unsigned long long)w[-1]);
+				hits++;
+			}
+		}
+		syslog(LOG_NOTICE, "bthook: name bytes %02x %02x %02x, %u pointers found", name[0], name[1], name[2], hits);
+		syslog(LOG_NOTICE, "bthook: H4 transport entry not where 20F66 has it (mh %p, [0] %#llx, [1] %#llx, want %p): "
+		    "teardown slot left alone", mh, (unsigned long long)ent[0], (unsigned long long)ent[1], name);
+		return;
+	}
+	if (ent[12] == 0) {
+		ent[12] = (uint64_t)(uintptr_t)h4_slot60;
+		syslog(LOG_NOTICE, "bthook: H4 transport +0x60 was NULL: filled (power-off crash fix)");
+	}
+}
+
 __attribute__((constructor)) static void init(void)
 {
+	fix_h4_teardown();
 	if (getenv("BT_HCI_TRANSPORT") == NULL) {
 		setenv("BT_HCI_TRANSPORT", "H4:POSIX:" BT_FAKE_NAME ",115200", 1);
 	}

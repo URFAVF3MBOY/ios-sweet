@@ -45,6 +45,13 @@
     - GPU runs: `addresses: ... longest run free 3608 MB`; DDR on, 13952 KB per submission in 431 us.
     - `bt_up.sh` (plus the usual "File exists" re-bootstrap, scratchpad run2.sh) -> **bluetoothd "Stack did start"** with the hook.
   - **Wi-Fi auto-join never worked** (user, 2026-11-11: they always rejoin by hand). The log shows "Join candidate ... not allowed (Below minimum RSSI threshold)" for some Naja2025 BSSIDs even at -54/-60. Not a 0192 regression; open.
+- **2026-11-11: Bluetooth power off/on fixed (hook, verified by toggling in Settings).**
+  - **Crash cause (static, bluetoothd 20F66):** the H4 transport table entry (`__DATA,__data` 0x100844218: type 1, name "H4") has an empty slot at +0x60. H4BC/H5/PCIe/APPLEBT fill theirs. The teardown at 0x1000e656c only skips type 0 (USB), then `br` to that slot -> jump to 0 (SIGSEGV pc 0, the 02:48/02:55 crashes). Real iPhones never use plain H4.
+  - **Fix:** bthook's constructor finds bluetoothd by image name and fills the slot with a do-nothing function, after checking the entry (type 1, pointer to "H4").
+    - `_dyld_get_image_header(0)` is NOT bluetoothd when a library is inserted; its "H4" bytes read as zeros.
+    - Off now: "Terminating stack..." -> "bthook: H4 transport +0x60 called" -> STACK_OFF, no crash.
+  - **Power-on exit:** after the reconnect, bluetoothd quit within a second. Cause: the hook's packet parser kept a half packet from the old connection ("dropped 0 queued + 4 partial bytes"). Now reset at every TIOCSETA (new connection). On: the same bluetoothd reconnects -> STACK_READY.
+  - **Pairings now survive:** "Paired device cache contains 1 device(s)" after restarts. The loss on 11-10 came with the crash.
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 

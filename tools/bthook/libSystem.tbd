@@ -5,5 +5,5 @@ install-name:    '/usr/lib/libSystem.B.dylib'
 current-version: 1319
 exports:
   - targets:     [ arm64-ios, arm64e-ios ]
-    symbols:     [ _setsockopt, _getsockopt, ___error, _syslog, _snprintf, _setenv, _getenv, _ioctl, _read, _write, _recv, _send, dyld_stub_binder ]
+    symbols:     [ _setsockopt, _getsockopt, ___error, _syslog, _snprintf, _setenv, _getenv, _ioctl, _read, _write, _recv, _send, __dyld_get_image_header, __dyld_image_count, __dyld_get_image_name, dyld_stub_binder ]
 ...
