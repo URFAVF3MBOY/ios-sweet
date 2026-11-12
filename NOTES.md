@@ -3,8 +3,10 @@
 ## Agent handoff / active work (2026-11-09, latest)
 
 ### >>> RESUME HERE (2026-11-11, user switching Claude accounts) <<<
-- **0196 kernel BUILT OK:** CI run 43151858000 (URFAVF3MBOY/ios-sweet, build 6m30s, artifacts `xnu-kernel` + `xnu-buildtree`). Not downloaded, not booted yet.
-- **Next, in order:** `gh run download 43151858000 -R URFAVF3MBOY/ios-sweet -n xnu-kernel` into a fresh dir; keep the current `xnu/out/kernel.development.sweet` as `.0195`; check the 0196 strings (sweet_sound / kern.sweetsound) are in it; build the image with the 0192 line (scratchpad bootline-0192.txt; if that scratchpad is gone, take the line from `shim/out/shim-boot-0195-7g-bt-ddr.img`) via `tools/mkpayload.py` + repack; `fastboot boot`; `sysctl kern.sweetsound` should reach stage 7; play something.
+- **0196 image BUILT, not booted yet (2026-11-11 23:34):** kernel from CI run 43151858000 (sha256 8d3656ba.., matches the run's SHA256SUMS; has sweet_sound / sweetsound / sweetsoundgain / sweetsounddelay strings) is now `xnu/out/kernel.development.sweet`; 0195 (04c33de2) kept as `.0195`.
+  - **Image `shim/out/shim-boot-0196-7g-bt-ddr.img`** = 0196 kernel + `shim/out/sweet-bt-7g.adt` + `--ramdisk shim/out/prep-cores.drop` + the 0192 line (440 bytes), repacked with `tools/repack_bootv2.py` on shim-boot-0195-7g-bt-ddr.img (shim + dtb byte-identical to 0195).
+  - Recipe checked: the 0192 line was pulled out of the 0195 image's payload, and rebuilding 0195's payload with it + prep-cores.drop gave the booted one byte for byte. Windows only: `python tools/mkpayload.py K shim/out/sweet-bt-7g.adt P --cmdline "$B" --ramdisk shim/out/prep-cores.drop` then `python tools/repack_bootv2.py shim/out/shim-boot-0195-7g-bt-ddr.img P OUT`.
+- **Next:** phone into fastboot, `fastboot boot shim/out/shim-boot-0196-7g-bt-ddr.img`; ~15 s after boot (sweetsounddelay) `/var/jb/usr/sbin/sysctl kern.sweetsound` should reach stage 7; play something. sweet-media.sh should then skip its audio part (check `/var/root/sweet-media.log`). Fallback: the 0195 image.
 - Uncommitted at this point (left as found): `shim/build.sh`, `shim/shim.c` modified, `shim/shim.zip` deleted; untracked `handoff/`, `tools/bthook/bthook.{o,dylib}`, `xnu/patches/patches.zip`.
 - Details of 0196 and the sp.dylib work: see "2026-11-11 (paused here)" further down.
 
