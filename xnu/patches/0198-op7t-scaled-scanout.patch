@@ -1,0 +1,287 @@
+op7t-0198: show the whole iPhone X picture, shrunk to the panel, instead of cropping it
+
+2026-11-12, user: the keyboard's Q and P keys go off the screen. The UI is
+the iPhone X's 1125x2436 (0061); since 0108 the panel scans it out directly
+and crops the centred 1080x2400: 22 columns left, 23 right, 18 rows top and
+bottom. iOS leaves ~9 px between Q/P and the edge, so half of them is gone.
+
+Each of the two VIG pipes that feed the panel (VIG0 left half, VIG1 right
+half) has a QSEED3 scaler (live DT: qcom,sde-qseed-type "qseedv3", at pipe +
+0xa00). On a flip of a full-screen surface they now read 563 columns each
+(x 0 and 562) and shrink them, bilinear, to 540x2339, placed 30 rows down:
+the whole picture at 0.96 with black bars of 30/31 rows (an iPhone 12 mini
+shows the same 1125x2436 on its 1080x2340 panel). Register offsets from
+Linux sde_hw_sspp.c / sde_hw_util.c; filter 3 = bilinear (sde_drm.h), no
+coefficient tables. ABL's pipe values are saved at start and put back for
+the splash buffer (copied frames, the power-off fade), which stays 1:1.
+
+Touch follows (SweetHID.cpp): while sweet_fb_scaled is 1, a panel pixel maps
+to x / 1080, (y - 30) / 2339, and the edge zone moves with the picture.
+
+sweetscale=0: crop as before. Not used with QSEED3 version 0x1002 (other
+phase layout) or if the version reads 0 / all ones. Logged at boot: "HOTDOGB
+SCAN: ABL VIG0 ..., qseed version ..." and "scaling on/off".
+Not compiled locally (no compiler for the kernel here): the CI build is the
+check.
+
+Apply after 0197.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3d2a008..4b8573d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -141,6 +141,19 @@ public:
+ 	SweetSurface *fScanned;       /* the surface the pipes fetch now (held), NULL: the splash buffer */
+ 	uint32_t      fScanFlips, fScanCopies;
+ 
++	/*
++	 * 0198 scaled scanout (boot-arg sweetscale, default 1; 0 = crop as before): each pipe's QSEED3
++	 * scaler shrinks its half of the 1125x2436 surface (563 columns from x 0 / 562) to 540x2339,
++	 * bilinear, placed 30 rows down: the whole iPhone X picture on the panel at 0.96, black bars of
++	 * 30/31 rows (as an iPhone 12 mini shows the same 1125x2436 on its 1080x2340 panel). The
++	 * splash buffer (copied frames, fades) is shown 1:1 with ABL's values, saved here.
++	 */
++	bool          fScale, fScaledNow;
++	uint32_t      fQseedVer;
++	uint32_t      fAbl[2][16];    /* per pipe, see kScanSaved */
++	void          scanScaled(uint32_t pa, uint32_t stride);
++	void          scanUnscale(void);
++
+ 	void          scanSetup(void);
+ 	void          scanTo(uint32_t addr, uint32_t stride, uint32_t xy0, uint32_t xy1);
+ 	void          scanSplash(void);
+@@ -902,6 +915,59 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ #define CTL_FLUSH       0x18
+ #define CTL_FLUSH_VIGS  0x20003u        /* VIG0 bit 0, VIG1 bit 1, CTL bit 17 */
+ 
++/*
++ * 0198: SSPP and QSEED3 registers (Linux sde_hw_sspp.c / sde_hw_util.c offsets; live DT: qcom,sde-qseed-type
++ * "qseedv3", qcom,sde-vig-qseed-off 0xa00, size 0xa0). Filter 3 = bilinear, alpha filter 1 = bilinear
++ * (uapi sde_drm.h FILTER_BILINEAR / FILTER_ALPHA_BILINEAR): no coefficient tables needed. Phase steps and
++ * initial phases in 21-bit fixed point (PHASE_STEP_SHIFT 21).
++ */
++#define SSPP_SRC_SIZE           0x00
++#define SSPP_SRC_IMG_SIZE       0x04
++#define SSPP_OUT_SIZE           0x0c
++#define SSPP_OUT_XY             0x10
++#define SSPP_SRC_FORMAT         0x30            /* bit 8: the format has alpha */
++#define SSPP_PE_C0_LR           0x100
++#define SSPP_PE_C0_TB           0x104
++#define SSPP_PE_C0_REQ          0x108
++#define SSPP_PE_C1C2_LR         0x110
++#define SSPP_PE_C1C2_TB         0x114
++#define SSPP_PE_C1C2_REQ        0x118
++#define SSPP_PE_C3_LR           0x120
++#define SSPP_PE_C3_TB           0x124
++#define SSPP_PE_C3_REQ          0x128
++#define QS                      0xa00
++#define QS_HW_VERSION           (QS + 0x00)
++#define QS_OP_MODE              (QS + 0x04)
++#define QS_PHASE_STEP_Y_H       (QS + 0x10)
++#define QS_PHASE_STEP_Y_V       (QS + 0x14)
++#define QS_PHASE_STEP_UV_H      (QS + 0x18)
++#define QS_PHASE_STEP_UV_V      (QS + 0x1c)
++#define QS_PRELOAD              (QS + 0x20)
++#define QS_SRC_SIZE_Y_RGB_A     (QS + 0x40)
++#define QS_SRC_SIZE_UV          (QS + 0x44)
++#define QS_DST_SIZE             (QS + 0x48)
++#define QS_PHASE_INIT_Y_H       (QS + 0x90)
++#define QS_PHASE_INIT_Y_V       (QS + 0x94)
++#define QS_PHASE_INIT_UV_H      (QS + 0x98)
++#define QS_PHASE_INIT_UV_V      (QS + 0x9c)
++
++/* what scanUnscale puts back for the splash buffer (ABL's values, read in scanSetup) */
++static const uint32_t kScanSaved[] = {
++	SSPP_SRC_SIZE, SSPP_SRC_IMG_SIZE, SSPP_OUT_SIZE, SSPP_OUT_XY,
++	SSPP_PE_C0_LR, SSPP_PE_C0_TB, SSPP_PE_C0_REQ, SSPP_PE_C1C2_LR, SSPP_PE_C1C2_TB, SSPP_PE_C1C2_REQ,
++	SSPP_PE_C3_LR, SSPP_PE_C3_TB, SSPP_PE_C3_REQ, QS_OP_MODE,
++};
++#define SCAN_SAVED      (sizeof(kScanSaved) / sizeof(kScanSaved[0]))
++
++#define SCALE_SRC_W     563u            /* columns each pipe reads: 0..562 and 562..1124 */
++#define SCALE_SRC_X1    562u
++#define SCALE_DST_W     540u            /* each pipe's half of the panel */
++#define SCALE_DST_H     2339u           /* 2436 * 1080 / 1125 = 2338.6 */
++#define SCALE_TOP       30u             /* (2400 - 2339) / 2 */
++
++/* read by SweetHID.cpp (touch): 1 while the panel shows a scaled surface (0198) */
++extern "C" { volatile int sweet_fb_scaled; }
++
+ void
+ AppleCLCD::scanSetup(void)
+ {
+@@ -929,12 +995,112 @@ AppleCLCD::scanSetup(void)
+ 		IOLog("HOTDOGB SCAN: the display is not set up as on the 2026-10-24 probe (splash 0x%llx): off\n", fPhys);
+ 		fScanMode = 0;
+ 	}
++	if (fScanMode == 0) {
++		return;
++	}
++
++	/* 0198: ABL's pipe values for the splash buffer, and whether the scalers can be used */
++	uint32_t scale = 1;
++	PE_parse_boot_argn("sweetscale", &scale, sizeof(scale));
++	for (uint32_t i = 0; i < SCAN_SAVED; i++) {
++		fAbl[0][i] = fVig0[kScanSaved[i] / 4];
++		fAbl[1][i] = fVig1[kScanSaved[i] / 4];
++	}
++	fQseedVer = fVig0[QS_HW_VERSION / 4];
++	IOLog("HOTDOGB SCAN: ABL VIG0 src 0x%x img 0x%x out 0x%x at 0x%x req 0x%x fmt 0x%x qseed op 0x%x; "
++	    "VIG1 src 0x%x out 0x%x at 0x%x; qseed version 0x%x\n",
++	    fAbl[0][0], fAbl[0][1], fAbl[0][2], fAbl[0][3], fAbl[0][6], fVig0[SSPP_SRC_FORMAT / 4], fAbl[0][13],
++	    fAbl[1][0], fAbl[1][2], fAbl[1][3], fQseedVer);
++	/* 0x1002 (QSEED3 1.0.2) packs the initial phases differently; 0 / all ones: no scaler there */
++	fScale = scale != 0 && fLogicalW == 1125 && fLogicalH == 2436 && fWidth == 1080 && fHeight == 2400 &&
++	    fQseedVer != 0 && fQseedVer != 0xffffffffu && fQseedVer != 0x1002;
++	IOLog("HOTDOGB SCAN: scaling %s\n", fScale ? "on (1125x2436 -> 1080x2339, 30 rows down)" :
++	    scale == 0 ? "off (sweetscale=0): cropped" : "not possible here: cropped");
++}
++
++/* 0198: the splash buffer's pipe values back (ABL's), scaler off; the caller flushes */
++void
++AppleCLCD::scanUnscale(void)
++{
++	for (uint32_t i = 0; i < SCAN_SAVED; i++) {
++		fVig0[kScanSaved[i] / 4] = fAbl[0][i];
++		fVig1[kScanSaved[i] / 4] = fAbl[1][i];
++	}
++	fScaledNow = false;
++	sweet_fb_scaled = 0;
++}
++
++/* 0198: show a 1125x2436 surface at pa shrunk to 1080x2339 (see fScale) */
++void
++AppleCLCD::scanScaled(uint32_t pa, uint32_t stride)
++{
++	const uint32_t step_x = (uint32_t)(((uint64_t)1125 << 21) / 1080);
++	const uint32_t step_y = (uint32_t)(((uint64_t)2436 << 21) / SCALE_DST_H);
++	/* initial phase: where the first output pixel's centre falls in the pipe's first source column, minus 0.5 */
++	const uint32_t init_y = (uint32_t)((((uint64_t)2436 << 21) / (2 * SCALE_DST_H)) - (1u << 20));
++	const uint32_t init_x0 = (uint32_t)((((uint64_t)1125 << 21) / (2 * 1080)) - (1u << 20));
++	const uint32_t init_x1 = (uint32_t)(((((uint64_t)(2 * SCALE_DST_W + 1) * 1125) << 21) / (2 * 1080)) -
++	    (1u << 20) - ((uint64_t)SCALE_SRC_X1 << 21));
++	const uint32_t src = (2436u << 16) | SCALE_SRC_W, dst = (SCALE_DST_H << 16) | SCALE_DST_W;
++	volatile uint32_t *pipe[2] = { fVig0, fVig1 };
++
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the pixels before the switch */
++	for (int i = 0; i < 2; i++) {
++		volatile uint32_t *p = pipe[i];
++		uint32_t op = 1u | (3u << 16) | (1u << 14) | (1u << 31);   /* on, bilinear, 8-bit, blend */
++		uint32_t ix = i == 0 ? init_x0 : init_x1;
++
++		if (p[SSPP_SRC_FORMAT / 4] & (1u << 8)) {
++			op |= (1u << 10) | (1u << 29);          /* alpha: bilinear too */
++		}
++		p[SSPP_SRC0_ADDR / 4] = pa;
++		p[SSPP_YSTRIDE0 / 4] = stride;
++		p[SSPP_SRC_XY / 4] = i == 0 ? 0 : SCALE_SRC_X1;
++		p[SSPP_SRC_SIZE / 4] = src;
++		p[SSPP_SRC_IMG_SIZE / 4] = (2436u << 16) | 1125u;
++		p[SSPP_OUT_SIZE / 4] = dst;
++		p[SSPP_OUT_XY / 4] = (SCALE_TOP << 16) | (fAbl[i][3] & 0xffffu);   /* x as ABL put it in the mixer */
++		p[SSPP_PE_C0_LR / 4] = 0;
++		p[SSPP_PE_C0_TB / 4] = 0;
++		p[SSPP_PE_C0_REQ / 4] = src;
++		p[SSPP_PE_C1C2_LR / 4] = 0;
++		p[SSPP_PE_C1C2_TB / 4] = 0;
++		p[SSPP_PE_C1C2_REQ / 4] = src;
++		p[SSPP_PE_C3_LR / 4] = 0;
++		p[SSPP_PE_C3_TB / 4] = 0;
++		p[SSPP_PE_C3_REQ / 4] = src;
++		p[QS_PHASE_INIT_Y_H / 4] = ix & 0x1fffffu;
++		p[QS_PHASE_INIT_Y_V / 4] = init_y & 0x1fffffu;
++		p[QS_PHASE_INIT_UV_H / 4] = ix & 0x1fffffu;
++		p[QS_PHASE_INIT_UV_V / 4] = init_y & 0x1fffffu;
++		p[QS_PHASE_STEP_Y_H / 4] = step_x & 0xffffffu;
++		p[QS_PHASE_STEP_Y_V / 4] = step_y & 0xffffffu;
++		p[QS_PHASE_STEP_UV_H / 4] = step_x & 0xffffffu;
++		p[QS_PHASE_STEP_UV_V / 4] = step_y & 0xffffffu;
++		p[QS_PRELOAD / 4] = 0x03040304u;                /* sde defaults: h 4, v 3, both planes */
++		p[QS_SRC_SIZE_Y_RGB_A / 4] = src;
++		p[QS_SRC_SIZE_UV / 4] = src;
++		p[QS_DST_SIZE / 4] = dst;
++		p[QS_OP_MODE / 4] = op;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fCtl0[CTL_FLUSH / 4] = CTL_FLUSH_VIGS;          /* taken at the next refresh; never CTL_START */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!fScaledNow) {
++		IOLog("HOTDOGB SCAN: scaled: step 0x%x/0x%x, init x 0x%x/0x%x y 0x%x\n", step_x, step_y, init_x0, init_x1,
++		    init_y);
++	}
++	fScaledNow = true;
++	sweet_fb_scaled = 1;
+ }
+ 
+ void
+ AppleCLCD::scanTo(uint32_t addr, uint32_t stride, uint32_t xy0, uint32_t xy1)
+ {
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* the pixels before the switch */
++	if (fScaledNow) {
++		scanUnscale();                          /* 0198: 1:1 again (flushed below with the rest) */
++	}
+ 	fVig0[SSPP_SRC0_ADDR / 4] = addr;
+ 	fVig0[SSPP_YSTRIDE0 / 4] = stride;
+ 	fVig0[SSPP_SRC_XY / 4] = xy0;
+@@ -990,7 +1156,9 @@ AppleCLCD::scanPresent(const uint8_t *rec)
+ 	}
+ 	(void)RedwoodGPUSurfaceReady(s, 100);           /* the GPU done drawing it (at most 100 ms) */
+ 	uint32_t row0 = (uint32_t)(pa + (uint64_t)fOffY * s->bytesPerRow);
+-	if (fScanMode == 2) {
++	if (fScale) {
++		scanScaled((uint32_t)pa, s->bytesPerRow);       /* 0198 */
++	} else if (fScanMode == 2) {
+ 		scanTo(row0 + (uint32_t)fOffX * 4, s->bytesPerRow, fBootXY0, fBootXY1);
+ 	} else {
+ 		scanTo(row0, s->bytesPerRow, fBootXY0 + (uint32_t)fOffX, fBootXY1 + (uint32_t)fOffX);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 0252e02..d755a7e 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,13 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/*
++ * 0198: while the panel shows the 1125x2436 picture shrunk to 1080x2339, 30 rows down (SweetFramebuffer.cpp,
++ * sweetscale), a panel pixel maps to the picture as x / 1080, (y - 30) / 2339; the edge zone follows the picture.
++ */
++extern "C" volatile int sweet_fb_scaled;
++#define SWEET_TOUCH_SCALED_TOP 30
++#define SWEET_TOUCH_SCALED_H   2339
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -464,16 +471,29 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	bool scaled = sweet_fb_scaled != 0;
++	IOFixed nx, ny;
++	if (scaled) {
++		int sy = y - SWEET_TOUCH_SCALED_TOP;
++
++		sy = sy < 0 ? 0 : (sy > SWEET_TOUCH_SCALED_H - 1 ? SWEET_TOUCH_SCALED_H - 1 : sy);
++		nx = (IOFixed)(((int64_t)x << 16) / 1080);
++		ny = (IOFixed)(((int64_t)sy << 16) / SWEET_TOUCH_SCALED_H);
++	} else {
++		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
++		int top = scaled ? SWEET_TOUCH_SCALED_TOP : 0;
++		int bottom = scaled ? SWEET_TOUCH_SCALED_TOP + SWEET_TOUCH_SCALED_H - 1 : 2399;
++
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < top + SWEET_TOUCH_EDGE_PX || y > bottom - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
