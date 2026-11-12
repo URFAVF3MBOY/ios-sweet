@@ -1,0 +1,533 @@
+op7t-0205: cameras, step 4: real IMX586 frames into a bounded buffer (kern.sweetcam=4 / =5, kern.sweetcambuf)
+
+0204 proved CSID -> IFE -> SMMU -> DDR with the CSID's test pattern; the
+IMX586 streams on its defaults. The vendor's register tables are now
+decoded (tools/chromatix_regs.py on com.qti.sensormodule.*_imx586.bin from
+the vendor partition): init (1710 writes) and 10 modes, the smallest
+1296x736 RAW10 on 3 lanes at ~1 Gbps/lane. The sensor is set up from user
+space (camio.py over kern.sweetcami2c); this patch brings up the rest:
+
+- camera PLL0 (1200 MHz) and PLL3 (800 MHz), Trion, as Linux's
+  clk_trion_pll_configure/enable with camcc-sm8150.c's values; IFE0 400 MHz
+  (PLL3 even), CSID and CPHY RX 400 MHz (PLL0 odd), CSIPHY1 timer 300 MHz;
+- a 2 MiB, 2 MiB-aligned capture buffer and the IFE's SMMU group translated
+  through a window that maps ONLY that buffer (sweet_smmu_window_group: own
+  L1/L2 tables, one 2 MiB block): a frame larger than expected faults in the
+  SMMU instead of writing kernel memory; sweet_smmu_bank_fault reports it;
+- CSIPHY1 (Linux camss-csiphy-3ph-1-0.c, sdm845 lane table, settle 0x14),
+  data lanes 0/1/2 + clock; CSID0 RX from PHY 1, 3 lanes; RDI0 RAW10;
+  IFE0 WM0 into the buffer;
+- kern.sweetcam=5: CSIPHY/CSID/IFE/bus status, SMMU fault status, bytes
+  changed; kern.sweetcambuf reads the buffer out (u32 offset in, 4 KB out).
+Lane assignment (0/1/2) and the settle count are the Linux defaults, not
+read from the module file (its laneAssign field is not decoded yet).
+Not compiled locally: the CI build is the check.
+
+Apply after 0204.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index ea9cc60..cf7196b 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -858,6 +858,330 @@ cam_capture_test(void)
+ 	cam_stage = 9;
+ }
+ 
++/*
++ * ---- 0205: real frames from the IMX586 (`kern.sweetcam=4` arms the path, `=5` stops and reports) ----
++ *
++ * The sensor itself is set up from user space over kern.sweetcami2c with the tables decoded from OnePlus's
++ * com.qti.sensormodule.*_imx586.bin (tools/chromatix_regs.py): init table, a mode (1296x736 RAW10, 3 lanes),
++ * stream on. This side, after kern.sweetcam=2:
++ *  1. camera PLL0 (1200 MHz; odd /3 = 400, even /2 = 600) and PLL3 (800 MHz; even /2 = 400), Trion PLLs set up
++ *     as Linux clk_trion_pll_configure / clk_trion_pll_enable do with camcc-sm8150.c's values;
++ *  2. IFE0 GDSC + clocks: IFE0 400 MHz (PLL3 even), IFE0 CSID 400 MHz and CPHY RX 400 MHz (PLL0 odd);
++ *     CSIPHY1 timer 300 MHz (PLL0 even /2) and the CSIPHY1 branch;
++ *  3. a 2 MiB, 2 MiB-aligned buffer (0xa5) and the IFE's SMMU group translated through a window that maps
++ *     ONLY that buffer (sweet_smmu_window_group): an IFE write past it faults instead of reaching RAM;
++ *  4. CSIPHY1 (0xac66000, Linux camss-csiphy-3ph-1-0.c, sdm845 table): reset, common CTRL5 = clock + data
++ *     lanes 0/1/2, CTRL6 power, CTRL7, lane table with settle count 0x14 (1 Gbps/lane, 300 MHz timer);
++ *  5. IFE0 WM0 at the buffer (as 0204), CSID0: RX from PHY 1, 3 lanes (DL0..2 = lanes 0..2), RDI0 RAW10
++ *     payload-only, resume.
++ * =5: CSID RX/RDI0, IFE and bus IRQ status, WM0 status, the window bank's SMMU fault status, bytes of the
++ *     buffer that changed; then RDI0 halted and WM0 off. kern.sweetcambuf: write a u32 offset, read 4096 bytes
++ *     of the buffer from there.
++ */
++extern int sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa);
++extern int sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va);
++extern int sweet_smmu_bank_fault(int bank, uint32_t *fsr, uint64_t *far);
++
++#define CAM_CSIPHY1_PA          0x0ac66000u
++#define CAM_LIVE_SIZE           0x200000u
++#define PHY_CMN(n)              (0x800 + 4 * (n))
++#define PHY_STATUS(n)           (0x8b0 + 4 * (n))
++
++static vm_offset_t cam_phy, cam_live_va;
++static uint64_t cam_live_pa;
++static int cam_live_bank = -1;
++static uint32_t cam_buf_off;
++
++/* camcc Trion PLL at base: l, alpha, config_ctl, _u, _u1, user_ctl, _u, _u1, test_ctl, _u, _u1 */
++static bool
++cam_pll_trion(uint32_t base, const uint32_t c[11], const char *name)
++{
++	uint32_t mode = rd32(cam_cc, base);
++
++	if ((mode & (1u << 31)) && (mode & 1u)) {
++		cam_say("  %s already running: mode %#010x", name, mode);
++		return true;
++	}
++	wr32(cam_cc, base + 0x04, c[0]);
++	wr32(cam_cc, base + 0x08, 0x44u);               /* TRION_PLL_CAL_VAL */
++	wr32(cam_cc, base + 0x40, c[1]);
++	wr32(cam_cc, base + 0x18, c[2]);
++	wr32(cam_cc, base + 0x1c, c[3]);
++	wr32(cam_cc, base + 0x20, c[4]);
++	wr32(cam_cc, base + 0x0c, c[5]);
++	wr32(cam_cc, base + 0x10, c[6]);
++	wr32(cam_cc, base + 0x14, c[7]);
++	wr32(cam_cc, base + 0x24, c[8]);
++	wr32(cam_cc, base + 0x28, c[9]);
++	wr32(cam_cc, base + 0x2c, c[10]);
++	wr32(cam_cc, base, rd32(cam_cc, base) | (1u << 23));                    /* UPDATE_BYPASS */
++	wr32(cam_cc, base, rd32(cam_cc, base) & ~1u);                           /* outputs off */
++	wr32(cam_cc, base + 0x38, 0);                                           /* OPMODE standby */
++	wr32(cam_cc, base, rd32(cam_cc, base) | (1u << 2));                     /* RESET_N */
++	wr32(cam_cc, base + 0x38, 1);                                           /* OPMODE run */
++	if (!cam_poll(cam_cc, base, 1u << 31, 1u << 31, 20000)) {
++		cam_say("  %s did not lock: mode %#010x opmode %#x", name, rd32(cam_cc, base), rd32(cam_cc, base + 0x38));
++		return false;
++	}
++	wr32(cam_cc, base + 0x0c, rd32(cam_cc, base + 0x0c) | 7u);              /* outputs (main/even/odd) */
++	wr32(cam_cc, base, rd32(cam_cc, base) | 1u);                            /* OUTCTRL */
++	cam_say("  %s locked: mode %#010x user %#010x", name, rd32(cam_cc, base), rd32(cam_cc, base + 0x0c));
++	return true;
++}
++
++/* an RCG to CFG cfg (source in [10:8], divider field in [4:0]), CMD bit 0 update */
++static bool
++cam_rcg_cfg(const char *name, uint32_t off, uint32_t cfg)
++{
++	wr32(cam_cc, off + 4, cfg);
++	wr32(cam_cc, off, rd32(cam_cc, off) | 1u);
++	if (!cam_poll(cam_cc, off, 1u, 0, 20000)) {
++		cam_say("  %s: update did not finish: cmd %#010x cfg %#010x", name, rd32(cam_cc, off), rd32(cam_cc, off + 4));
++		return false;
++	}
++	cam_say("  %s: cfg %#010x", name, rd32(cam_cc, off + 4));
++	return true;
++}
++
++static const uint16_t cam_phy_table[][2] = {      /* Linux lane_regs_sdm845 (DNP entries left out) */
++	{0x0004, 0x0C}, {0x002C, 0x01}, {0x0034, 0x0F}, {0x001C, 0x0A}, {0x0014, 0x60}, {0x003C, 0xB8},
++	{0x0000, 0x91}, {0x0008, 0xFFFF}, {0x0010, 0x52}, {0x0038, 0xFE}, {0x0060, 0x00}, {0x0064, 0x7F},
++	{0x0704, 0x0C}, {0x072C, 0x01}, {0x0734, 0x0F}, {0x071C, 0x0A}, {0x0714, 0x60}, {0x0728, 0x04},
++	{0x073C, 0xB8}, {0x0700, 0x80}, {0x0708, 0xFFFF}, {0x070C, 0xA5}, {0x0710, 0x52}, {0x0738, 0x1F},
++	{0x0760, 0x00}, {0x0764, 0x7F},
++	{0x0204, 0x0C}, {0x022C, 0x01}, {0x0234, 0x0F}, {0x021C, 0x0A}, {0x0214, 0x60}, {0x023C, 0xB8},
++	{0x0200, 0x91}, {0x0208, 0xFFFF}, {0x0210, 0x52}, {0x0238, 0xFE}, {0x0260, 0x00}, {0x0264, 0x7F},
++	{0x0404, 0x0C}, {0x042C, 0x01}, {0x0434, 0x0F}, {0x041C, 0x0A}, {0x0414, 0x60}, {0x043C, 0xB8},
++	{0x0400, 0x91}, {0x0408, 0xFFFF}, {0x0410, 0x52}, {0x0438, 0xFE}, {0x0460, 0x00}, {0x0464, 0x7F},
++	{0x0604, 0x0C}, {0x062C, 0x01}, {0x0634, 0x0F}, {0x061C, 0x0A}, {0x0614, 0x60}, {0x063C, 0xB8},
++	{0x0600, 0x91}, {0x0608, 0xFFFF}, {0x0610, 0x52}, {0x0638, 0xFE}, {0x0660, 0x00}, {0x0664, 0x7F},
++};
++#define PHY_SETTLE      0x14u
++
++static void
++cam_live_arm(void)
++{
++	static const uint32_t pll0[11] = { 0x3e, 0x8000, 0x20485699, 0x00002267, 0x00000024, 0x00003100, 0x00000805,
++		0x000000d0, 0x00000000, 0x00000000, 0x00000020 };
++	static const uint32_t pll3[11] = { 0x29, 0xaaaa, 0x20485699, 0x00002267, 0x00000024, 0x00000100, 0x00000805,
++		0x000000d0, 0x00000000, 0x00000000, 0x00000020 };
++	int e;
++
++	cam_log_len = 0;
++	cam_log[0] = '\0';
++	cam_say("live capture path (0205)");
++	if (cam_stage < 7 || cam_cc == 0 || cam_cci == 0) {
++		cam_say("run kern.sweetcam=2 first");
++		return;
++	}
++
++	cam_say("PLLs:");
++	if (!cam_pll_trion(0x0000, pll0, "pll0") || !cam_pll_trion(0x3000, pll3, "pll3")) {
++		cam_say("stopping (a PLL did not lock)");
++		return;
++	}
++
++	cam_say("IFE0 / CSID / CSIPHY1 clocks:");
++	if (!cam_gdsc_on("ife_0_gdsc", 0xa004) ||
++	    !cam_rcg_cfg("cphy_rx_src 400 MHz", 0xa064, (3u << 8) | 1u) ||
++	    !cam_rcg_cfg("ife_0_csid_src 400 MHz", 0xa03c, (3u << 8) | 1u) ||
++	    !cam_rcg_cfg("ife_0_src 400 MHz", 0xa010, (6u << 8) | 1u) ||
++	    !cam_rcg_cfg("csi1phytimer_src 300 MHz", 0x6028, (2u << 8) | 3u) ||
++	    !cam_branch_on(cam_cc, "ife_0", 0xa028, true) || !cam_branch_on(cam_cc, "ife_0_csid", 0xa054, true) ||
++	    !cam_branch_on(cam_cc, "ife_0_cphy_rx", 0xa07c, true) || !cam_branch_on(cam_cc, "ife_0_axi", 0xa080, true) ||
++	    !cam_branch_on(cam_cc, "csi1phytimer", 0x6040, true) || !cam_branch_on(cam_cc, "csiphy1", 0x6044, true)) {
++		cam_say("stopping (a clock did not start)");
++		return;
++	}
++
++	if (cam_live_va == 0) {
++		e = sweet_cam_dma_buffer_2m(&cam_live_pa, &cam_live_va);
++		if (e != 0) {
++			cam_say("no 2 MiB buffer (%d)", e);
++			return;
++		}
++		cam_live_bank = sweet_smmu_window_group(0x840, 0x620, cam_live_pa);
++	}
++	cam_say("buffer %#llx (2 MiB), IFE SMMU group 0x840/0x620 -> window bank %d", cam_live_pa, cam_live_bank);
++	if (cam_live_bank < 0) {
++		cam_say("stopping (no bounded SMMU window)");
++		return;
++	}
++	for (uint32_t i = 0; i < CAM_LIVE_SIZE; i += 4) {
++		*(volatile uint32_t *)(cam_live_va + i) = 0xa5a5a5a5u;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	cam_phy = ml_io_map(CAM_CSIPHY1_PA, 0x1000);
++	cam_ife = ml_io_map(CAM_IFE0_PA, 0x4000);
++	cam_csid = ml_io_map(CAM_CSID0_PA, 0x1000);
++	if (cam_phy == 0 || cam_ife == 0 || cam_csid == 0) {
++		cam_say("no mapping");
++		return;
++	}
++
++	cam_say("CSIPHY1:");
++	wr32(cam_phy, PHY_CMN(0), 1u);
++	delay(5000);
++	wr32(cam_phy, PHY_CMN(0), 0);
++	wr32(cam_phy, PHY_CMN(6), 2u);                                          /* show rev id */
++	cam_say("  hw version %02x%02x%02x%02x", rd32(cam_phy, PHY_STATUS(15)) & 0xffu, rd32(cam_phy, PHY_STATUS(14)) & 0xffu,
++	    rd32(cam_phy, PHY_STATUS(13)) & 0xffu, rd32(cam_phy, PHY_STATUS(12)) & 0xffu);
++	wr32(cam_phy, PHY_CMN(5), 0x80u | 0x01u | 0x04u | 0x10u);               /* clock + data lanes 0/1/2 */
++	wr32(cam_phy, PHY_CMN(6), 1u);                                          /* COMMON_PWRDN_B */
++	wr32(cam_phy, PHY_CMN(7), 2u);
++	wr32(cam_phy, PHY_CMN(0), 0);
++	for (unsigned i = 0; i < sizeof(cam_phy_table) / sizeof(cam_phy_table[0]); i++) {
++		wr32(cam_phy, cam_phy_table[i][0], cam_phy_table[i][1] == 0xffff ? PHY_SETTLE : cam_phy_table[i][1]);
++	}
++	for (unsigned n = 11; n < 22; n++) {
++		wr32(cam_phy, PHY_CMN(n), 0);
++	}
++	cam_say("  lanes 0/1/2 + clock on, settle %#x", PHY_SETTLE);
++
++	cam_say("IFE0:");
++	wr32(cam_ife, VFE_IRQ_MASK_0, 1u << 31);
++	wr32(cam_ife, VFE_GLOBAL_RESET_CMD, 0x3f9fu);
++	(void)cam_poll(cam_ife, VFE_IRQ_STATUS_0, 1u << 31, 1u << 31, 100000);
++	wr32(cam_ife, VFE_IRQ_CLEAR_0, ~0u);
++	wr32(cam_ife, VFE_IRQ_CLEAR_1, ~0u);
++	wr32(cam_ife, VFE_IRQ_CMD, 1u);
++	wr32(cam_ife, VFE_IRQ_MASK_0, ~0u);
++	wr32(cam_ife, VFE_IRQ_MASK_1, ~0u);
++	for (unsigned n = 0; n < 3; n++) {
++		wr32(cam_ife, VFE_BUS_IRQ_MASK(n), ~0u);
++		wr32(cam_ife, VFE_BUS_IRQ_CLEAR(n), ~0u);
++	}
++	wr32(cam_ife, VFE_BUS_IRQ_CLEAR_GLOBAL, 1u);
++	wr32(cam_ife, VFE_BUS_WM_ADDR_SYNC_FRAME_HEADER, 0);
++	wr32(cam_ife, VFE_BUS_WM_CGC_OVERRIDE, 0xfffffu);
++	wr32(cam_ife, VFE_BUS_WM_TEST_BUS_CTRL, 0);
++	wr32(cam_ife, VFE_BUS_WM_ADDR_SYNC_NO_SYNC, 0xffffu);
++	wr32(cam_ife, VFE_BUS_WM_BURST_LIMIT(0), 0xfu);
++	wr32(cam_ife, VFE_BUS_WM_BUFFER_WIDTH_CFG(0), 0xff01u);
++	wr32(cam_ife, VFE_BUS_WM_BUFFER_HEIGHT_CFG(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_PACKER_CFG(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_STRIDE(0), 0xff01u);
++	wr32(cam_ife, VFE_BUS_WM_IMAGE_ADDR(0), (uint32_t)cam_live_pa);
++	wr32(cam_ife, VFE_BUS_WM_FRAME_INC(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_CFG(0), 1u | (1u << 1));
++	wr32(cam_ife, VFE_REG_UPDATE_CMD, 1u << 1);
++
++	cam_say("CSID0:");
++	wr32(cam_csid, CSID_TOP_IRQ_CLEAR, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_TOP_IRQ_MASK, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_RST_STROBES, 0x1eu);
++	if (!cam_poll(cam_csid, CSID_TOP_IRQ_STATUS, 1u, 1u, 100000)) {
++		cam_say("  reset not acknowledged: stopping");
++		return;
++	}
++	wr32(cam_csid, CSID_TOP_IRQ_CLEAR, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_RDI0_IRQ_MASK, ~0u);
++	wr32(cam_csid, 0x024, ~0u);                                             /* CSI2 RX IRQ mask */
++	wr32(cam_csid, CSID_CSI2_RX_CFG0, 2u | (0x210u << 4) | (1u << 20));     /* 3 lanes, DL0..2 = 0..2, PHY 1, D-PHY */
++	wr32(cam_csid, CSID_CSI2_RX_CFG1, 1u | (1u << 6));
++	wr32(cam_csid, CSID_RDI0_CFG0, 1u | (1u << 1) | (1u << 2) | (0xfu << 12) | (0x2bu << 16));
++	wr32(cam_csid, CSID_RDI0_CFG1, 2u);
++	wr32(cam_csid, CSID_RDI0_FRM_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_FRM_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_IRQ_SUBSAMPLE_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_IRQ_SUBSAMPLE_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_RPP_PIX_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_RPP_PIX_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_RPP_LINE_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_RPP_LINE_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_CTRL, 0);
++	wr32(cam_csid, CSID_RDI0_CFG0, rd32(cam_csid, CSID_RDI0_CFG0) | (1u << 31));
++	wr32(cam_csid, CSID_RDI0_CTRL, 1u);
++	cam_say("armed: start the sensor stream now (camio.py), then kern.sweetcam=5");
++	cam_stage = 10;
++}
++
++static void
++cam_live_stop(void)
++{
++	uint32_t fsr = 0, changed = 0;
++	uint64_t far = 0;
++
++	cam_log_len = 0;
++	cam_log[0] = '\0';
++	cam_say("live capture report (0205)");
++	if (cam_stage != 10) {
++		cam_say("not armed (kern.sweetcam=4 first)");
++		return;
++	}
++	cam_say("  CSIPHY1 status 0..4: %02x %02x %02x %02x %02x", rd32(cam_phy, PHY_STATUS(0)) & 0xffu,
++	    rd32(cam_phy, PHY_STATUS(1)) & 0xffu, rd32(cam_phy, PHY_STATUS(2)) & 0xffu, rd32(cam_phy, PHY_STATUS(3)) & 0xffu,
++	    rd32(cam_phy, PHY_STATUS(4)) & 0xffu);
++	cam_say("  CSID top %#010x rx %#010x rdi0 %#010x", rd32(cam_csid, CSID_TOP_IRQ_STATUS),
++	    rd32(cam_csid, CSID_CSI2_RX_IRQ_STATUS), rd32(cam_csid, CSID_RDI0_IRQ_STATUS));
++	cam_say("  CSID rdi0 format/byte counters @0x3a0: %#010x %#010x %#010x %#010x", rd32(cam_csid, 0x3a0),
++	    rd32(cam_csid, 0x3a4), rd32(cam_csid, 0x3a8), rd32(cam_csid, 0x3ac));
++	cam_say("  IFE irq0 %#010x irq1 %#010x violation %#010x", rd32(cam_ife, VFE_IRQ_STATUS_0),
++	    rd32(cam_ife, VFE_IRQ_STATUS_1), rd32(cam_ife, VFE_VIOLATION_STATUS));
++	cam_say("  IFE bus irq %#010x %#010x %#010x; WM0 status %#010x %#010x",
++	    rd32(cam_ife, VFE_BUS_IRQ_STATUS(0)), rd32(cam_ife, VFE_BUS_IRQ_STATUS(1)), rd32(cam_ife, VFE_BUS_IRQ_STATUS(2)),
++	    rd32(cam_ife, VFE_BUS_WM_STATUS0(0)), rd32(cam_ife, VFE_BUS_WM_STATUS1(0)));
++	if (sweet_smmu_bank_fault(cam_live_bank, &fsr, &far) == 0) {
++		cam_say("  SMMU window bank %d: FSR %#010x FAR %#llx%s", cam_live_bank, fsr, far,
++		    fsr ? " (a write outside the buffer was stopped)" : "");
++	}
++	wr32(cam_csid, CSID_RDI0_CTRL, 0);
++	wr32(cam_ife, VFE_BUS_WM_CFG(0), 0);
++	delay(50000);
++	for (uint32_t i = 0; i < CAM_LIVE_SIZE; i += 4) {
++		if (*(volatile uint32_t *)(cam_live_va + i) != 0xa5a5a5a5u) {
++			changed += 4;
++		}
++	}
++	cam_say("  buffer: %u of %u bytes changed (4-byte words); first %08x %08x %08x %08x", changed, CAM_LIVE_SIZE,
++	    *(volatile uint32_t *)(cam_live_va + 0), *(volatile uint32_t *)(cam_live_va + 4),
++	    *(volatile uint32_t *)(cam_live_va + 8), *(volatile uint32_t *)(cam_live_va + 12));
++	cam_stage = 8;          /* (=4 may run again) */
++}
++
++static int
++sysctl_sweetcambuf SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static uint8_t chunk[4096];      /* (not on the kernel stack) */
++	int error = 0;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		uint32_t off;
++
++		if (req->newlen != sizeof(off)) {
++			return EINVAL;
++		}
++		error = SYSCTL_IN(req, &off, sizeof(off));
++		if (error) {
++			return error;
++		}
++		if (off >= CAM_LIVE_SIZE || (off & 3u)) {
++			return EINVAL;
++		}
++		cam_buf_off = off;
++	}
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, sizeof(chunk));
++	}
++	if (cam_live_va == 0) {
++		return ENXIO;
++	}
++	uint32_t n = MIN((uint32_t)sizeof(chunk), CAM_LIVE_SIZE - cam_buf_off);
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t v = *(volatile uint32_t *)(cam_live_va + cam_buf_off + i);
++		memcpy(chunk + i, &v, 4);
++	}
++	return SYSCTL_OUT(req, chunk, n);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcambuf, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweetcambuf, "S", "camera capture buffer (0205): write a u32 offset, read 4096 bytes from it");
++
+ static int
+ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ {
+@@ -877,6 +1201,10 @@ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ 		cam_power_and_scan();
+ 	} else if (value == 3) {
+ 		cam_capture_test();             /* 0204 */
++	} else if (value == 4) {
++		cam_live_arm();                 /* 0205 */
++	} else if (value == 5) {
++		cam_live_stop();                /* 0205 */
+ 	} else {
+ 		return EINVAL;
+ 	}
+@@ -885,7 +1213,7 @@ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetcam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcam, "I",
+-    "OnePlus 7T cameras: 1 = read-only survey (0201), 2 = power the rear main sensor, CCI scan + id (0202), 3 = capture path test with the CSID test pattern (0204)");
++    "OnePlus 7T cameras: 1 = read-only survey (0201), 2 = power the rear main sensor, CCI scan + id (0202), 3 = capture path test with the CSID test pattern (0204), 4 = arm the live path, 5 = report and stop (0205)");
+ 
+ static int
+ sysctl_sweetcamlog SYSCTL_HANDLER_ARGS
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 3d28d81..07a569a 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -241,9 +241,9 @@ smmu_wr(uint32_t off, uint32_t value)
+ }
+ 
+ static bool
+-smmu_cb_setup(uint32_t pagesize, uint32_t cbo, uint32_t cb, uint32_t pasize)
++smmu_cb_setup(uint32_t pagesize, uint32_t cbo, uint32_t cb, uint32_t pasize, uint64_t table_pa)
+ {
+-	uint64_t ttbr0 = (uint64_t)SMMU_PT_PA | ((uint64_t)cb << 48);           /* ASID = bank */
++	uint64_t ttbr0 = table_pa | ((uint64_t)cb << 48);           /* ASID = bank */
+ 	uint32_t sctlr = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 12);  /* M TRE AFE CFRE ASIDPNE */
+ 
+ 	smmu_wr(cbo + CB_SCTLR, 0);
+@@ -278,7 +278,7 @@ smmu_cb_setup(uint32_t pagesize, uint32_t cbo, uint32_t cb, uint32_t pasize)
+ }
+ 
+ static int
+-smmu_identity_masked(uint32_t sid, uint32_t smask)
++smmu_identity_masked(uint32_t sid, uint32_t smask, uint64_t table_pa)
+ {
+ 	if (sid > 0x7fffu || smask > 0x7fffu) {
+ 		return -1;
+@@ -356,7 +356,7 @@ smmu_identity_masked(uint32_t sid, uint32_t smask)
+ 			continue;
+ 		}
+ 		tries++;
+-		if (smmu_cb_setup(pagesize, cbo, (uint32_t)n, pasize)) {
++		if (smmu_cb_setup(pagesize, cbo, (uint32_t)n, pasize, table_pa ? table_pa : SMMU_PT_PA)) {
+ 			cb = n;
+ 			break;
+ 		}
+@@ -377,7 +377,7 @@ smmu_identity_masked(uint32_t sid, uint32_t smask)
+ int
+ sweet_smmu_identity(uint32_t sid)
+ {
+-	return smmu_identity_masked(sid, 0);
++	return smmu_identity_masked(sid, 0, 0);
+ }
+ 
+ /* 0204: a stream group (SMR id + mask), e.g. the camera IFE's 0x840 / 0x620 (live DT msm_cam_smmu_ife) */
+@@ -386,7 +386,106 @@ int sweet_smmu_identity_group(uint32_t sid, uint32_t smask);
+ int
+ sweet_smmu_identity_group(uint32_t sid, uint32_t smask)
+ {
+-	return smmu_identity_masked(sid, smask);
++	return smmu_identity_masked(sid, smask, 0);
++}
++
++/*
++ * 0205: a stream group translated through a bank whose tables map ONLY [pa, pa + 2 MiB) (pa 2 MiB aligned,
++ * below 4 GiB) to itself; everything else faults (the bank terminates faulting transactions). For the camera
++ * IFE writing real sensor frames: a wrong frame size then ends in an SMMU fault, not in kernel memory.
++ * Tables: one L1 page (T0SZ 25: 512 GiB, 1 GiB per entry) pointing at one L2 page with a single 2 MiB block.
++ */
++int sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa);
++
++int
++sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa)
++{
++	static uint64_t tables_pa;
++	static vm_offset_t tables_va;
++
++	if ((pa & 0x1fffffull) != 0 || pa + 0x200000ull > 0x100000000ull) {
++		return -1;
++	}
++	if (tables_va == 0) {
++		vm_offset_t kva = 0;
++		ppnum_t pn;
++
++		if (kmem_alloc_contig(kernel_map, &kva, 2 * PAGE_SIZE, PAGE_MASK, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return -1;
++		}
++		pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++		if (pn == 0) {
++			return -1;
++		}
++		tables_pa = ptoa_64(pn);
++		tables_va = ml_io_map_wcomb((vm_offset_t)tables_pa, 2 * PAGE_SIZE);
++		if (tables_va == 0) {
++			return -1;
++		}
++	}
++	volatile uint64_t *l1 = (volatile uint64_t *)tables_va;
++	volatile uint64_t *l2 = (volatile uint64_t *)(tables_va + PAGE_SIZE);
++	for (unsigned i = 0; i < 512; i++) {
++		l1[i] = 0;
++		l2[i] = 0;
++	}
++	l1[(pa >> 30) & 511] = (tables_pa + PAGE_SIZE) | 3u;                     /* table */
++	l2[(pa >> 21) & 511] = pa | (1u << 10) | (2u << 8) | (1u << 6) | 1u;      /* 2 MiB block, as the identity map's */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	int bank = smmu_identity_masked(sid, smask, tables_pa);
++	printf("HOTDOGB SMMU: window %#llx + 2 MiB for SID %#x/%#x (tables %#llx): bank %d\n", pa, sid, smask, tables_pa, bank);
++	return bank;
++}
++
++/* 0205: a bank's fault status (FSR) and fault address (FAR), then FSR cleared; -1 if unknown */
++int sweet_smmu_bank_fault(int bank, uint32_t *fsr, uint64_t *far);
++
++int
++sweet_smmu_bank_fault(int bank, uint32_t *fsr, uint64_t *far)
++{
++	if (smmu == 0 || bank < 0 || bank > 127) {
++		return -1;
++	}
++	uint32_t idr1 = smmu_rd(0x24);
++	uint32_t pagesize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t cb_base = (1u << (((idr1 >> 28) & 7u) + 1u)) * pagesize;
++	uint32_t cbo = cb_base + (uint32_t)bank * pagesize;
++
++	if (cbo + pagesize > SMMU_SIZE) {
++		return -1;
++	}
++	*fsr = smmu_rd(cbo + CB_FSR);
++	*far = smmu_rd64(cbo + 0x60);           /* CB_FAR */
++	smmu_wr(cbo + CB_FSR, *fsr);
++	return 0;
++}
++
++/* 0205: a 2 MiB, 2 MiB-aligned uncached capture buffer below 4 GiB (for sweet_smmu_window_group) */
++int sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va);
++
++int
++sweet_cam_dma_buffer_2m(uint64_t *pa, vm_offset_t *va)
++{
++	vm_offset_t kva = 0;
++	ppnum_t pn;
++	uint64_t p;
++
++	if (kmem_alloc_contig(kernel_map, &kva, 0x200000, 0x1fffff, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	p = ptoa_64(pn);
++	if (pn == 0 || (p & 0x1fffffull) != 0 || p < 0x80000000ull || p + 0x200000ull > 0x100000000ull) {
++		return ERANGE;
++	}
++	*va = ml_io_map((vm_offset_t)p, 0x200000);
++	if (*va == 0) {
++		return ENOMEM;
++	}
++	*pa = p;
++	return 0;
+ }
+ 
+ /*
