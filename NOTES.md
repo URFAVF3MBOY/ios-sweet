@@ -141,6 +141,19 @@
     - **audio:** DSP start, TFA9874 set-up over I2C (container values built in), pins, AFE, ASM stream fed from /dev/redwood-audio at boot, amp gating, as HackiOS's in-kernel sound=5.
     - **BT:** power + firmware at boot, a second kctl name, BT_HCI_TRANSPORT through sweetinject, the HCI fix-ups in sweet_bt.c's I/O thread.
     - **Stays userland:** the HAL plug-in + VirtualAudio (files only), the BlueTool XPC stand-in, a tiny hook for bluetoothd's H4 teardown slot.
+- **2026-11-11 (paused here): 0196 written, building; sp.dylib root causes started.**
+  - **0196** (`xnu/patches/0196-op7t-speakers-in-kernel.patch`, new `bsd/dev/sweet_sound.c`, CI run 43151858000, not booted yet): the whole speaker chain from boot in the kernel.
+    - /dev/redwood-audio made at boot (no mediaserverd restart).
+    - Then a thread (after sweetsounddelay 15 s): DSP start, SE4 I2C, both TFA9874s with the container writes built in, MI2S pins, AFE port, amps up; ASM stream fed from the ring at sweetsoundgain (12) dB below; amps gated on sound.
+    - Boot-args: sweetsound=0 turns it off. Status: kern.sweetsound.
+    - sweet-media.sh (repo + phone) now skips its audio part when kern.sweetsound exists, so only Bluetooth stays scripted.
+    - **To test:** fetch the kernel from 43151858000, build the image with the 0192 line (scratchpad bootline-0192.txt) on shim-boot-0195-7g-bt-ddr.img, boot, check `sysctl kern.sweetsound` reaches stage 7, then play something.
+  - **sp.dylib** (`/var/jb/usr/lib/sp.dylib` = repo `libsweetpb.dylib`, 68656 bytes; its source is not in the repo, only sweetpb/sweetpb.c with the PosterBoard part): three fixes per its strings:
+    1. PosterBoard's switcher-configuration assertion.
+    2. ExtensionKit's extension-point cache: a signed read falls back to unsigned (`+[NSDictionary _EX_dictionaryWithSignedURL:error:]`).
+    3. containermanagerd: `+[MCMUserIdentityCache personasAreSupported]` -> NO.
+    - A first oslog capture while restarting lsd/containermanagerd/PosterBoard showed no "sweetpb" lines (it may log to stderr only: "os_log copied to stderr"). Next: find why each was needed, then decide which can become kernel fixes.
+  - Also next: Bluetooth into the kernel (power at boot, second kctl name, BT_HCI_TRANSPORT via sweetinject, HCI fix-ups in sweet_bt.c).
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
