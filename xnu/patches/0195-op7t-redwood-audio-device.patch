@@ -1,0 +1,196 @@
+op7t-0195: /dev/redwood-audio, the device iOS's audio goes to
+
+2026-11-11: the speakers play a tone the DSP takes from kern.sweetaudiobuf
+(0194, user heard it). For iOS's own sound: HackiOS's RedwoodAudio.driver
+(an AudioServerPlugIn for /System/Library/Audio/Plug-Ins/HAL, built for iOS
+16.5; its "Speaker" is the device the virtual audio device routes to)
+writes 16-bit stereo at 48 kHz to /dev/redwood-audio from the audio
+server's real-time thread, which must never wait.
+
+sweet_smmu.c (next to the audio buffer):
+- the character device: writes go into a ring of 65536 frames (1.37 s) and
+  are dropped when it is full (counted); the ioctl REDWOOD_AUDIO_SET_VOLUME
+  { below (1/8 dB), muted } is kept, as HackiOS's redwood_audio.c;
+- sysctl kern.sweetaudiodev=1 makes the node (then restart the audio server:
+  the plug-in opens it once, when it is loaded);
+- kern.sweetaudioring (read): whole frames taken from the ring, for the
+  userland feeder (tools/sweetaudio.py) that plays them through the DSP;
+- kern.sweetaudiostat: written / lost / in the ring / opens / volume.
+
+Apply after 0194.
+---
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 66fb2e6..3fcafc8 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -22,6 +22,11 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <mach/vm_param.h>
++#include <kern/locks.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+@@ -478,6 +483,158 @@ sysctl_sweetaudiobuf SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweetaudiobuf, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+ 	sysctl_sweetaudiobuf, "S", "audio buffer for the ADSP (0194): read pa/size/bank, write offset + PCM");
+ 
++/*
++ * 0195: /dev/redwood-audio, what iOS plays. HackiOS's RedwoodAudio.driver (an AudioServerPlugIn in
++ * /System/Library/Audio/Plug-Ins/HAL; its "Speaker" is the device iOS routes to) opens it once when the audio
++ * server loads it and writes 16-bit stereo at 48 kHz from the server's real-time thread, which must never wait:
++ * here the frames go into a ring and are dropped when it is full. A feeder in userland (tools/sweetaudio.py feed)
++ * drains the ring with kern.sweetaudioring and plays it through the DSP from kern.sweetaudiobuf.
++ *   sysctl kern.sweetaudiodev=1     make the node (once; then restart the audio server so the plug-in opens it)
++ *   kern.sweetaudioring (read)      up to oldlen bytes (whole frames) taken from the ring; 0 bytes when empty
++ *   kern.sweetaudiostat (read)      "frames written, lost, in the ring, opens, volume"
++ * The ioctl REDWOOD_AUDIO_SET_VOLUME { u32 below (eighths of a dB), u32 muted } is kept (HackiOS's numbers).
++ */
++#define RW_AUDIO_SET_VOLUME     _IOW('r', 1, struct rw_audio_volume)
++#define RW_RING_FRAMES          65536u          /* 1.37 s at 48 kHz; a power of two */
++
++struct rw_audio_volume {
++	uint32_t below, muted;
++};
++
++static LCK_GRP_DECLARE(rw_audio_grp, "sweet-audio");
++static LCK_MTX_DECLARE(rw_audio_lock, &rw_audio_grp);
++static uint32_t rw_ring[RW_RING_FRAMES];        /* one frame = left | right << 16 */
++static uint32_t rw_head, rw_tail;               /* run on and wrap */
++static uint64_t rw_written, rw_lost;
++static uint32_t rw_opens, rw_vol_below, rw_vol_muted, rw_vol_set;
++static int rw_major = -1;
++
++static int
++rw_audio_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	OSIncrementAtomic((volatile SInt32 *)&rw_opens);
++	return 0;
++}
++
++static int
++rw_audio_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++rw_audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t chunk[1024];
++	int error = 0;
++
++	while (uio_resid(uio) >= 4) {
++		uint32_t n = (uint32_t)MIN((user_ssize_t)sizeof(chunk), uio_resid(uio)) & ~3u;
++		if ((error = uiomove((caddr_t)chunk, (int)n, uio)) != 0) {
++			break;
++		}
++		n /= 4;
++		lck_mtx_lock(&rw_audio_lock);
++		uint32_t room = RW_RING_FRAMES - (rw_head - rw_tail), take = n < room ? n : room;
++		for (uint32_t i = 0; i < take; i++) {
++			rw_ring[(rw_head + i) % RW_RING_FRAMES] = chunk[i];
++		}
++		rw_head += take;
++		rw_written += n;
++		rw_lost += n - take;
++		lck_mtx_unlock(&rw_audio_lock);
++	}
++	if (uio_resid(uio) > 0 && error == 0) {
++		uio_update(uio, uio_resid(uio));        /* a part frame: taken and dropped */
++	}
++	return error;
++}
++
++static int
++rw_audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
++{
++	const struct rw_audio_volume *v = (const struct rw_audio_volume *)data;
++
++	if (command != RW_AUDIO_SET_VOLUME) {
++		return ENOTTY;
++	}
++	rw_vol_below = v->below;
++	rw_vol_muted = v->muted != 0;
++	rw_vol_set++;
++	printf("HOTDOGB AUDIO: iOS volume: %s%u.%03u dB under the loudest\n", v->muted ? "muted; " : "", v->below / 8,
++		v->below % 8 * 125);
++	return 0;
++}
++
++static const struct cdevsw rw_audio_cdevsw = {
++	.d_open = rw_audio_open, .d_close = rw_audio_close, .d_read = eno_rdwrt, .d_write = rw_audio_write,
++	.d_ioctl = rw_audio_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static int
++sysctl_sweetaudiodev SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = rw_major >= 0, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed || value == 0 || rw_major >= 0) {
++		return error;
++	}
++	rw_major = cdevsw_add(-1, &rw_audio_cdevsw);
++	if (rw_major < 0 || devfs_make_node(makedev(rw_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio") == NULL) {
++		printf("HOTDOGB AUDIO: /dev/redwood-audio could not be made (major %d)\n", rw_major);
++		return EIO;
++	}
++	printf("HOTDOGB AUDIO: /dev/redwood-audio made (major %d): restart the audio server so its plug-in opens it\n",
++		rw_major);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetaudiodev, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++	sysctl_sweetaudiodev, "I", "1: make /dev/redwood-audio (0195)");
++
++static int
++sysctl_sweetaudioring SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t out[1024];
++	uint32_t want = (uint32_t)MIN(req->oldlen / 4, (size_t)1024), got;
++
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, sizeof(out));
++	}
++	lck_mtx_lock(&rw_audio_lock);
++	got = MIN(want, rw_head - rw_tail);
++	for (uint32_t i = 0; i < got; i++) {
++		out[i] = rw_ring[(rw_tail + i) % RW_RING_FRAMES];
++	}
++	rw_tail += got;
++	lck_mtx_unlock(&rw_audio_lock);
++	return SYSCTL_OUT(req, out, got * 4);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetaudioring, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++	sysctl_sweetaudioring, "S", "frames iOS wrote to /dev/redwood-audio, taken from the ring (0195)");
++
++static int
++sysctl_sweetaudiostat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char text[200];
++	int len;
++
++	lck_mtx_lock(&rw_audio_lock);
++	len = snprintf(text, sizeof(text), "written %llu lost %llu ring %u opens %u volume %u/8 dB below%s (set %u times)",
++		rw_written, rw_lost, rw_head - rw_tail, rw_opens, rw_vol_below, rw_vol_muted ? " muted" : "", rw_vol_set);
++	lck_mtx_unlock(&rw_audio_lock);
++	return SYSCTL_OUT(req, text, (size_t)len + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetaudiostat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++	sysctl_sweetaudiostat, "A", "/dev/redwood-audio counters (0195)");
++
+ /* sysctl kern.sweetsmmu_map=0x140: the same by hand (root); reading gives the bank (or -1) */
+ static int
+ sysctl_sweetsmmu_map SYSCTL_HANDLER_ARGS
