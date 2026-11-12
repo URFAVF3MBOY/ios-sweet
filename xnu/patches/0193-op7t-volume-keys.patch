@@ -1,0 +1,132 @@
+op7t-0193: OnePlus 7T volume keys (PM8150 GPIO 6/7)
+
+sweet_keys.c still read the Redmi's keys: volume up from PM6150L (SPMI SID 4)
+GPIO 2 at 0xc110, volume down from the PON's RESIN bit. On the 7T that GPIO
+does not exist (volume up was withheld), and pressing the volume keys never
+set RESIN (2026-11-11: four presses of power/volume all logged as key 0).
+User report: the keys did not act separately.
+
+Live DT (dtb/hotdogb-live.dts) gpio_keys: vol_up = PM8150 GPIO 6, vol_down =
+PM8150 GPIO 7, both active-low, pinctrl@c000 of qcom,pm8150@0 (SID 0).
+Now (sweetkeys7t=1, default): power = PON KPDPWR (0x810 bit 0), volume up =
+!0xc510 bit 0, volume down = !0xc610 bit 0 or RESIN. Each GPIO is read only if
+firmware left it an enabled input (same check as before, logged at start);
+PMIC access stays read-only. The raw registers are logged on every change.
+sweetkeys7t=0: the old reads.
+
+Apply after 0124.
+---
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 5756a2c..ce763bf 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -23,9 +23,21 @@ void sweet_keys_init(void);
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu
++/*
++ * 0193 (OnePlus 7T, live DT dtb/hotdogb-live.dts): gpio_keys vol_up = PM8150 GPIO 6, vol_down = PM8150 GPIO 7,
++ * both active-low, on pinctrl@c000 of qcom,pm8150@0 (SPMI SID 0, peripherals 0xc5/0xc6, real-time status at
++ * 0xc510/0xc610, the register Linux reads for a GPIO input). Power = PON KPDPWR (SID 0, 0x810 bit 0); the PON's
++ * RESIN (bit 1) is also mapped to volume down there (qcom,pon_2 code 0x72), so either counts. The Redmi's
++ * volume-up (PM6150L SID 4 GPIO 2, 0xc110) does not exist on the 7T: volume up never worked, volume down only
++ * through RESIN. sweetkeys7t=0: the old Redmi reads.
++ */
++#define KEYS_VUP_RT      0xc510u    /* PM8150 GPIO 6 */
++#define KEYS_VDN_RT      0xc610u    /* PM8150 GPIO 7 */
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_vup_apid = KEYS_NO_APID, keys_vdn_apid = KEYS_NO_APID;
++static int keys_7t = 1;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -97,6 +109,39 @@ keys_thread(void *arg, wait_result_t result)
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
++	if (keys_7t) {
++		uint8_t last_pon = 0xff, last_up = 0xff, last_dn = 0xff;
++
++		for (;;) {
++			uint8_t pon = 0, up = 0xff, dn = 0xff;
++			bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++			bool uok = keys_read(keys_vup_apid, KEYS_VUP_RT, &up);
++			bool dok = keys_read(keys_vdn_apid, KEYS_VDN_RT, &dn);
++			/* key 0 power, 1 volume up, 2 volume down (sweet_hid_key); the GPIOs are active-low */
++			int now[3] = {!!(pon & 1u), uok && !(up & 1u), !!(pon & 2u) || (dok && !(dn & 1u))};
++
++			if (!pok) {
++				if ((errors++ % 250u) == 0) {
++					printf("HOTDOGB KEYS: read error pon-ok=%d arb-status=%#x\n", pok, keys_last_status);
++				}
++			} else {
++				errors = 0;
++			}
++			if (pok && (pon != last_pon || up != last_up || dn != last_dn)) {
++				printf("HOTDOGB KEYS: raw pon=%#x gpio6:c510=%#x/%d gpio7:c610=%#x/%d\n", pon, up, uok, dn, dok);
++				last_pon = pon, last_up = up, last_dn = dn;
++			}
++			for (int k = 0; k < 3; ++k) {
++				if (pok && now[k] != state[k]) {
++					state[k] = now[k];
++					printf("HOTDOGB KEYS: key=%d (%s) down=%d\n", k,
++						k == 0 ? "power" : k == 1 ? "volume up" : "volume down", state[k]);
++					sweet_hid_key(k, state[k]);
++				}
++			}
++			keys_wait();
++		}
++	}
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+@@ -152,6 +197,39 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
++	(void)PE_parse_boot_argn("sweetkeys7t", &keys_7t, sizeof(keys_7t));
++	if (keys_7t) {
++		/* PM8150 (SID 0) GPIO 6/7: report how firmware left them; one not confirmed as an enabled input is not read */
++		static const struct { uint16_t ppid, base; const char *name; } g[2] = {
++			{ 0x0c5, 0xc500, "GPIO6 (volume up)" }, { 0x0c6, 0xc600, "GPIO7 (volume down)" },
++		};
++		uint8_t pon = 0;
++		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++
++		printf("HOTDOGB KEYS: 7T keys: arb=%#x apids=%u pon-apid=%u pon=%#x/%d\n", keys_version, count, keys_pon_apid,
++			pon, pok);
++		for (int i = 0; i < 2; i++) {
++			uint16_t apid = keys_find_apid(g[i].ppid, count);
++			uint8_t rt = 0, mode = 0, en = 0, subtype = 0;
++			bool rok = keys_read(apid, (uint16_t)(g[i].base + 0x10), &rt);
++			bool mok = keys_read(apid, (uint16_t)(g[i].base + 0x40), &mode);
++			bool eok = keys_read(apid, (uint16_t)(g[i].base + 0x46), &en);
++			bool sok = keys_read(apid, (uint16_t)(g[i].base + 0x05), &subtype);
++			unsigned dir = subtype >= 0x10u && subtype <= 0x13u ? mode & 3u : (mode >> 4) & 7u;
++			bool input = rok && mok && eok && sok && (en & 0x80u) && (dir == 0 || dir == 2);
++
++			printf("HOTDOGB KEYS: %s apid=%u rt=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d -> %s\n", g[i].name, apid,
++				rt, rok, mode, mok, en, eok, subtype, sok, input ? "read" : "not an enabled input: not read");
++			if (input) {
++				if (i == 0) {
++					keys_vup_apid = apid;
++				} else {
++					keys_vdn_apid = apid;
++				}
++			}
++		}
++		goto start;
++	}
+ 	keys_gpio_apid = keys_find_apid(0x4c1, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+@@ -172,6 +250,7 @@ sweet_keys_init(void)
+ 	if (!pok && !gok) {
+ 		printf("HOTDOGB KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++start:;
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
