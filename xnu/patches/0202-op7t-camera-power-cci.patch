@@ -1,0 +1,511 @@
+op7t-0202: cameras, step 2: power the rear main sensor, MCLK, CCI scan and chip id (kern.sweetcam=2)
+
+The 0201 survey (2026-11-12): camcc readable (GCC camera AHB on) but
+everything camera is off: TITAN_TOP_GDSC collapsed, MCLK1/CCI/cpas/camnoc
+off; GCC camera_xo off although Linux keeps it on; all camera pins in their
+reset state; cmd-db files ldoc1 (XOB, aux 0002) at 0x43400, bobc1 at
+0x40300 (listed twice), ldof1 at 0x41f00, all as VRM; the PMIC LDO/BOB
+peripherals have no SPMI channel for us (only RPMh votes).
+
+kern.sweetcam=2 (once per boot), each stage checked before the next and the
+CCI only touched once its power domain and clocks report on: reset gpio30
+low; RPMh ldoc1 enable (XOB: enable @4 only), bobc1 3312 mV, ldof1 1104 mV
+(sweet_rpmh_cam_rail; rh_lookup now takes a resource listed twice at the
+same address as one); gpio11/29 high; GCC camera_xo/hf_axi/sf_axi; GDSC on
+(Linux gdsc.c wait values, POWER_UP_COMPLETE polled); core/cpas AHB;
+camnoc_axi, CCI0, MCLK1 from XO /1; pins cci_i2c (pull-up) and cam_mclk;
+reset high; CCI0 reset, 100 kHz timing for 19.2 MHz (Linux table), polled
+transfers on master 1; scan of 0x08..0x77; registers 0x0016 and 0x0000 of
+every address that answers. Report in kern.sweetcamlog.
+Not compiled locally: the CI build is the check.
+
+Apply after 0201.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index d2a68de..f69cac2 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -25,6 +25,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <sys/sysctl.h>
++#include <kern/clock.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+ 
+@@ -224,6 +225,364 @@ cam_survey(void)
+ 	}
+ }
+ 
++/*
++ * ---- 0202: step 2, power the rear main sensor and talk to it over the CCI (`sysctl kern.sweetcam=2`) ----
++ *
++ * Sequence (each stage checked before the next; the CCI is only touched once its power domain and clocks
++ * report on, so a failure stops short of a bus stall):
++ *  1. sensor reset gpio30 low (output, no pull, 2 mA);
++ *  2. rails through RPMh: ldoc1 (vio, XOB enable), bobc1 3312 mV (vana), ldof1 1104 mV (vdig); the
++ *     analog switches gpio11 / gpio29 high;
++ *  3. GCC camera_xo / hf_axi / sf_axi on (the survey found camera_xo off although Linux keeps it on);
++ *  4. TITAN_TOP_GDSC on (Linux gdsc.c: wait values en_rest 2, en_few 2, clk_dis 0xf; clear SW_COLLAPSE;
++ *     POLL_CFG_GDSCR: GDSCR + 4 bit 16 POWER_UP_COMPLETE);
++ *  5. camcc: core_ahb, cpas_ahb on; camnoc_axi, CCI0 and MCLK1 RCGs from XO /1 (CFG = 1, CMD bit 0 update),
++ *     their branches on (CBCR bit 0, CLK_OFF bit 31 polled);
++ *  6. pins: gpio19/20 cci_i2c (function 1, pull-up), gpio14 cam_mclk (function 1); 2 ms; reset high; 10 ms;
++ *  7. CCI0: version, reset (RESET_CMD 0x0f73f3f7, RST_DONE), IRQ mask, master 1 timing for a 19.2 MHz clock
++ *     (Linux standard mode), then a scan of master 1 (a 1-byte read at every 7-bit address 0x08..0x77,
++ *     polled; a NACK halts and resets the master), and for each address that answers, 16-bit registers
++ *     0x0016 (Sony sensor id) and 0x0000 read.
++ * Logged as "HOTDOGB CAM:" and kept in kern.sweetcamlog.
++ */
++extern int sweet_rpmh_cam_rail(const char *res, unsigned mv);
++
++#define CCI_HW_VERSION          0x000
++#define CCI_RESET_CMD           0x004
++#define CCI_QUEUE_START         0x008
++#define CCI_HALT_REQ            0x034
++#define CCI_SCL_CTL(m)          (0x100 + 0x100 * (m))
++#define CCI_SDA_CTL_0(m)        (0x104 + 0x100 * (m))
++#define CCI_SDA_CTL_1(m)        (0x108 + 0x100 * (m))
++#define CCI_SDA_CTL_2(m)        (0x10c + 0x100 * (m))
++#define CCI_MISC_CTL(m)         (0x110 + 0x100 * (m))
++#define CCI_READ_DATA(m)        (0x118 + 0x100 * (m))
++#define CCI_READ_BUF_LEVEL(m)   (0x11c + 0x100 * (m))
++#define CCI_EXEC_WORD_CNT(m, q) (0x300 + 0x200 * (m) + 0x100 * (q))
++#define CCI_CUR_WORD_CNT(m, q)  (0x304 + 0x200 * (m) + 0x100 * (q))
++#define CCI_LOAD_DATA(m, q)     (0x310 + 0x200 * (m) + 0x100 * (q))
++#define CCI_IRQ_GLOBAL_CLEAR    0xc00
++#define CCI_IRQ_MASK_0          0xc04
++#define CCI_IRQ_CLEAR_0         0xc08
++#define CCI_IRQ_STATUS_0        0xc0c
++#define CCI_ST_M1_RD_DONE       (1u << 12)
++#define CCI_ST_M1_Q0_REPORT     (1u << 16)
++#define CCI_ST_M1_Q1_REPORT     (1u << 20)
++#define CCI_ST_RST_DONE         (1u << 24)
++#define CCI_ST_M1_HALT_ACK      (1u << 26)
++#define CCI_ST_M1_Q0_NACK       (1u << 29)
++#define CCI_ST_M1_Q1_NACK       (1u << 30)
++#define CCI_ST_M1_ERROR         0x60ee6000u
++#define CCI_SET_PARAM           1u
++#define CCI_REPORT              8u
++#define CCI_WRITE               9u
++#define CCI_READ                10u
++#define CCI_REPORT_IRQ_EN       (1u << 8)
++#define CAM_MASTER              1u
++
++static vm_offset_t cam_cc, cam_cci;
++static int cam_stage;
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++cam_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned timeout_us)
++{
++	for (unsigned t = 0; t < timeout_us; t += 10) {
++		if ((rd32(base, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return (rd32(base, off) & mask) == want;
++}
++
++/* a branch on: CBCR bit 0, then CLK_OFF (bit 31) clear unless the branch has no usable halt bit */
++static bool
++cam_branch_on(vm_offset_t base, const char *name, uint32_t off, bool halt_check)
++{
++	wr32(base, off, rd32(base, off) | 1u);
++	if (!halt_check) {
++		delay(10);
++		cam_say("  %s on (no halt check): %#010x", name, rd32(base, off));
++		return true;
++	}
++	if (!cam_poll(base, off, 1u << 31, 0, 20000)) {
++		cam_say("  %s: CLK_OFF still set: %#010x", name, rd32(base, off));
++		return false;
++	}
++	cam_say("  %s on: %#010x", name, rd32(base, off));
++	return true;
++}
++
++/* an RCG to XO /1 (CFG src 0, div field 1, mode 0), CMD bit 0 update */
++static bool
++cam_rcg_xo(vm_offset_t base, const char *name, uint32_t off)
++{
++	wr32(base, off + 4, 1u);
++	wr32(base, off, rd32(base, off) | 1u);
++	if (!cam_poll(base, off, 1u, 0, 20000)) {
++		cam_say("  %s: update did not finish: cmd %#010x", name, rd32(base, off));
++		return false;
++	}
++	cam_say("  %s: XO /1, cmd %#010x cfg %#010x", name, rd32(base, off), rd32(base, off + 4));
++	return true;
++}
++
++static void
++cam_pin(vm_offset_t tile, unsigned gpio, uint32_t cfg, int out)
++{
++	vm_offset_t page = ml_io_map(tile + 0x1000u * gpio, 0x1000);
++
++	if (page == 0) {
++		return;
++	}
++	if (out >= 0) {
++		wr32(page, 4, out ? 2u : 0u);   /* the level before the output turns on */
++	}
++	wr32(page, 0, cfg);
++}
++
++#define PIN_OUT         (1u << 9)                       /* gpio, no pull, 2 mA, output */
++#define PIN_FUNC1_PU    ((1u << 2) | 3u)                /* function 1, pull-up, 2 mA */
++#define PIN_FUNC1       (1u << 2)                       /* function 1, no pull, 2 mA */
++
++static void
++cci_clear(void)
++{
++	uint32_t st = rd32(cam_cci, CCI_IRQ_STATUS_0);
++
++	wr32(cam_cci, CCI_IRQ_CLEAR_0, st);
++	wr32(cam_cci, CCI_IRQ_GLOBAL_CLEAR, 1u);
++}
++
++static void
++cci_timing(void)
++{
++	wr32(cam_cci, CCI_SCL_CTL(CAM_MASTER), (78u << 16) | 114u);
++	wr32(cam_cci, CCI_SDA_CTL_0(CAM_MASTER), (28u << 16) | 28u);
++	wr32(cam_cci, CCI_SDA_CTL_1(CAM_MASTER), (10u << 16) | 77u);
++	wr32(cam_cci, CCI_SDA_CTL_2(CAM_MASTER), 118u);
++	wr32(cam_cci, CCI_MISC_CTL(CAM_MASTER), (1u << 8) | (6u << 4) | 1u);
++}
++
++/* after a NACK or error: halt master 1's queues, reset the master, timing again (Linux cci_isr) */
++static void
++cci_recover(void)
++{
++	cci_clear();
++	wr32(cam_cci, CCI_HALT_REQ, 1u << 1);
++	(void)cam_poll(cam_cci, CCI_IRQ_STATUS_0, CCI_ST_M1_HALT_ACK, CCI_ST_M1_HALT_ACK, 20000);
++	cci_clear();
++	wr32(cam_cci, CCI_RESET_CMD, 0x0003f001u);    /* CCI_RESET_CMD_M1_MASK */
++	(void)cam_poll(cam_cci, CCI_IRQ_STATUS_0, CCI_ST_RST_DONE, CCI_ST_RST_DONE, 20000);
++	cci_clear();
++	cci_timing();
++}
++
++/* run master 1's queue q; returns the IRQ status seen */
++static uint32_t
++cci_run(unsigned q, uint32_t done)
++{
++	uint32_t st = 0;
++
++	wr32(cam_cci, CCI_EXEC_WORD_CNT(CAM_MASTER, q), rd32(cam_cci, CCI_CUR_WORD_CNT(CAM_MASTER, q)));
++	wr32(cam_cci, CCI_QUEUE_START, 1u << (CAM_MASTER * 2 + q));
++	for (unsigned t = 0; t < 20000; t += 10) {
++		st = rd32(cam_cci, CCI_IRQ_STATUS_0);
++		if (st & (done | CCI_ST_M1_ERROR | CCI_ST_M1_Q0_NACK | CCI_ST_M1_Q1_NACK)) {
++			break;
++		}
++		delay(10);
++	}
++	return st;
++}
++
++static bool
++cci_failed(uint32_t st, uint32_t done)
++{
++	return (st & done) == 0 || (st & (CCI_ST_M1_ERROR | CCI_ST_M1_Q0_NACK | CCI_ST_M1_Q1_NACK)) != 0;
++}
++
++/* read n (<= 11) bytes from addr7, after writing reg_len (0..2) register bytes; 0 = ACKed and read */
++static int
++cci_xfer(unsigned addr7, uint32_t reg, unsigned reg_len, uint8_t *buf, unsigned n, uint32_t *status)
++{
++	uint32_t st, words;
++	unsigned got = 0;
++	bool first = true;
++
++	*status = 0;
++	if (reg_len != 0) {
++		uint8_t load[4] = { (uint8_t)(CCI_WRITE | (reg_len << 4)), 0, 0, 0 };
++
++		for (unsigned i = 0; i < reg_len; i++) {
++			load[1 + i] = (uint8_t)(reg >> (8 * (reg_len - 1 - i)));
++		}
++		wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0), CCI_SET_PARAM | (addr7 << 4));
++		wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0),
++		    (uint32_t)load[0] | (uint32_t)load[1] << 8 | (uint32_t)load[2] << 16 | (uint32_t)load[3] << 24);
++		wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0), CCI_REPORT | CCI_REPORT_IRQ_EN);
++		st = cci_run(0, CCI_ST_M1_Q0_REPORT);
++		*status = st;
++		if (cci_failed(st, CCI_ST_M1_Q0_REPORT)) {
++			cci_recover();
++			return -1;
++		}
++		cci_clear();
++	}
++	wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 1), CCI_SET_PARAM | (addr7 << 4));
++	wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 1), CCI_READ | (n << 4));
++	st = cci_run(1, CCI_ST_M1_RD_DONE);
++	*status = st;
++	if (cci_failed(st, CCI_ST_M1_RD_DONE)) {
++		cci_recover();
++		return -1;
++	}
++	words = rd32(cam_cci, CCI_READ_BUF_LEVEL(CAM_MASTER));
++	for (unsigned w = 0; w < words && w < 8; w++) {
++		uint32_t v = rd32(cam_cci, CCI_READ_DATA(CAM_MASTER));
++
++		for (unsigned i = 0; i < 4; i++) {
++			if (first) {
++				first = false;          /* the slave address byte */
++				continue;
++			}
++			if (got < n) {
++				buf[got++] = (uint8_t)(v >> (8 * i));
++			}
++		}
++	}
++	cci_clear();
++	return got == n ? 0 : -2;
++}
++
++static void
++cam_power_and_scan(void)
++{
++	vm_offset_t gcc;
++	uint8_t id[2];
++	uint32_t st = 0;
++	unsigned found = 0, addrs[16];
++
++	cam_log_len = 0;
++	cam_log[0] = '\0';
++	cam_say("power-up + CCI scan (0202)");
++	cam_stage = 1;
++
++	cam_pin(TLMM_EAST, 30, PIN_OUT, 0);             /* reset low first */
++
++	cam_say("rails:");
++	cam_say("  ldoc1 (vio): %d", sweet_rpmh_cam_rail("ldoc1", 0));
++	cam_say("  bobc1 (vana) 3312 mV: %d", sweet_rpmh_cam_rail("bobc1", 3312));
++	cam_say("  ldof1 (vdig) 1104 mV: %d", sweet_rpmh_cam_rail("ldof1", 1104));
++	cam_pin(TLMM_NORTH, 11, PIN_OUT, 1);
++	cam_pin(TLMM_EAST, 29, PIN_OUT, 1);
++	delay(2000);
++	cam_stage = 2;
++
++	gcc = ml_io_map(CAM_GCC_PAGE, 0x1000);
++	cam_cc = ml_io_map(CAM_CC_PA, CAM_CC_LEN);
++	if (gcc == 0 || cam_cc == 0) {
++		cam_say("no mapping");
++		return;
++	}
++	cam_say("GCC:");
++	(void)cam_branch_on(gcc, "camera_xo", 0x044, false);
++	(void)cam_branch_on(gcc, "camera_hf_axi", 0x030, true);
++	(void)cam_branch_on(gcc, "camera_sf_axi", 0x034, true);
++	cam_stage = 3;
++
++	cam_say("TITAN_TOP_GDSC:");
++	{
++		uint32_t g = rd32(cam_cc, 0xc1bc);
++
++		g &= ~((0xfu << 20) | (0xfu << 16) | (0xfu << 12));
++		g |= (2u << 20) | (2u << 16) | (0xfu << 12);
++		wr32(cam_cc, 0xc1bc, g);
++		wr32(cam_cc, 0xc1bc, g & ~1u);          /* SW_COLLAPSE off */
++		if (!cam_poll(cam_cc, 0xc1c0, 1u << 16, 1u << 16, 100000)) {
++			cam_say("  did not power up: gdscr %#010x cfg %#010x: stopping", rd32(cam_cc, 0xc1bc),
++			    rd32(cam_cc, 0xc1c0));
++			return;
++		}
++		cam_say("  on: gdscr %#010x cfg %#010x", rd32(cam_cc, 0xc1bc), rd32(cam_cc, 0xc1c0));
++	}
++	cam_stage = 4;
++
++	cam_say("camcc:");
++	(void)cam_branch_on(cam_cc, "core_ahb", 0xc1c8, false);
++	if (!cam_branch_on(cam_cc, "cpas_ahb", 0xc168, true)) {
++		cam_say("stopping (no AHB to the camera blocks)");
++		return;
++	}
++	if (cam_rcg_xo(cam_cc, "camnoc_axi_src", 0xc170)) {
++		(void)cam_branch_on(cam_cc, "camnoc_axi", 0xc18c, true);
++	}
++	if (!cam_rcg_xo(cam_cc, "cci0_src", 0xc108) || !cam_branch_on(cam_cc, "cci0", 0xc120, true)) {
++		cam_say("stopping (no CCI clock)");
++		return;
++	}
++	if (cam_rcg_xo(cam_cc, "mclk1_src", 0x5024)) {
++		(void)cam_branch_on(cam_cc, "mclk1", 0x503c, true);
++	}
++	cam_stage = 5;
++
++	cam_pin(TLMM_NORTH, 19, PIN_FUNC1_PU, -1);
++	cam_pin(TLMM_NORTH, 20, PIN_FUNC1_PU, -1);
++	cam_pin(TLMM_NORTH, 14, PIN_FUNC1, -1);
++	delay(2000);
++	cam_pin(TLMM_EAST, 30, PIN_OUT, 1);             /* out of reset */
++	delay(10000);
++	cam_say("pins set, sensor out of reset");
++	cam_stage = 6;
++
++	cam_cci = ml_io_map(CAM_CCI0_PA, 0x1000);
++	if (cam_cci == 0) {
++		cam_say("CCI0: no mapping");
++		return;
++	}
++	cam_say("CCI0: hw version %#010x", rd32(cam_cci, CCI_HW_VERSION));
++	cci_clear();
++	wr32(cam_cci, CCI_RESET_CMD, 0x0f73f3f7u);
++	if (!cam_poll(cam_cci, CCI_IRQ_STATUS_0, CCI_ST_RST_DONE, CCI_ST_RST_DONE, 100000)) {
++		cam_say("CCI0: reset not acknowledged (status %#010x): stopping", rd32(cam_cci, CCI_IRQ_STATUS_0));
++		return;
++	}
++	cci_clear();
++	wr32(cam_cci, CCI_IRQ_MASK_0, 0x7fffffffu);
++	cci_timing();
++	cam_say("CCI0: reset done, master %u at 100 kHz", CAM_MASTER);
++	cam_stage = 7;
++
++	for (unsigned a = 0x08; a <= 0x77; a++) {
++		if (cci_xfer(a, 0, 0, id, 1, &st) == 0) {
++			if (found < sizeof(addrs) / sizeof(addrs[0])) {
++				addrs[found] = a;
++			}
++			found++;
++		}
++	}
++	cam_say("scan of master %u: %u address(es) answered", CAM_MASTER, found);
++	for (unsigned i = 0; i < found && i < sizeof(addrs) / sizeof(addrs[0]); i++) {
++		uint8_t r16[2] = { 0, 0 }, r0[2] = { 0, 0 };
++		int e16 = cci_xfer(addrs[i], 0x0016, 2, r16, 2, &st);
++		int e0 = cci_xfer(addrs[i], 0x0000, 2, r0, 2, &st);
++
++		cam_say("  %#04x (8-bit %#04x): reg 0x0016 -> %s %02x%02x, reg 0x0000 -> %s %02x%02x", addrs[i],
++		    addrs[i] << 1, e16 ? "error" : "ok", r16[0], r16[1], e0 ? "error" : "ok", r0[0], r0[1]);
++	}
++	if (found == 0) {
++		cam_say("  nothing answered (last status %#010x)", st);
++	}
++	cam_stage = 8;
++}
++
+ static int
+ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ {
+@@ -234,16 +593,22 @@ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ 	if (error != 0 || !changed) {
+ 		return error;
+ 	}
+-	if (value != 1) {
++	if (value == 1) {
++		cam_survey();
++	} else if (value == 2) {
++		if (cam_stage != 0) {
++			return EALREADY;        /* (0202: once per boot) */
++		}
++		cam_power_and_scan();
++	} else {
+ 		return EINVAL;
+ 	}
+-	cam_survey();
+-	cam_ran = 1;
++	cam_ran = value;
+ 	return 0;
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetcam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcam, "I",
+-    "OnePlus 7T cameras (0201): 1 = read-only survey of the rear main sensor's power, clocks, pins");
++    "OnePlus 7T cameras: 1 = read-only survey (0201), 2 = power the rear main sensor, CCI scan + id (0202)");
+ 
+ static int
+ sysctl_sweetcamlog SYSCTL_HANDLER_ARGS
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index afc6e1d..3d5ffc5 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -15,6 +15,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_arc_level(const char *res, unsigned vlvl);
+ int sweet_rpmh_clk_enable(const char *res, unsigned unused);
+ int sweet_rpmh_describe(const char *res, char *out, size_t outlen);
++int sweet_rpmh_cam_rail(const char *res, unsigned mv);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -196,6 +197,9 @@ rh_lookup(const char *res, unsigned kind, uint32_t *address, uint32_t *aux_at, u
+ 				printf("HOTDOGB RPMH: invalid %s entry for %s\n", kind == RH_ARC ? "ARC" : "VRM", res);
+ 				return EINVAL;
+ 			}
++			if (matches != 0 && addr == *address) {
++				continue;       /* 0202: the same resource listed twice (bobc1 is): one match */
++			}
+ 			*address = addr;
+ 			if (aux_at != NULL) {
+ 				*aux_at = aux + rh_db16(e + 22);
+@@ -477,6 +481,61 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * 0202: the rear main camera's rails (live DT qcom,cam-sensor@0), only ever switched on:
++ *   ldof1 PM8009 L1 cam_vdig 1104 mV: a PMIC5 LDO like the others: voltage @0, mode 7 (HPM) @8, enable @4;
++ *   bobc1 PM8150L BOB cam_vana 3312 mV: voltage @0, enable @4 (its mode is left as the other users set it);
++ *   ldoc1 PM8150L L1 cam_vio: an XOB (DT rpmh-xob-regulator; cmd-db files it as VRM, aux 0002): no voltage
++ *         or mode register, enable @4 only.
++ */
++int
++sweet_rpmh_cam_rail(const char *res, unsigned mv)
++{
++	uint32_t offsets[3], values[3];
++	unsigned n;
++
++	if (res == NULL) {
++		return EINVAL;
++	}
++	if (!strcmp(res, "ldof1") && mv == 1104) {
++		offsets[0] = 0; values[0] = mv;
++		offsets[1] = 8; values[1] = 7;
++		offsets[2] = 4; values[2] = 1;
++		n = 3;
++	} else if (!strcmp(res, "bobc1") && mv == 3312) {
++		offsets[0] = 0; values[0] = mv;
++		offsets[1] = 4; values[1] = 1;
++		n = 2;
++	} else if (!strcmp(res, "ldoc1") && mv == 0) {
++		offsets[0] = 4; values[0] = 1;
++		n = 1;
++	} else {
++		printf("HOTDOGB RPMH: camera rail %s %u mV not allowed\n", res, mv);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("HOTDOGB RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address, NULL, NULL);
++	}
++	if (!error) {
++		error = rh_send(address, n, offsets, values);
++	}
++out:
++	if (error) {
++		printf("HOTDOGB RPMH: camera rail %s failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ /*
+  * 0201: what cmd-db says about a resource (slave type, address, aux data), without voting and without
+  * the type check rh_lookup makes: for the camera rails (ldoc1 is an XOB regulator, bobc1 a BOB).
