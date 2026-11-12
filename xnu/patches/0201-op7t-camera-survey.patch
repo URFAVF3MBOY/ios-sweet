@@ -1,0 +1,398 @@
+op7t-0201: cameras, step 1: a read-only survey of the rear main sensor's power, clocks and pins
+
+2026-11-12, user: camera next. Before switching anything on, read what the
+rear main sensor (live DT qcom,cam-sensor@0) depends on and in what state ABL
+left it, so the power-up (step 2) is built on facts:
+- GCC camera clocks (ahb/hf axi/sf axi/xo);
+- TLMM config of its pins: gpio11 CAM_VANA_0, gpio14 MCLK1, gpio17-20 CCI
+  (master 1 = 19/20), gpio29 CAM_VANA2_0, gpio30 CAM_RESET0;
+- PMIC over SPMI (reads only; sweet_spmi.c's allowlist widened): PM8150L
+  L1 (cam_vio), 0xa0 (BOB?), GPIO1 (CAM_PVDD); PM8009 L1 (cam_vdig);
+- cmd-db entries of the RPMh rails ldoc1 (XOB), bobc1, ldof1 (new
+  sweet_rpmh_describe: no vote, no type check);
+- the camera clock controller (only if GCC's camera AHB is on): TITAN_TOP
+  GDSC, gdsc/core ahb/cpas ahb/camnoc axi, MCLK1, CCI0/1, slow ahb, PLL0/2;
+- CCI0's version register only if its power domain and clocks already run.
+Offsets from Linux camcc-sm8150.c, gcc-sm8150.c, pinctrl-sm8150.c,
+i2c-qcom-cci.c. `sysctl kern.sweetcam=1`, report in kern.sweetcamlog.
+Not compiled locally (no compiler for the kernel here): the CI build is the
+check.
+
+Apply after 0200.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_clock.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_sound.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_cores.c			standard
+ bsd/dev/sweet_swipe.c			standard
+ bsd/dev/sweet_reboot.c			standard
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+new file mode 100644
+index 0000000..d2a68de
+--- /dev/null
++++ b/bsd/dev/sweet_cam.c
+@@ -0,0 +1,257 @@
++/*
++ * OnePlus 7T cameras, step 1 (0201): a read-only survey of what the main rear sensor needs, before
++ * anything is switched on.
++ *
++ * Live DT (dtb/hotdogb-live.dts) qcom,cam-sensor@0 (rear main): CCI device 0 (qcom,cci@ac4a000),
++ * master 1 (TLMM gpio19 SDA1 / gpio20 SCL1, function 1 cci_i2c); MCLK1 19.2 MHz on gpio14 (function 1
++ * cam_mclk); reset gpio30; analog switches gpio11 (CAM_VANA_0) and gpio29 (CAM_VANA2_0); CAM_PVDD =
++ * PM8150L GPIO1 (DT active state: output low); supplies cam_vio = PM8150L L1 (RPMh "ldoc1", an XOB,
++ * 1.8 V fixed), cam_vana = PM8150L BOB ("bobc1", 3.312 V), cam_vdig = PM8009 L1 ("ldof1", 1.104 V),
++ * cam_clk = camcc TITAN_TOP_GDSC (0xad0c1bc).
++ * Register offsets from Linux: camcc-sm8150.c (MCLK1 RCG 0x5024 / branch 0x503c, CCI0 RCG 0xc108 /
++ * branch 0xc120, CCI1 0xc124 / 0xc13c, cpas_ahb 0xc168, camnoc_axi 0xc18c (RCG 0xc170), core_ahb 0xc1c8,
++ * gdsc_clk 0xc1e4, slow_ahb RCG 0x7058, titan_top_gdsc 0xc1bc), gcc-sm8150.c (camera ahb 0xb008, hf axi
++ * 0xb030, sf axi 0xb034, xo 0xb044), pinctrl-sm8150.c + sm8150.dtsi (TLMM tiles: north 0x03900000,
++ * east 0x03500000; gpio n config at tile + 0x1000 * n, io at + 4), i2c-qcom-cci.c (CCI_HW_VERSION 0).
++ *
++ * Nothing here writes a register. A block whose clock is off can stall the bus, so the camera clock
++ * controller is read only if GCC's camera AHB clock is enabled, and the CCI only if its power domain and
++ * clocks already run (not expected). `sysctl kern.sweetcam=1` runs it; kern.sweetcamlog is the report
++ * (also printed, "HOTDOGB CAM:").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdarg.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_spmi_init(void);
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern int sweet_rpmh_describe(const char *res, char *out, size_t outlen);
++
++#define CAM_GCC_PAGE    0x0010b000u     /* GCC + 0xb000 */
++#define CAM_CC_PA       0x0ad00000u
++#define CAM_CC_LEN      0x00010000u
++#define CAM_CCI0_PA     0x0ac4a000u
++#define TLMM_NORTH      0x03900000u
++#define TLMM_EAST       0x03500000u
++
++static char cam_log[6144];
++static size_t cam_log_len;
++static int cam_ran;
++
++static void
++cam_say(const char *fmt, ...)
++{
++	va_list ap;
++	char line[256];
++	int n;
++
++	va_start(ap, fmt);
++	n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("HOTDOGB CAM: %s\n", line);
++	if (cam_log_len + (size_t)n + 2 < sizeof(cam_log)) {
++		memcpy(cam_log + cam_log_len, line, (size_t)n);
++		cam_log_len += (size_t)n;
++		cam_log[cam_log_len++] = '\n';
++		cam_log[cam_log_len] = '\0';
++	}
++}
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++/* a clock branch: enable bit 0, CLK_OFF bit 31 */
++static void
++cam_branch(vm_offset_t base, const char *name, uint32_t off)
++{
++	uint32_t v = rd32(base, off);
++
++	cam_say("  %-14s +%#06x = %#010x (enable %u, off %u)", name, off, v, v & 1u, v >> 31);
++}
++
++/* an RCG: CMD (bit 0 update, bit 31 root off), CFG (src [10:8], div [4:0], mode [13:12]) */
++static void
++cam_rcg(vm_offset_t base, const char *name, uint32_t off)
++{
++	uint32_t cmd = rd32(base, off), cfg = rd32(base, off + 4);
++
++	cam_say("  %-14s +%#06x cmd %#010x (root off %u) cfg %#010x (src %u div %u mode %u)", name, off, cmd,
++	    cmd >> 31, cfg, (cfg >> 8) & 7u, cfg & 31u, (cfg >> 12) & 3u);
++}
++
++static void
++cam_gpio(vm_offset_t tile, const char *tname, unsigned gpio, const char *what)
++{
++	vm_offset_t page = ml_io_map(tile + 0x1000u * gpio, 0x1000);
++	uint32_t cfg, io;
++
++	if (page == 0) {
++		cam_say("  gpio%u (%s): no mapping", gpio, what);
++		return;
++	}
++	cfg = rd32(page, 0);
++	io = rd32(page, 4);
++	cam_say("  gpio%-3u %-11s %s cfg %#06x (func %u, pull %u, drive %u mA, oe %u) io %#x (in %u, out %u)",
++	    gpio, what, tname, cfg, (cfg >> 2) & 15u, cfg & 3u, 2u * (((cfg >> 6) & 7u) + 1u), (cfg >> 9) & 1u,
++	    io, io & 1u, (io >> 1) & 1u);
++}
++
++static void
++cam_pmic(unsigned sid, unsigned base, const char *name)
++{
++	static const struct { uint8_t off; const char *what; } regs[] = {
++		{ 0x04, "type" }, { 0x05, "subtype" }, { 0x08, "status1" }, { 0x09, "status2" },
++		{ 0x40, "reg40" }, { 0x41, "reg41" }, { 0x42, "reg42" }, { 0x44, "reg44" }, { 0x45, "reg45" },
++		{ 0x46, "en_ctl" },
++	};
++	char line[200];
++	size_t n = 0;
++
++	n += (size_t)snprintf(line + n, sizeof(line) - n, "  %-10s sid %u %#06x:", name, sid, base);
++	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]) && n < sizeof(line); i++) {
++		uint8_t v = 0;
++
++		if (sweet_spmi_read(sid, base + regs[i].off, &v) == 0) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s %#04x", regs[i].what, v);
++		} else {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s ?", regs[i].what);
++		}
++	}
++	cam_say("%s", line);
++}
++
++static void
++cam_survey(void)
++{
++	vm_offset_t gcc, cc, cci;
++	char buf[256];
++	uint32_t ahb;
++
++	cam_log_len = 0;
++	cam_log[0] = '\0';
++	cam_say("survey (0201, read only)");
++
++	gcc = ml_io_map(CAM_GCC_PAGE, 0x1000);
++	if (gcc == 0) {
++		cam_say("GCC: no mapping");
++		return;
++	}
++	cam_say("GCC camera clocks:");
++	cam_branch(gcc, "camera_ahb", 0x008);
++	cam_branch(gcc, "camera_hf_axi", 0x030);
++	cam_branch(gcc, "camera_sf_axi", 0x034);
++	cam_branch(gcc, "camera_xo", 0x044);
++	ahb = rd32(gcc, 0x008);
++
++	cam_say("pins:");
++	cam_gpio(TLMM_NORTH, "N", 11, "CAM_VANA_0");
++	cam_gpio(TLMM_NORTH, "N", 14, "MCLK1");
++	cam_gpio(TLMM_NORTH, "N", 17, "CCI_SDA0");
++	cam_gpio(TLMM_NORTH, "N", 18, "CCI_SCL0");
++	cam_gpio(TLMM_NORTH, "N", 19, "CCI_SDA1");
++	cam_gpio(TLMM_NORTH, "N", 20, "CCI_SCL1");
++	cam_gpio(TLMM_EAST, "E", 29, "CAM_VANA2_0");
++	cam_gpio(TLMM_EAST, "E", 30, "CAM_RESET0");
++
++	cam_say("PMIC (SPMI reads):");
++	if (sweet_spmi_init() != 0) {
++		cam_say("  SPMI not ready");
++	} else {
++		cam_pmic(4, 0x4000, "PM8150L L1");
++		cam_pmic(4, 0xa000, "PM8150L a0");
++		cam_pmic(4, 0xc000, "PM8150L G1");
++		cam_pmic(0xa, 0x4000, "PM8009 L1");
++	}
++
++	cam_say("RPMh cmd-db:");
++	for (const char *const *r = (const char *const[]){ "ldoc1", "bobc1", "ldof1", NULL }; *r != NULL; r++) {
++		buf[0] = '\0';
++		(void)sweet_rpmh_describe(*r, buf, sizeof(buf));
++		cam_say("  %s: %s", *r, buf);
++	}
++
++	if ((ahb & 1u) == 0 && (ahb >> 31) != 0) {
++		cam_say("camcc: GCC camera AHB is off: not read");
++		return;
++	}
++	cc = ml_io_map(CAM_CC_PA, CAM_CC_LEN);
++	if (cc == 0) {
++		cam_say("camcc: no mapping");
++		return;
++	}
++	cam_say("camcc:");
++	{
++		uint32_t g = rd32(cc, 0xc1bc), gc = rd32(cc, 0xc1c0);
++
++		cam_say("  titan_top_gdsc +0xc1bc = %#010x (pwr_on %u, sw_collapse %u, hw_ctrl %u) cfg %#010x", g,
++		    g >> 31, g & 1u, (g >> 1) & 1u, gc);
++	}
++	cam_branch(cc, "gdsc_clk", 0xc1e4);
++	cam_branch(cc, "core_ahb", 0xc1c8);
++	cam_branch(cc, "cpas_ahb", 0xc168);
++	cam_branch(cc, "camnoc_axi", 0xc18c);
++	cam_rcg(cc, "camnoc_axi_src", 0xc170);
++	cam_rcg(cc, "slow_ahb_src", 0x7058);
++	cam_rcg(cc, "mclk1_src", 0x5024);
++	cam_branch(cc, "mclk1", 0x503c);
++	cam_rcg(cc, "cci0_src", 0xc108);
++	cam_branch(cc, "cci0", 0xc120);
++	cam_rcg(cc, "cci1_src", 0xc124);
++	cam_branch(cc, "cci1", 0xc13c);
++	cam_say("  pll0 +0x0000 = %#010x, pll2 +0x2000 = %#010x", rd32(cc, 0x0000), rd32(cc, 0x2000));
++
++	/* the CCI only if all of its path already runs */
++	if ((rd32(cc, 0xc1bc) >> 31) && !(rd32(cc, 0xc120) >> 31) && !(rd32(cc, 0xc168) >> 31) &&
++	    !(rd32(cc, 0xc1c8) >> 31)) {
++		cci = ml_io_map(CAM_CCI0_PA, 0x1000);
++		if (cci != 0) {
++			cam_say("CCI0: hw version %#010x", rd32(cci, 0));
++		}
++	} else {
++		cam_say("CCI0: power domain or clocks off: not read");
++	}
++}
++
++static int
++sysctl_sweetcam SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = cam_ran, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != 1) {
++		return EINVAL;
++	}
++	cam_survey();
++	cam_ran = 1;
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcam, "I",
++    "OnePlus 7T cameras (0201): 1 = read-only survey of the rear main sensor's power, clocks, pins");
++
++static int
++sysctl_sweetcamlog SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, cam_log, cam_log_len + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcamlog, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweetcamlog, "A", "the last kern.sweetcam report");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index a419122..afc6e1d 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -14,6 +14,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_arc_level(const char *res, unsigned vlvl);
+ int sweet_rpmh_clk_enable(const char *res, unsigned unused);
++int sweet_rpmh_describe(const char *res, char *out, size_t outlen);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -476,4 +477,73 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * 0201: what cmd-db says about a resource (slave type, address, aux data), without voting and without
++ * the type check rh_lookup makes: for the camera rails (ldoc1 is an XOB regulator, bobc1 a BOB).
++ */
++int
++sweet_rpmh_describe(const char *res, char *out, size_t outlen)
++{
++	uint32_t key[2] = {0, 0};
++	size_t n = 0;
++	unsigned found = 0;
++	int error;
++
++	if (res == NULL || out == NULL || outlen == 0) {
++		return EINVAL;
++	}
++	out[0] = '\0';
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		snprintf(out, outlen, "busy");
++		return EBUSY;
++	}
++	error = rh_map();
++	if (error) {
++		snprintf(out, outlen, "cmd-db not mapped (%d)", error);
++		goto done;
++	}
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			unsigned alen = rh_db16(e + 20);
++			found++;
++			if (n < outlen) {
++				n += (size_t)snprintf(out + n, outlen - n, "slave %u addr %#x priority %#x:%#x aux %u bytes",
++				    slave, addr, rh_read(rh_db, e + 8), rh_read(rh_db, e + 12), alen);
++			}
++			for (unsigned k = 0; k < alen && k < 8 && n < outlen &&
++			    rh_range(aux + rh_db16(e + 22) + k, 1); k += 2) {
++				n += (size_t)snprintf(out + n, outlen - n, " %04x", rh_db16(aux + rh_db16(e + 22) + k));
++			}
++			if (n < outlen) {
++				n += (size_t)snprintf(out + n, outlen - n, "; ");
++			}
++		}
++	}
++	if (found == 0) {
++		snprintf(out, outlen, "not in cmd-db");
++		error = ENOENT;
++	}
++done:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 438acc7..e85a815 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -92,7 +92,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	bool pm8150b = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 	    peripheral == 0x13 || peripheral == 0x40 || peripheral == 0x41);
+-	if (!sp_ready || !out || addr > 0xffffu || (sid != 0 && !pm8150b) ||
++	/* 0201: camera rails, read only: PM8150L (SID 4) L1, 0xa0 (BOB?), GPIO1; PM8009 (SID 0xa) L1 */
++	bool camera = (sid == 4 && (peripheral == 0x40 || peripheral == 0xa0 || peripheral == 0xc0)) ||
++	    (sid == 0xa && peripheral == 0x40);
++	if (!sp_ready || !out || addr > 0xffffu || (sid != 0 && !pm8150b && !camera) ||
+ 	    (sid == 0 && peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
