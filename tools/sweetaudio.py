@@ -17,6 +17,10 @@
                               file); left in powerdown, muted
   sweetaudio.py tfa-up        MANSCONF 1, PWDN 0, wait for CLKS (needs the bit clock); still muted
   sweetaudio.py tfa-unmute / tfa-mute / tfa-down / tfa-status
+  sweetaudio.py buf-info      kern.sweetaudiobuf (0194): the DSP's buffer, its PA and the SMMU bank of stream 0x1b21
+  sweetaudio.py play-tone [SECS] [DBFS]  1 kHz (default 3 s at -30 dBFS, never above -12) through ASM session 1 ->
+                              ADM (no processing) -> port 0x1006; the amps unmuted once the DSP takes the first
+                              periods, muted again at the end. Needs afe-start, mi2s-pins, tfa-init, tfa-up first.
 
 Numbers: live DT (i2c@890000, tfa98xx_right@34 reset gpio37, tfa98xx_left@35 reset gpio100,
 qupv3_se4_i2c_active gpio51/52 function qup4); Linux pinctrl-sm8150.c (51, 52, 100 on SOUTH, 37 on NORTH,
@@ -468,6 +472,164 @@ def afe_start(lines=2, bits=16):
     return apr_cmd("port 0x1006 started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, struct.pack("<HH", QUAT_MI2S_RX, 0))
 
 
+# ---- ASM / ADM: a stream played from kern.sweetaudiobuf (0194), as HackiOS vayu_audio.c stream_on/play ----
+
+APR_SVC_ASM, APR_SVC_ADM = 7, 8
+ADM_CMD_DEVICE_OPEN_V5, ADM_CMDRSP_DEVICE_OPEN_V5, ADM_CMD_DEVICE_CLOSE_V5 = 0x00010326, 0x00010329, 0x00010327
+ADM_CMD_MATRIX_MAP_ROUTINGS_V5, ADM_TOPOLOGY_NONE = 0x00010325, 0x00010312
+ASM_CMD_SHARED_MEM_MAP_REGIONS, ASM_CMDRSP_SHARED_MEM_MAP_REGIONS = 0x00010d92, 0x00010d93
+ASM_CMD_SHARED_MEM_UNMAP_REGIONS = 0x00010d94
+ASM_STREAM_CMD_OPEN_WRITE_V3, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 = 0x00010db3, 0x00010d98
+ASM_SESSION_CMD_RUN_V2, ASM_DATA_CMD_WRITE_V2, ASM_DATA_EVENT_WRITE_DONE_V2 = 0x00010daa, 0x00010dab, 0x00010d99
+ASM_SESSION_EVENT_RX_UNDERFLOW, ASM_STREAM_CMD_CLOSE = 0x00010c17, 0x00010bcd
+ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 = 0x00010c68, 0x00010da5
+SESSION, STREAM_PORT = 1, 1 << 8 | 1
+WRITE_TOKEN = 0x80000000
+PERIOD_FRAMES = 960                             # 20 ms at 48 kHz
+PERIOD_BYTES = PERIOD_FRAMES * 4                # 2 channels of 16 bits; one 4096-byte page per period
+PERIODS = 8
+
+
+def apr_words(p):
+    field, size, fs, fd, fp, ts, td, tp, token, op = struct.unpack_from("<HHBBHBBHII", p)
+    hl = max(APR_HDR, (field >> 4 & 0xf) * 4)
+    return op, token, [struct.unpack_from("<I", p, o)[0] for o in range(hl, len(p) - 3, 4)]
+
+
+def apr_call(what, svc, port, opcode, payload, rsp=None, events=None):
+    """Send and wait (1 s) for the basic response (status) or the `rsp' opcode (its words). Events seen meanwhile
+    go to `events' (a list)."""
+    _token[0] += 1
+    tok = _token[0]
+    sysctl("kern.sweetapr", apr_packet(svc, opcode, payload, token=tok, port=port))
+    for _ in range(100):
+        for p in apr_read():
+            op, token, w = apr_words(p)
+            if rsp is not None and op == rsp:
+                print("dsp: %s: answer %s" % (what, " ".join("%08x" % x for x in w[:4])))
+                return w
+            if op == APR_BASIC_RSP and w and w[0] == opcode:
+                st = w[1] if len(w) > 1 else -1
+                print("dsp: %s: %s" % (what, "done" if st == 0 else "REFUSED, status %#x" % st))
+                return [] if st == 0 else None
+            if events is not None:
+                events.append((op, token, w))
+        time.sleep(0.01)
+    print("dsp: %s: NO ANSWER" % what)
+    return None
+
+
+def apr_post(svc, port, opcode, payload, token):
+    sysctl("kern.sweetapr", apr_packet(svc, opcode, payload, token=token, port=port))
+
+
+def buf_info():
+    pa, size, bank = struct.unpack("<QIi", sysctl("kern.sweetaudiobuf", oldlen=16))
+    return pa, size, bank
+
+
+def buf_write(offset, data):
+    for at in range(0, len(data), 4092):
+        sysctl("kern.sweetaudiobuf", struct.pack("<I", offset + at) + data[at:at + 4092])
+
+
+def tone_period(start, dbfs=-30.0, hz=1000):
+    import math
+    amp = 32767 * 10 ** (dbfs / 20)
+    out = bytearray()
+    for n in range(start, start + PERIOD_FRAMES):
+        v = int(round(amp * math.sin(2 * math.pi * hz * n / RATE)))
+        out += struct.pack("<hh", v, v)
+    return bytes(out)
+
+
+def play_tone(secs=3.0, dbfs=-30.0, unmute=True):
+    """1 kHz at `dbfs' (default -30 dBFS, as vayu) for `secs': buffer mapped, ADM path to 0x1006 (16-bit, no
+    processing), ASM session 1 opened, routed, run; periods written as the DSP gives them back. The amplifiers are
+    unmuted after the DSP has taken the first periods and muted again at the end, whatever happens."""
+    if dbfs > -12:
+        print("refusing %.1f dBFS: no speaker protection here, keep it at -12 or below" % dbfs)
+        return False
+    pa, size, bank = buf_info()
+    dsp = pa | 1 << 32                         # the audio stream's SID bit (0194's alias)
+    print("buffer: pa %#x, %d KB, SMMU bank %d -> DSP address %#x" % (pa, size // 1024, bank, dsp))
+    if bank < 0 or pa == 0:
+        print("buffer: not usable (see HOTDOGB AUDIO in the kernel log)")
+        return False
+    apr_read()
+    m = apr_call("buffer mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS,
+                 struct.pack("<HHIIII", 3, 1, 0, dsp & 0xffffffff, dsp >> 32, PERIODS * 4096),
+                 rsp=ASM_CMDRSP_SHARED_MEM_MAP_REGIONS)
+    if not m:
+        return False
+    handle = m[0]
+    copp = None
+    opened = False
+    unmuted = False
+    try:
+        w = apr_call("device path to port 0x1006: playback, no processing, 2 x 16 bit, 48 kHz", APR_SVC_ADM, QUAT_MI2S_RX,
+                     ADM_CMD_DEVICE_OPEN_V5, struct.pack("<HHHHIHHI8B", 0, 1, QUAT_MI2S_RX, 0xffff, ADM_TOPOLOGY_NONE, 2, 16,
+                                                         RATE, 1, 2, 0, 0, 0, 0, 0, 0), rsp=ADM_CMDRSP_DEVICE_OPEN_V5)
+        if not w or w[0] != 0:
+            return False
+        copp = w[1] & 0xffff
+        if apr_call("stream opened for writing: 16-bit PCM, no processing", APR_SVC_ASM, STREAM_PORT,
+                    ASM_STREAM_CMD_OPEN_WRITE_V3, struct.pack("<IHHII", 0, 0, 16, ASM_TOPOLOGY_NONE,
+                                                              ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2)) is None:
+            return False
+        opened = True
+        if apr_call("session 1 routed to COPP %d" % copp, APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5,
+                    struct.pack("<IIHHHH", 0, 1, SESSION, 1, copp, 0)) is None:
+            return False
+        if apr_call("stream format: 2 x 16 bit at 48 kHz", APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2,
+                    struct.pack("<IHHIHH8B", 20, 2, 16, RATE, 1, 0, 1, 2, 0, 0, 0, 0, 0, 0)) is None:
+            return False
+        if apr_call("session run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, struct.pack("<III", 0, 0, 0)) is None:
+            return False
+        frame = 0
+        for k in range(PERIODS):
+            buf_write(4096 * k, tone_period(frame, dbfs))
+            frame += PERIOD_FRAMES
+        def post(k):
+            a = dsp + 4096 * k
+            apr_post(APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_WRITE_V2,
+                     struct.pack("<IIIIIIII", a & 0xffffffff, a >> 32, handle, PERIOD_BYTES, k, 0, 0, 0), WRITE_TOKEN | k)
+        for k in range(PERIODS):
+            post(k)
+        done = errors = underflows = 0
+        end = time.time() + secs
+        while time.time() < end:
+            for p in apr_read():
+                op, token, w = apr_words(p)
+                if op == ASM_DATA_EVENT_WRITE_DONE_V2 and token & WRITE_TOKEN:
+                    k = token & 31
+                    if len(w) > 3 and w[3] != 0:
+                        errors += 1
+                    done += 1
+                    if done == 2 and unmute and not unmuted:
+                        tfa_mute(False)
+                        unmuted = True
+                    buf_write(4096 * k, tone_period(frame, dbfs))
+                    frame += PERIOD_FRAMES
+                    post(k)
+                elif op == ASM_SESSION_EVENT_RX_UNDERFLOW:
+                    underflows += 1
+                elif op == APR_BASIC_RSP and w and w[0] == ASM_DATA_CMD_WRITE_V2 and len(w) > 1 and w[1] != 0:
+                    errors += 1
+                    print("dsp: a write REFUSED, status %#x" % w[1])
+            time.sleep(0.002)
+        print("tone: %d periods played (%.1f s), %d errors, %d underflows" % (done, done * 0.02, errors, underflows))
+        return done > 0
+    finally:
+        if unmuted or unmute:
+            tfa_mute(True)
+        if opened:
+            apr_call("stream closed", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_CLOSE, b"")
+        if copp is not None:
+            apr_call("device path closed", APR_SVC_ADM, copp, ADM_CMD_DEVICE_CLOSE_V5, b"")
+        apr_call("buffer unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, struct.pack("<I", handle))
+
+
 def afe_stop():
     apr_cmd("port 0x1006 stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, struct.pack("<HH", QUAT_MI2S_RX, 0))
     afe_clock(False)
@@ -520,6 +682,11 @@ def main(argv):
         tfa_mute(cmd == "tfa-mute")
     elif cmd == "tfa-down":
         tfa_down()
+    elif cmd == "buf-info":
+        pa, size, bank = buf_info()
+        print("kern.sweetaudiobuf: pa %#x, %d KB, SMMU bank %d" % (pa, size // 1024, bank))
+    elif cmd == "play-tone":
+        play_tone(float(argv[2]) if len(argv) > 2 else 3.0, float(argv[3]) if len(argv) > 3 else -30.0)
     elif cmd == "afe-stop":
         afe_stop()
     elif cmd == "apr-read":
