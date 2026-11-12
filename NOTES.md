@@ -52,6 +52,16 @@
     - Off now: "Terminating stack..." -> "bthook: H4 transport +0x60 called" -> STACK_OFF, no crash.
   - **Power-on exit:** after the reconnect, bluetoothd quit within a second. Cause: the hook's packet parser kept a half packet from the old connection ("dropped 0 queued + 4 partial bytes"). Now reset at every TIOCSETA (new connection). On: the same bluetoothd reconnects -> STACK_READY.
   - **Pairings now survive:** "Paired device cache contains 1 device(s)" after restarts. The loss on 11-10 came with the crash.
+- **2026-11-11: volume keys fixed (0193) + audio amps answer on I2C.**
+  - **Keys:** sweet_keys.c still read the Redmi wiring: volume up from PM6150L SID 4 GPIO 2 (absent on the 7T: never worked), volume down from PON RESIN (never set by the 7T's key). Before 0193, four presses all logged as key 0 (power).
+    - Live DT gpio_keys: vol_up = PM8150 (SID 0) GPIO 6, vol_down = GPIO 7, active-low.
+    - **0193** (`xnu/patches/0193-op7t-volume-keys.patch`, CI 43139365299, kernel 27e539ed): power = PON 0x810 bit 0, volume up = !0xc510 bit 0, volume down = !0xc610 bit 0 or RESIN. Raw registers are logged on change; `sweetkeys7t=0` gives the old reads.
+    - **Image `shim/out/shim-boot-0193-7g-bt-ddr.img`** (the 0192 line): presses log `key=1 (volume up)` on GPIO6 and `key=2 (volume down)` on GPIO7; **the user confirms the volume slider moves.**
+  - **Audio amps:** `SWEET_TLMM=1 python3 /var/root/sweetaudio.py status / i2c-init / tfa-id` on the 0193 boot.
+    - SE4 = I2C firmware (fw 0x303, 32-bit FIFOs); pins 51/52 muxed to qup4; master at 400 kHz.
+    - Reset pins 37/100 read 0 (TFA reset is active-high, so out of reset).
+    - **tfa 0x34 (right) and 0x35 (left): register 0x03 = 0x0c74 -> TFA9874** (the low byte is the type: 0x74 = TFA9874, 0x94 would be TFA9894), even though the vendor module is named audio_tfa9894.ko (NXP's driver covers both).
+    - Next: TFA9874 init from the container (backup/vendor-audio/tfa98xx.cnt; NXP open tfa98xx tfa2 rules: patch/config/preset for the 9874), MI2S pins 137-142 to function 1, then the data path (AFE port 0x1006 SD1, ASM stream).
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
