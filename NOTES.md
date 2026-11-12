@@ -109,6 +109,21 @@
     - **But "written 0" and the volume was never set:** iOS never routes to the Speaker.
   - **Cause seen:** `-CMVAEndptMgr- vaemGetVirtualAudioDeviceIDs: vadInitializationCompleteSemaphore: Timeout occurred` -> `No Audio Device Available. This is a serious error.`, then `AudioSessionInfo.mm:674 Couldn't get the VAD...`. The virtual audio device (VirtualAudio.plugin) never finishes initializing, so nothing is routed anywhere. Next: find why (debug-level VAD logs; HackiOS's mkidentity.py / routing-table notes; what VAD waits for).
   - User: nothing heard; videos don't load yet either (separate issue).
+  - **ROOT CAUSE + FIX (19:39): VirtualAudio.plugin had been moved to `/Library/Audio/Plug-Ins/HAL.disabled/` on 10-22.**
+    - Why it was moved: it crashed mediaserverd in a loop then (ApplyBeamFormerPreference: no default virtual device 'vdef' without any audio hardware; NOTES line ~434).
+    - **Moved back to `/Library/Audio/Plug-Ins/HAL/`** (stays on the phone's root). With RedwoodAudio's devices present, mediaserverd no longer crashes. VAD runs its deferred initialization, activates "VAD [vdef]" / VirtualAudioDevice_Default, and publishes ports Speaker (pspk), Speaker Telemetry, Speaker Tap, Hawking Input, Built-In Microphone (pmbi), Actuator, Null.
+  - **IT WORKS (user, 2026-11-11 ~19:41): iOS's own sounds play through the 7T's speakers.**
+    - Counters: written 765952 frames, volume set 6 times, feeder 0 errors / 0 underflows over 55 s, at -12 dB.
+    - (The first feeder start was refused: "buffer mapped: REFUSED 0x1" because a SIGTERM-killed earlier run left ASM session 1 / COPP 0 / map handle b0acc1d8 open. Closed by hand: ASM_STREAM_CMD_CLOSE port 0x101, ADM_CMD_DEVICE_CLOSE_V5 port 0, SHARED_MEM_UNMAP b0acc1d8.)
+  - **Per boot, still by hand:**
+    1. `kern.sweetadsp=1`.
+    2. `sweetaudio.py i2c-init`, `tfa-init`, `mi2s-pins`, `afe-start 2 32`, `tfa-up`, `tfa-mute`.
+    3. `sysctl kern.sweetaudiodev=1`, then `killall mediaserverd` (so the plug-in opens the node).
+    4. `nohup python3 -u sweetaudio.py feed 0 -12 &`.
+  - Next:
+    - Make that a boot job (launchd plist or prep.sh); create the node at boot (kernel init) so no mediaserverd restart is needed.
+    - Amps: mute when silent (HackiOS's guard/watcher) instead of always-on hiss.
+    - Gain/tuning; speaker protection; the microphone (Codec device, /dev/redwood-mic).
 - **Recommended next steps, in order:** (1) boot a 0190+0191 kernel with `sweetddr=1` added; compare `tools/op7t-test.sh fps`, the "addresses:" line and app scrolling against the current image. (2) RedwoodGPU buffers from an unmanaged RAM pool (ADT carve-out, WC user maps, drop the per-submission dc civac push and 0145/0146): the biggest remaining GPU-side cost, and the base Metal needs anyway. (3) Only then the NativeAdreno user client + flame's SweetMetal2 bundle for apps, with backboardd left on GL.
 - **This session's changes:** 0190 (vsync period), 0191 (GPU VA 3840 MiB), `tools/cpuhz.c`. Both patches pass `git apply --check` on SweetFramebuffer.cpp / sweet_gpu.c rebuilt from every patch that touches them (scratchpad); sweet_gpu.c also passed a clang syntax check against stub headers. **Not built, not booted** (the phone was busy with audio).
 
