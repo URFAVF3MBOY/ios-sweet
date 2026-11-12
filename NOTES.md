@@ -6,7 +6,8 @@
 - **0196 BOOTED, SPEAKERS WORK FROM THE KERNEL (2026-11-11, user: "audio works").** Rebooted from 0195 over ssh with `sysctl -w kern.sweetreboot=2` (fastboot after 8 s), `fastboot boot shim/out/shim-boot-0196-7g-bt-ddr.img`, ssh after ~55 s.
   - At ~1 min uptime: `kern.sweetsound: stage 7 periods 2251 short 1919 clipped 0 amp-on 3 amp on`; /dev/redwood-audio exists at boot (no mediaserverd restart).
   - sweet-media.log: bluetooth chip stage 6 + bluetoothd restarted; "audio: done by the kernel (0196)" (script skipped its audio part as intended).
-  - Seen once: ssh timed out about a minute after that, then came back (cause not checked; load was 65 at 1 min uptime).
+  - Seen once: ssh timed out about a minute after that, then came back within ~1 min (cause not checked; load 65 at 1 min uptime, 23 at 2 min).
+  - At 2 min: `kern.sweetaudiostat: written 677888 lost 0 ring 0 opens 1`, sweetsound `amp-on 5 amp off` (amps gated off in silence), no userland `sweetaudio.py feed` running.
   - Next: Bluetooth into the kernel (see "paused here" below), and the sp.dylib investigation.
 - **0196 image build (2026-11-11 23:34):** kernel from CI run 43151858000 (sha256 8d3656ba.., matches the run's SHA256SUMS; has sweet_sound / sweetsound / sweetsoundgain / sweetsounddelay strings) is now `xnu/out/kernel.development.sweet`; 0195 (04c33de2) kept as `.0195`.
   - **Image `shim/out/shim-boot-0196-7g-bt-ddr.img`** = 0196 kernel + `shim/out/sweet-bt-7g.adt` + `--ramdisk shim/out/prep-cores.drop` + the 0192 line (440 bytes), repacked with `tools/repack_bootv2.py` on shim-boot-0195-7g-bt-ddr.img (shim + dtb byte-identical to 0195).
