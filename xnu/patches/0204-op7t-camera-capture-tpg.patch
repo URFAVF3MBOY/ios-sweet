@@ -1,0 +1,422 @@
+op7t-0204: cameras, step 3: the capture path tested with the CSID's test pattern (kern.sweetcam=3)
+
+After 0202/0203 the rear main sensor (IMX586) answers on the CCI, but
+streaming it needs the vendor's sensor setup tables (not on this PC yet).
+The CSID has its own test pattern generator, so the rest of the path can be
+proven without them: CSID0 TPG -> RDI0 -> IFE0 write master 0 -> memory.
+
+kern.sweetcam=3 (after =2): IFE0 GDSC; IFE0 / CSID / CPHY RX clocks and IFE0
+AXI at XO 19.2 MHz (camcc-sm8150.c offsets); a 64 KB uncached buffer below
+4 GiB filled with 0xa5 (sweet_cam_dma_buffer, as 0194's audio buffer); the
+IFE's SMMU stream group 0x840/0x620 (live DT msm_cam_smmu_ife) identity-
+mapped (sweet_smmu_identity now takes a stream mask:
+sweet_smmu_identity_group); IFE0 reset, bus IRQs, WM0 in MIPI raw mode at
+the buffer, REG_UPDATE RDI0 (Linux camss-vfe-17x.c, VFE 170 layout); CSID0
+reset, RX 4 lanes, RDI0 RAW10 payload-only, TPG 64x32 RAW10 incrementing;
+200 ms; report CSID/IFE/bus IRQ status, WM0 status and how much of the
+buffer changed. Stops early if a power domain, clock or the SMMU mapping is
+missing. VFE 175 offsets assumed equal to VFE 170: a mismatch shows as no
+data, not a hang.
+Not compiled locally: the CI build is the check.
+
+Apply after 0203.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index d3ae8ac..ea9cc60 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -583,6 +583,281 @@ cam_power_and_scan(void)
+ 	cam_stage = 8;
+ }
+ 
++/*
++ * ---- 0204: the capture path, tested with the CSID's own test pattern (`sysctl kern.sweetcam=3`) ----
++ *
++ * No sensor needed: CSID0's test pattern generator feeds its RDI0 path, IFE0 (VFE 175) write master 0 puts
++ * the frames into memory. Proves power, clocks, SMMU and the CSID -> IFE -> DDR path before the sensor's own
++ * setup (vendor tables) is known. After kern.sweetcam=2 (TITAN_TOP_GDSC, AHB, camnoc already on).
++ *   1. IFE0 GDSC (camcc 0xa004, as TITAN_TOP); IFE0 clock (RCG 0xa010, branch 0xa028), IFE0 CSID clock
++ *      (0xa03c / 0xa054), CPHY RX (0xa064 / 0xa07c), IFE0 AXI branch 0xa080: all at XO 19.2 MHz;
++ *   2. a 64 KB buffer below 4 GiB, filled with 0xa5, and the IFE's SMMU group (SID 0x840, mask 0x620; live
++ *      DT msm_cam_smmu_ife) identity-mapped (sweet_smmu.c);
++ *   3. IFE0 (0xacaf000, Linux camss-vfe-17x.c, VFE 170 layout): global reset (IRQ_STATUS_0 bit 31 = reset
++ *      ack), bus IRQ masks, WM0 (RDI0): burst 0xf, width/stride 0xff01 (defaults), MIPI raw mode, image
++ *      address = the buffer, frame increment 0, then REG_UPDATE bit 1 (RDI0);
++ *   4. CSID0 (0xacb3000, Linux camss-csid-gen2.c): reset (RST_STROBES 0x1e, TOP_IRQ bit 0), RX CFG0
++ *      (4 lanes), CFG1, RDI0: RAW10 (DT 0x2b), decode payload only, byte counter/format measure on, enable;
++ *      RDI0 resume; TPG: 64 x 32, DT 0x2b, payload mode 0 (incrementing), encode 10-bit, 4 lanes, enable;
++ *   5. 200 ms, then report: CSID top/RX/RDI0 IRQ status and RDI0 byte counter area, IFE IRQ status 0/1, bus
++ *      IRQ status 0..2, violation status, WM0 status; the first bytes of the buffer and how many of the
++ *      64 KB changed from 0xa5. TPG off, WM0 off afterwards.
++ * Register offsets for VFE 175 are taken from VFE 170 (sdm845), the closest mainline layout: a mismatch shows
++ * as no data, not a hang (every block touched is powered and clocked first).
++ */
++extern int sweet_smmu_identity_group(uint32_t sid, uint32_t smask);
++extern int sweet_cam_dma_buffer(uint32_t size, uint64_t *pa, vm_offset_t *va);
++
++#define CAM_IFE0_PA             0x0acaf000u
++#define CAM_CSID0_PA            0x0acb3000u
++#define CAM_CAP_SIZE            0x10000u
++
++/* VFE 17x */
++#define VFE_GLOBAL_RESET_CMD    0x018
++#define VFE_IRQ_CMD             0x058
++#define VFE_IRQ_MASK_0          0x05c
++#define VFE_IRQ_MASK_1          0x060
++#define VFE_IRQ_CLEAR_0         0x064
++#define VFE_IRQ_CLEAR_1         0x068
++#define VFE_IRQ_STATUS_0        0x06c
++#define VFE_IRQ_STATUS_1        0x070
++#define VFE_VIOLATION_STATUS    0x07c
++#define VFE_REG_UPDATE_CMD      0x4ac
++#define VFE_BUS_IRQ_MASK(n)     (0x2044 + (n) * 4)
++#define VFE_BUS_IRQ_CLEAR(n)    (0x2050 + (n) * 4)
++#define VFE_BUS_IRQ_STATUS(n)   (0x205c + (n) * 4)
++#define VFE_BUS_IRQ_CLEAR_GLOBAL 0x2068
++#define VFE_BUS_WM_ADDR_SYNC_FRAME_HEADER 0x2080
++#define VFE_BUS_WM_ADDR_SYNC_NO_SYNC 0x2084
++#define VFE_BUS_WM_CGC_OVERRIDE 0x200c
++#define VFE_BUS_WM_TEST_BUS_CTRL 0x211c
++#define VFE_BUS_WM_STATUS0(n)   (0x2200 + (n) * 0x100)
++#define VFE_BUS_WM_STATUS1(n)   (0x2204 + (n) * 0x100)
++#define VFE_BUS_WM_CFG(n)       (0x2208 + (n) * 0x100)
++#define VFE_BUS_WM_IMAGE_ADDR(n) (0x2214 + (n) * 0x100)
++#define VFE_BUS_WM_BUFFER_WIDTH_CFG(n) (0x221c + (n) * 0x100)
++#define VFE_BUS_WM_BUFFER_HEIGHT_CFG(n) (0x2220 + (n) * 0x100)
++#define VFE_BUS_WM_PACKER_CFG(n) (0x2224 + (n) * 0x100)
++#define VFE_BUS_WM_STRIDE(n)    (0x2228 + (n) * 0x100)
++#define VFE_BUS_WM_FRAME_INC(n) (0x2258 + (n) * 0x100)
++#define VFE_BUS_WM_BURST_LIMIT(n) (0x225c + (n) * 0x100)
++
++/* CSID gen2 */
++#define CSID_RST_STROBES        0x010
++#define CSID_CSI2_RX_IRQ_STATUS 0x020
++#define CSID_CSI2_RX_IRQ_CLEAR  0x028
++#define CSID_RDI0_IRQ_STATUS    0x040
++#define CSID_RDI0_IRQ_MASK      0x044
++#define CSID_RDI0_IRQ_CLEAR     0x048
++#define CSID_TOP_IRQ_STATUS     0x070
++#define CSID_TOP_IRQ_MASK       0x074
++#define CSID_TOP_IRQ_CLEAR      0x078
++#define CSID_IRQ_CMD            0x080
++#define CSID_CSI2_RX_CFG0       0x100
++#define CSID_CSI2_RX_CFG1       0x104
++#define CSID_RDI0_CFG0          0x300
++#define CSID_RDI0_CFG1          0x304
++#define CSID_RDI0_CTRL          0x308
++#define CSID_RDI0_FRM_DROP_PATTERN 0x30c
++#define CSID_RDI0_FRM_DROP_PERIOD 0x310
++#define CSID_RDI0_IRQ_SUBSAMPLE_PATTERN 0x314
++#define CSID_RDI0_IRQ_SUBSAMPLE_PERIOD 0x318
++#define CSID_RDI0_RPP_PIX_DROP_PATTERN 0x324
++#define CSID_RDI0_RPP_PIX_DROP_PERIOD 0x328
++#define CSID_RDI0_RPP_LINE_DROP_PATTERN 0x32c
++#define CSID_RDI0_RPP_LINE_DROP_PERIOD 0x330
++#define CSID_TPG_CTRL           0x600
++#define CSID_TPG_VC_CFG0        0x604
++#define CSID_TPG_VC_CFG1        0x608
++#define CSID_TPG_LFSR_SEED      0x60c
++#define CSID_TPG_DT0_CFG_0      0x610
++#define CSID_TPG_DT0_CFG_1      0x614
++#define CSID_TPG_DT0_CFG_2      0x618
++#define CSID_TPG_COLOR_BARS_CFG 0x640
++#define CSID_TPG_COLOR_BOX_CFG  0x644
++
++static vm_offset_t cam_ife, cam_csid, cam_buf_va;
++static uint64_t cam_buf_pa;
++
++static bool
++cam_gdsc_on(const char *name, uint32_t gdscr)
++{
++	uint32_t g = rd32(cam_cc, gdscr);
++
++	if ((g >> 31) && !(g & 1u)) {
++		cam_say("  %s already on: %#010x", name, g);
++		return true;
++	}
++	g &= ~((0xfu << 20) | (0xfu << 16) | (0xfu << 12));
++	g |= (2u << 20) | (2u << 16) | (0xfu << 12);
++	wr32(cam_cc, gdscr, g);
++	wr32(cam_cc, gdscr, g & ~1u);
++	if (!cam_poll(cam_cc, gdscr + 4, 1u << 16, 1u << 16, 100000)) {
++		cam_say("  %s did not power up: %#010x cfg %#010x", name, rd32(cam_cc, gdscr), rd32(cam_cc, gdscr + 4));
++		return false;
++	}
++	cam_say("  %s on: %#010x cfg %#010x", name, rd32(cam_cc, gdscr), rd32(cam_cc, gdscr + 4));
++	return true;
++}
++
++static void
++cam_capture_test(void)
++{
++	int bank, e;
++	unsigned changed = 0;
++
++	cam_log_len = 0;
++	cam_log[0] = '\0';
++	cam_say("capture path test with the CSID test pattern (0204)");
++	if (cam_stage < 4 || cam_cc == 0) {
++		cam_say("run kern.sweetcam=2 first (camera power domain and AHB)");
++		return;
++	}
++
++	cam_say("IFE0 power and clocks:");
++	if (!cam_gdsc_on("ife_0_gdsc", 0xa004)) {
++		return;
++	}
++	if (!cam_rcg_xo(cam_cc, "ife_0_src", 0xa010) || !cam_branch_on(cam_cc, "ife_0", 0xa028, true) ||
++	    !cam_rcg_xo(cam_cc, "ife_0_csid_src", 0xa03c) || !cam_branch_on(cam_cc, "ife_0_csid", 0xa054, true) ||
++	    !cam_rcg_xo(cam_cc, "cphy_rx_src", 0xa064) || !cam_branch_on(cam_cc, "ife_0_cphy_rx", 0xa07c, true) ||
++	    !cam_branch_on(cam_cc, "ife_0_axi", 0xa080, true)) {
++		cam_say("stopping (an IFE0 clock did not start)");
++		return;
++	}
++
++	if (cam_buf_va == 0) {
++		e = sweet_cam_dma_buffer(CAM_CAP_SIZE, &cam_buf_pa, &cam_buf_va);
++		if (e != 0) {
++			cam_say("no buffer below 4 GiB (%d)", e);
++			return;
++		}
++	}
++	for (uint32_t i = 0; i < CAM_CAP_SIZE; i += 4) {
++		*(volatile uint32_t *)(cam_buf_va + i) = 0xa5a5a5a5u;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bank = sweet_smmu_identity_group(0x840, 0x620);
++	cam_say("buffer %#llx (64 KB, 0xa5); IFE SMMU group 0x840/0x620 -> bank %d", cam_buf_pa, bank);
++	if (bank < 0) {
++		cam_say("stopping (no SMMU mapping for the IFE: it would write through an unknown translation)");
++		return;
++	}
++
++	cam_ife = ml_io_map(CAM_IFE0_PA, 0x4000);
++	cam_csid = ml_io_map(CAM_CSID0_PA, 0x1000);
++	if (cam_ife == 0 || cam_csid == 0) {
++		cam_say("no mapping for IFE0/CSID0");
++		return;
++	}
++
++	cam_say("IFE0:");
++	wr32(cam_ife, VFE_IRQ_MASK_0, 1u << 31);
++	wr32(cam_ife, VFE_GLOBAL_RESET_CMD, 0x3fffu & ~(1u << 5) & ~(1u << 6));   /* Linux's reset bits */
++	if (cam_poll(cam_ife, VFE_IRQ_STATUS_0, 1u << 31, 1u << 31, 100000)) {
++		cam_say("  reset acknowledged (irq status 0 %#010x)", rd32(cam_ife, VFE_IRQ_STATUS_0));
++	} else {
++		cam_say("  no reset ack (irq status 0 %#010x): going on", rd32(cam_ife, VFE_IRQ_STATUS_0));
++	}
++	wr32(cam_ife, VFE_IRQ_CLEAR_0, ~0u);
++	wr32(cam_ife, VFE_IRQ_CLEAR_1, ~0u);
++	wr32(cam_ife, VFE_IRQ_CMD, 1u);
++	wr32(cam_ife, VFE_IRQ_MASK_0, ~0u);
++	wr32(cam_ife, VFE_IRQ_MASK_1, ~0u);
++	for (unsigned n = 0; n < 3; n++) {
++		wr32(cam_ife, VFE_BUS_IRQ_MASK(n), ~0u);
++		wr32(cam_ife, VFE_BUS_IRQ_CLEAR(n), ~0u);
++	}
++	wr32(cam_ife, VFE_BUS_IRQ_CLEAR_GLOBAL, 1u);
++	wr32(cam_ife, VFE_BUS_WM_ADDR_SYNC_FRAME_HEADER, 0);
++	wr32(cam_ife, VFE_BUS_WM_CGC_OVERRIDE, 0xfffffu);
++	wr32(cam_ife, VFE_BUS_WM_TEST_BUS_CTRL, 0);
++	wr32(cam_ife, VFE_BUS_WM_ADDR_SYNC_NO_SYNC, 0xffffu);
++	wr32(cam_ife, VFE_BUS_WM_BURST_LIMIT(0), 0xfu);
++	wr32(cam_ife, VFE_BUS_WM_BUFFER_WIDTH_CFG(0), 0xff01u);
++	wr32(cam_ife, VFE_BUS_WM_BUFFER_HEIGHT_CFG(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_PACKER_CFG(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_STRIDE(0), 0xff01u);
++	wr32(cam_ife, VFE_BUS_WM_IMAGE_ADDR(0), (uint32_t)cam_buf_pa);
++	wr32(cam_ife, VFE_BUS_WM_FRAME_INC(0), 0);
++	wr32(cam_ife, VFE_BUS_WM_CFG(0), 1u | (1u << 1));                       /* enable, MIPI raw */
++	wr32(cam_ife, VFE_REG_UPDATE_CMD, 1u << 1);                             /* RDI0 */
++	cam_say("  WM0 -> %#x, MIPI raw, reg update RDI0", (uint32_t)cam_buf_pa);
++
++	cam_say("CSID0: hw version %#010x", rd32(cam_csid, 0));
++	wr32(cam_csid, CSID_TOP_IRQ_CLEAR, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_TOP_IRQ_MASK, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_RST_STROBES, 0x1eu);
++	if (!cam_poll(cam_csid, CSID_TOP_IRQ_STATUS, 1u, 1u, 100000)) {
++		cam_say("  reset not acknowledged (top irq %#010x): stopping", rd32(cam_csid, CSID_TOP_IRQ_STATUS));
++		return;
++	}
++	wr32(cam_csid, CSID_TOP_IRQ_CLEAR, 1u);
++	wr32(cam_csid, CSID_IRQ_CMD, 1u);
++	wr32(cam_csid, CSID_RDI0_IRQ_MASK, ~0u);
++	wr32(cam_csid, CSID_CSI2_RX_CFG0, 3u);                                  /* 4 lanes */
++	wr32(cam_csid, CSID_CSI2_RX_CFG1, 1u | (1u << 6));                      /* ECC correction, MISR */
++	wr32(cam_csid, CSID_RDI0_CFG0, 1u | (1u << 1) | (1u << 2) | (0xfu << 12) | (0x2bu << 16));
++	wr32(cam_csid, CSID_RDI0_CFG1, 2u);
++	wr32(cam_csid, CSID_RDI0_FRM_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_FRM_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_IRQ_SUBSAMPLE_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_IRQ_SUBSAMPLE_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_RPP_PIX_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_RPP_PIX_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_RPP_LINE_DROP_PERIOD, 1);
++	wr32(cam_csid, CSID_RDI0_RPP_LINE_DROP_PATTERN, 0);
++	wr32(cam_csid, CSID_RDI0_CTRL, 0);
++	wr32(cam_csid, CSID_RDI0_CFG0, rd32(cam_csid, CSID_RDI0_CFG0) | (1u << 31));
++	wr32(cam_csid, CSID_RDI0_CTRL, 1u);                                     /* resume at frame boundary */
++
++	wr32(cam_csid, CSID_TPG_VC_CFG0, 1u << 10);                             /* VC 0, one-shot interleave, frames: infinite */
++	wr32(cam_csid, CSID_TPG_VC_CFG1, 0x740u | (0x3ffu << 12));
++	wr32(cam_csid, CSID_TPG_LFSR_SEED, 0x12345678u);
++	wr32(cam_csid, CSID_TPG_DT0_CFG_0, 32u | (64u << 16));                  /* 64 x 32 */
++	wr32(cam_csid, CSID_TPG_DT0_CFG_1, 0x2bu);                              /* RAW10 */
++	wr32(cam_csid, CSID_TPG_DT0_CFG_2, 0u | (0xbeu << 4) | (2u << 16));     /* incrementing, encode 10-bit */
++	wr32(cam_csid, CSID_TPG_COLOR_BARS_CFG, 0);
++	wr32(cam_csid, CSID_TPG_COLOR_BOX_CFG, 0);
++	wr32(cam_csid, CSID_TPG_CTRL, 1u | (1u << 1) | (1u << 2) | (3u << 4) | (0x64u << 8) | (0xau << 20));
++	cam_say("  RDI0 RAW10 on, TPG 64x32 running");
++
++	delay(200000);
++
++	cam_say("after 200 ms:");
++	cam_say("  CSID top %#010x rx %#010x rdi0 %#010x; tpg ctrl %#010x", rd32(cam_csid, CSID_TOP_IRQ_STATUS),
++	    rd32(cam_csid, CSID_CSI2_RX_IRQ_STATUS), rd32(cam_csid, CSID_RDI0_IRQ_STATUS), rd32(cam_csid, CSID_TPG_CTRL));
++	cam_say("  CSID rdi0 words @0x3a0..: %#010x %#010x %#010x %#010x", rd32(cam_csid, 0x3a0), rd32(cam_csid, 0x3a4),
++	    rd32(cam_csid, 0x3a8), rd32(cam_csid, 0x3ac));
++	cam_say("  IFE irq0 %#010x irq1 %#010x violation %#010x", rd32(cam_ife, VFE_IRQ_STATUS_0),
++	    rd32(cam_ife, VFE_IRQ_STATUS_1), rd32(cam_ife, VFE_VIOLATION_STATUS));
++	cam_say("  IFE bus irq %#010x %#010x %#010x; WM0 status %#010x %#010x cfg %#010x",
++	    rd32(cam_ife, VFE_BUS_IRQ_STATUS(0)), rd32(cam_ife, VFE_BUS_IRQ_STATUS(1)), rd32(cam_ife, VFE_BUS_IRQ_STATUS(2)),
++	    rd32(cam_ife, VFE_BUS_WM_STATUS0(0)), rd32(cam_ife, VFE_BUS_WM_STATUS1(0)), rd32(cam_ife, VFE_BUS_WM_CFG(0)));
++
++	wr32(cam_csid, CSID_TPG_CTRL, 0);
++	wr32(cam_csid, CSID_RDI0_CTRL, 0);
++	wr32(cam_ife, VFE_BUS_WM_CFG(0), 0);
++	delay(50000);
++
++	for (uint32_t i = 0; i < CAM_CAP_SIZE; i++) {
++		if (*(volatile uint8_t *)(cam_buf_va + i) != 0xa5u) {
++			changed++;
++		}
++	}
++	cam_say("buffer: %u of %u bytes changed; first: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x",
++	    changed, CAM_CAP_SIZE,
++	    *(volatile uint8_t *)(cam_buf_va + 0), *(volatile uint8_t *)(cam_buf_va + 1),
++	    *(volatile uint8_t *)(cam_buf_va + 2), *(volatile uint8_t *)(cam_buf_va + 3),
++	    *(volatile uint8_t *)(cam_buf_va + 4), *(volatile uint8_t *)(cam_buf_va + 5),
++	    *(volatile uint8_t *)(cam_buf_va + 6), *(volatile uint8_t *)(cam_buf_va + 7),
++	    *(volatile uint8_t *)(cam_buf_va + 80), *(volatile uint8_t *)(cam_buf_va + 81),
++	    *(volatile uint8_t *)(cam_buf_va + 82), *(volatile uint8_t *)(cam_buf_va + 83));
++	cam_stage = 9;
++}
++
+ static int
+ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ {
+@@ -600,6 +875,8 @@ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ 			return EALREADY;        /* (0202: once per boot) */
+ 		}
+ 		cam_power_and_scan();
++	} else if (value == 3) {
++		cam_capture_test();             /* 0204 */
+ 	} else {
+ 		return EINVAL;
+ 	}
+@@ -608,7 +885,7 @@ sysctl_sweetcam SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetcam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcam, "I",
+-    "OnePlus 7T cameras: 1 = read-only survey (0201), 2 = power the rear main sensor, CCI scan + id (0202)");
++    "OnePlus 7T cameras: 1 = read-only survey (0201), 2 = power the rear main sensor, CCI scan + id (0202), 3 = capture path test with the CSID test pattern (0204)");
+ 
+ static int
+ sysctl_sweetcamlog SYSCTL_HANDLER_ARGS
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index ade7e46..3d28d81 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -277,10 +277,10 @@ smmu_cb_setup(uint32_t pagesize, uint32_t cbo, uint32_t cb, uint32_t pasize)
+ 	return ok;
+ }
+ 
+-int
+-sweet_smmu_identity(uint32_t sid)
++static int
++smmu_identity_masked(uint32_t sid, uint32_t smask)
+ {
+-	if (sid > 0x7fffu) {
++	if (sid > 0x7fffu || smask > 0x7fffu) {
+ 		return -1;
+ 	}
+ 	if (smmu == 0) {
+@@ -332,8 +332,8 @@ sweet_smmu_identity(uint32_t sid)
+ 		if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < 128) {
+ 			used[s2cr & 0xffu] = 1;
+ 		}
+-		if (((sid ^ id) & ~mask & 0x7fffu) == 0) {
+-			if (mask != 0 || id != sid) {
++		if (((sid ^ id) & ~(mask | smask) & 0x7fffu) == 0) {
++			if (mask != smask || id != sid) {
+ 				/* 0194: a stream group somebody (firmware, the hypervisor) set up: not ours to change */
+ 				printf("HOTDOGB SMMU: SID %#x is covered by SMR[%u] %08x (S2CR %08x): left alone\n", sid, i, smr, s2cr);
+ 				return -1;
+@@ -366,14 +366,63 @@ sweet_smmu_identity(uint32_t sid)
+ 		return -1;
+ 	}
+ 	smmu_wr(0xc00 + 4 * (uint32_t)smr_i, (uint32_t)cb);                     /* S2CR: translate, bank */
+-	smmu_wr(0x800 + 4 * (uint32_t)smr_i, (1u << 31) | sid);                 /* SMR: valid, mask 0 */
++	smmu_wr(0x800 + 4 * (uint32_t)smr_i, (1u << 31) | (smask << 16) | sid);  /* SMR: valid, mask, id */
+ 	uint32_t smr = smmu_rd(0x800 + 4 * (uint32_t)smr_i), s2cr = smmu_rd(0xc00 + 4 * (uint32_t)smr_i);
+-	bool ok = smr == ((1u << 31) | sid) && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == (uint32_t)cb;
++	bool ok = smr == ((1u << 31) | (smask << 16) | sid) && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == (uint32_t)cb;
+ 	printf("HOTDOGB SMMU: SID %#x -> SMR[%d] %08x S2CR %08x -> bank %d, identity 0x80000000-0xffffffff (+ alias at 0x1_80000000): %s\n", sid, smr_i,
+ 	    smr, s2cr, cb, ok ? "in place" : "NOT taken (read back differs)");
+ 	return ok ? cb : -1;
+ }
+ 
++int
++sweet_smmu_identity(uint32_t sid)
++{
++	return smmu_identity_masked(sid, 0);
++}
++
++/* 0204: a stream group (SMR id + mask), e.g. the camera IFE's 0x840 / 0x620 (live DT msm_cam_smmu_ife) */
++int sweet_smmu_identity_group(uint32_t sid, uint32_t smask);
++
++int
++sweet_smmu_identity_group(uint32_t sid, uint32_t smask)
++{
++	return smmu_identity_masked(sid, smask);
++}
++
++/*
++ * 0204: a physically contiguous, uncached buffer below 4 GiB for a camera block to write into (inside the
++ * identity map above), as 0194's audio buffer. Kept for the rest of the boot.
++ */
++int sweet_cam_dma_buffer(uint32_t size, uint64_t *pa, vm_offset_t *va);
++
++int
++sweet_cam_dma_buffer(uint32_t size, uint64_t *pa, vm_offset_t *va)
++{
++	vm_offset_t kva = 0;
++	ppnum_t pn;
++	uint64_t p;
++
++	if (size == 0 || size > 0x400000u || pa == NULL || va == NULL) {
++		return EINVAL;
++	}
++	size = (uint32_t)round_page(size);
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	p = ptoa_64(pn);
++	if (pn == 0 || p < 0x80000000ull || p + size > 0x100000000ull) {
++		return ERANGE;                  /* (left allocated: it is permanent) */
++	}
++	*va = ml_io_map((vm_offset_t)p, size);
++	if (*va == 0) {
++		return ENOMEM;
++	}
++	*pa = p;
++	return 0;
++}
++
+ /*
+  * 0194: memory the ADSP plays from. kern.sweetaudiobuf (root):
+  *   read : struct { uint64_t pa; uint32_t size; int32_t bank; } -- allocated and the audio stream (0x1b21)
