@@ -305,7 +305,6 @@ process_wanted(void)
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
 - (BOOL)hasUnifiedMemory { return YES; }
-- (MTLDeviceLocation)location { return MTLDeviceLocationBuiltIn; }
 - (NSUInteger)maxBufferLength { return 256u << 20; }
 - (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 1024); }
 - (id<MTLCommandQueue>)newCommandQueue

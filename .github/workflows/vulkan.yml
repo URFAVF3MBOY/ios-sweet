@@ -128,7 +128,7 @@ jobs:
           B=out/SweetMTL.bundle
           mkdir -p $B
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -g -Wall -Wno-protocol \
-            -Wno-objc-property-implementation -Wno-incomplete-implementation -bundle -I metal/frontend \
+            -Wno-objc-property-implementation -Wno-incomplete-implementation -Wno-objc-protocol-property-synthesis -bundle -I metal/frontend \
             -o $B/SweetMTL metal/frontend/SweetMTL.m work/mtl-target/aarch64-apple-ios/release/libsweetmtl_bridge.a \
             -Wl,-u,_vkGetInstanceProcAddr -framework Foundation -framework Metal -framework IOSurface -lc++
           nm -gU $B/SweetMTL | grep -E " T _(vkGetInstanceProcAddr|smtl_device_new)"
