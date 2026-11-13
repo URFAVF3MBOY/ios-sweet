@@ -2,7 +2,10 @@
 
 ## Status / current work (2026-11-09, latest)
 
-### >>> RESUME HERE (2026-11-12, latest) <<<
+### >>> RESUME HERE (2026-11-13, latest) <<<
+- **Status 2026-11-13 ~05:30:** booted `research/kexts/shim-boot-0224-mtl.img` (kernel 0224, sweetmtl=SweetMTL). Vulkan works (Turnip over sweetdrm). Metal: MTLCreateSystemDefaultDevice -> SweetMTLDevice; buffers, blit, metallib, compute pipelines correct; render/textures not started; compute ~4x slower than Vulkan. CI `vulkan.yml` on the Intel pool with caches; Rust bridge builds locally. Short summary for a new session: `handoff.md` (local, not in git).
+- Cleanup 2026-11-13: deleted xnu/out kernel copies 0164-0210, shim/out images older than 0190, tool build outputs, patches.zip, today's screenshots, phone /var/tmp test leftovers and /var/jb/usr/w (vthw). Kept: backup/, ios165-root.img, research/kexts, shim/out 0190+, logs referenced in these notes.
+
 - **Metal milestone 1 works (2026-11-13 ~04:30, observed): my SweetMTL.bundle over metal2vulkan-runtime over Turnip.**
   - Code: `metal/bridge/lib.rs` (Rust staticlib, C functions over metal2vulkan-runtime 219f0136; exports `vkGetInstanceProcAddr` -> Turnip's `vk_icdGetInstanceProcAddr`, and names its own binary as the runtime's Vulkan "loader"), `metal/frontend/SweetMTL.m` (SweetMTLDevice/Queue/CommandBuffer/BlitEncoder/Buffer; unknown selectors logged once and answered with zeros; device only for processes in /var/local/sweetmtl-clients or SWEETMTL=1), `metal/test/mtltest.m`. Built in the vulkan workflow (run 43399375658). Installed at /System/Library/Extensions/SweetMTL.bundle (+ Turnip inside).
   - First run: "device lost" during the runtime's device setup. SWEETDRM_TRACE=1 showed an empty submission (0 cmds, 1 out syncobj) refused by RedwoodGPU (EINVAL). sweetdrm now answers empty submissions itself (out syncobjs = the last real fence, or signalled).
