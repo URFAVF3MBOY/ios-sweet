@@ -1,0 +1,42 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 12 Nov 2026 20:20:00 -0500
+Subject: [PATCH] op7t-0223: IOSurface planes report their bytes per row (video)
+
+Videos never played: mediaserverd died with SIGBUS in H264SW's copy into
+its output frame (row step 2*dstBytesPerRow - width = -0x170, written as
+unsigned 32-bit -> 4 GiB past the frame). Reproduced without video
+(tools/cv420v_test.py): a 352x288 '420v' surface reports plane widths and
+heights but bytes per row 0 for both planes.
+
+IOSurface.framework (16.5 20F66) reads the lock result at IOSurfaceClient
++ 0x68; per plane i (record at result + 0x68 + i*0x80), disassembled from
+the phone: width +0x00 (GetWidthOfPlane: client+0xd0), height +0x04
+(+0xd4), offset +0x0c (GetBaseAddressOfPlane: +0xdc), bytes per row +0x10
+(GetBytesPerRowOfPlane: +0xe0), bytes per element +0x18 (+0xe8), element
+width/height +0x1a/+0x1b (+0xea/+0xeb); a byte at +0x54 (+0x124) equal to
+1 makes both report 0. sweet_surface_fill_result wrote bytes per row only
+at +0x08: now also at +0x10 (+0x08 kept).
+
+Checked with tools/xnu-cc.py (CI flags).
+
+Apply after 0222.
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c2879ac..59492fc 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -721,6 +721,14 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
++		/*
++		 * 0223: where IOSurface.framework (16.5 20F66) reads a plane's bytes per row: IOSurfaceGetBytesPerRowOfPlane ->
++		 * IOSurfaceClient + 0xe0 + i * 0x80 = this record + 0x10 (width +0x00, height +0x04, offset +0x0c, bytes per
++		 * element +0x18, element width/height +0x1a/+0x1b, as written here; a byte at +0x54 equal to 1 makes it
++		 * report 0). Only +0x08 had it: every plane said 0 bytes per row, and H264SW's copy into a '420v' frame
++		 * stepped 4 GiB past it (SIGBUS in mediaserverd, videos never played). +0x08 kept as it was.
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
