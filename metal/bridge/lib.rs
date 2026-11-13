@@ -86,6 +86,7 @@ fn own_binary() -> Option<PathBuf> {
 /// directory or NULL for the runtime's default. NULL on failure (smtl_last_error says why).
 #[no_mangle]
 pub unsafe extern "C" fn smtl_device_new(turnip: *const c_char, cache: *const c_char) -> *mut Device {
+    sweetmtl_add_device_protocols(); // before MTLAddDevice checks the new device (and no load-time hook needed)
     if turnip.is_null() {
         fail("smtl_device_new", "no Turnip path");
         return ptr::null_mut();
@@ -271,3 +272,32 @@ pub unsafe extern "C" fn smtl_blit_end(e: *mut BlitCommandEncoder) -> i32 {
         Err(err) => fail("end_encoding", err),
     }
 }
+
+// ---- Metal.framework's checks on a plugin device ----
+
+extern "C" {
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
+    fn objc_getProtocol(name: *const c_char) -> *mut c_void;
+    fn class_addProtocol(cls: *mut c_void, protocol: *mut c_void) -> bool;
+}
+
+/// MTLAddDevice (Metal 16.5) asserts that a new device conforms to MTLDevice and to the private MTLDeviceSPI.
+/// SweetMTLDevice lists MTLDevice in its source; MTLDeviceSPI has no header, so it is added here, when the bundle
+/// loads (seen 2026-11-13: "failed assertion [newDevice conformsToProtocol:@protocol(MTLDeviceSPI)]").
+#[no_mangle]
+pub extern "C" fn sweetmtl_add_device_protocols() {
+    // SAFETY: plain Objective-C runtime calls with NUL-terminated names; a missing class or protocol is skipped.
+    unsafe {
+        let cls = objc_getClass(c"SweetMTLDevice".as_ptr());
+        for name in [c"MTLDevice", c"MTLDeviceSPI"] {
+            let p = objc_getProtocol(name.as_ptr());
+            if !cls.is_null() && !p.is_null() {
+                class_addProtocol(cls, p);
+            }
+        }
+    }
+}
+
+#[used]
+#[link_section = "__DATA,__mod_init_func"]
+static ADD_DEVICE_PROTOCOLS: extern "C" fn() = sweetmtl_add_device_protocols;
