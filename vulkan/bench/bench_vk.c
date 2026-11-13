@@ -5,6 +5,7 @@
  */
 #include <dlfcn.h>
 #include <string.h>
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "bench.h"
 #include "bench_vert.h"
