@@ -248,7 +248,7 @@ SWEET_CATCH_ALL
 @interface _MTLDevice : NSObject <MTLDevice>
 @end
 
-@interface SweetMTLDevice : _MTLDevice
+@interface SweetMTLDevice : _MTLDevice <MTLDevice>   /* listed here: MTLAddDevice asserts conformsToProtocol:@protocol(MTLDevice) */
 @property (nonatomic, readonly) smtl_device *d;
 @end
 
