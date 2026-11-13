@@ -4,104 +4,33 @@
 // only adds this file's implementations; every other object is an own class answering the Metal protocol methods it implements.
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
-// reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
+// reported once through the missing-selector hook and answered nil/0 (SWEET_MISSING_ABORT=1: the usual exception), so a hardware run names the gap.
+// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <Accelerate/Accelerate.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <mutex>
-#include <condition_variable>
-#include <deque>
-#include <chrono>
 #include <pthread.h>
-#include <pthread/qos.h>
-#include <sched.h>
-#include <mach/mach_time.h>
+#include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <math.h>
-#include <unistd.h>
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <mach/mach_time.h>
 #include <execinfo.h>
 #include <mach/mach.h>
-#include <os/lock.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
-
-// u-cpu: CPU savings of the frontend, env SWEET_CPUFAST (a bitmask, from /var/local/mtl2-env; unset = kCpuFastDefault):
-//  0x1 answers   the device queries that take an argument (supportsFamily:, supportsTextureSampleCount:, ...) answered once per
-//                selector and argument, then from a table. They are functions of the device alone (its properties and format
-//                answers, fixed at open). prof2 (Settings flings): Metal's MTLPixelFormatGetInfoForDevice, which Core Animation calls
-//                through MTLGetTextureLevelInfoForDeviceWithOptions, asked supportsFamily: and the runtime audited every row of the
-//                family each time (families::audit, its format answers cloned) = 23% of the display thread's samples.
-//  0x2 viewport  setViewport:/setScissorRect: with the value the encoder's last accepted call of it set is not sent again: the
-//                state is the same, the runtime logs no call, and its fast draw (SWEET_FASTDRAW) keeps its entries.
-// "native-metal: T cpufast 5s:" counts them.
-enum : uint32_t {CPUFAST_ANSWERS=0x1,CPUFAST_VIEWPORT=0x2};
-static const uint32_t kCpuFastDefault=CPUFAST_ANSWERS|CPUFAST_VIEWPORT;
-// u-lab: live knobs. /var/local/mtl2-live (KEY=VALUE lines, like mtl2-env) is looked at once a second from -commit (its
-// mtime; one stat per second) and its values override the env for the knobs that need no pipeline, device or thread
-// setup: SWEET_CPUFAST (bits), SWEET_ENCSTAT, SWEET_FNSTAT (0/1, with the timeline on), SWEET_ENC_SLOW_MS. A key not in the
-// file (or no file) = the env value again. Changes are logged "native-metal: live: KEY=VALUE". No restart: an A/B of
-// these switches in a second (tools-claude/exp-run.py `live` lines). All else (TU_DEBUG, SWEET_UBWC, bridge knobs, QoS)
-// is read once at startup and still needs the backboardd restart.
-// u-combo: also SWEET_M2V_SCRATCH (bridge 0111, chosen per pass: passed on with nmb_sweet_scratch_live) and
-// SWEET_ENCTHREAD_REPLACE (a flush before replaceRegion, per call; matters only with SWEET_ENCTHREAD on). Not live, by design:
-// SWEET_ENCTHREAD (a command buffer's mode is fixed at creation; switching would reorder commits against the worker's queue),
-// SWEET_ENCTHREAD_PRI/_SPIN_US (worker start), SWEET_M2V_COLOR_WRITES (compiled SPIR-V, cache keys), SWEET_TU_* (Turnip).
-static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gLiveEncSlowMs{-1},gLiveScratch{-1},gLiveEncReplace{-1};
-// ovd: SWEET_DRAWBOX=N (in /var/local/mtl2-live, backboardd with the timeline; each change of the file re-arms, at most 20): for the next N frames
-// (backboardd command buffers with a framebuffer pass) every render pass and draw as "DB" lines: pipeline functions + label,
-// blend, write mask, viewport, scissor, the position attribute's bounding box (raw and in pixels) and the vertex uniform bytes.
-static std::atomic<int32_t> gDrawboxLeft{0};static std::atomic<uint32_t> gDrawboxSeq{0};
-// g10: SWEET_DEADFILL defaults to 2 (unset); 0 turns it off. Passes: backboardd's, colour 0 an 8-bit unorm single-sample 2D IOSurface
-// (the composited framebuffer; +4 in the value: any such texture), no depth/stencil, no visibility buffer; colours 1..7 (CA's memoryless
-// scratch) are allowed. The g9 mode-2 hold demanded colour 0 alone, and every CA pass carries the scratch as colour 1: never held,
-// "cleared 0". Fills: also single-sample, no alpha-to-coverage, cull none, fill mode fill; a fill is dropped only for the next fill of the
-// same pipeline object with the same other vertex bindings; the Clear needs the transform (the first other vertex binding, a column-major
-// 4x4) to map the fill onto the whole target in clip space (w 1, z in [0,1]) and the fill's pipeline not to write an attached colour 1..7
-// that is not memoryless; the clear colour is the fill's, rounded to the 8-bit code.
-// g9 SWEET_DEADFILL (env or /var/local/mtl2-live, read at each render encoder's creation; default 0 = off). 1: a draw that is a
-// full-target opaque constant-colour fill (Core Animation's "draw.PBGRAXm_A2Xhf" pipeline: no blending, all channels written, no
-// depth/stencil, untextured; viewport/scissor the whole attachment; every vertex the same colour with alpha 1; position bbox covering
-// the attachment in pixels) is held; the encoder's later calls are recorded behind it until the next draw. If that draw is such a fill
-// too, the held one is dropped (it would be completely overwritten); otherwise the held draw and the recorded calls go out in their
-// order before it. Nothing else is reordered. 2: also, while no draw went out yet, the encoder's creation is held when its colour
-// attachment 0 loads (Load or DontCare) and it has no other attachment: if its first surviving draw is such a fill, the pass clears
-// to the fill's colour instead and the draw is dropped (A6xx fast clear). "native-metal: DF 5s:" counts them (with the timeline).
-static std::atomic<int64_t> gLiveDeadfill{-1};
-static std::atomic<uint64_t> gDfDeferred{0},gDfDropped{0},gDfCleared{0},gDfPx{0},gDfHeldPasses{0},gDfNoClear{0};static std::atomic<int32_t> gDfCapturing{0};
-static int deadfillMode() {
- static const int env=[]{const char *e=getenv("SWEET_DEADFILL");return e && *e?atoi(e):2;}();   // g10: default 2
- const int64_t live=gLiveDeadfill.load(std::memory_order_relaxed);
- return live>=0?(int)live:env;
-}
-// g9 SWEET_LUMA_BOOST=0 (env or /var/local/mtl2-live; unset = CA unchanged): Core Animation's luma boost pass (one full-screen
-// luma_boost_lph draw a frame) off. QuartzCore 16.7 reads CA_DISABLE_LUMA_BOOST from the environment once, before the plugin's
-// setenv; it is debug option 91 of its table (CA_COLOR_FLUSH = 0 .. CA_PRINT_FILM_GRAIN = 152) and the render path tests that byte
-// every frame, so CASetDebugOption(91, 1) turns the pass off live (backboardd, the render server). Restored (0) when the knob goes.
-static void lumaKnob(int64_t live);
-
-static uint32_t cpuFast() {
- static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
- const int64_t live=gLiveCpuFast.load(std::memory_order_relaxed);
- return live>=0?(uint32_t)live:bits;
-}
-static std::atomic<uint64_t> gCfAnswerHits{0},gCfAnswerAsks{0},gCfViewportSkips{0},gCfScissorSkips{0},gCfViewportSent{0},gCfScissorSent{0};
-
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -120,13 +49,6 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
-static void noteShadowCopies();   // WS-U: backboardd's 5 s "J copies" line (defined by the telemetry table)
-// u-f (r36): SWEET_SHADOW_SEED=1, surface-seed shadow copy skip (bridge patch 0107; see bumpWrittenSeeds).
-static bool shadowSeedOn() {
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_SHADOW_SEED");on=e && *e && strcmp(e,"0")?1:0;}
- return on;
-}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
@@ -134,32 +56,8 @@ static Timed gTimeWaitScheduled,gTimeWaitCompleted;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
-// u-t (r31): backboardd's frame timeline. Every command buffer's life on one clock (CLOCK_MONOTONIC_RAW, the runtime's host clock,
-// on which it places the GPU's timestamps through VK_KHR_calibrated_timestamps): created, first encoder, commit, the scheduler's
-// submission (kernel start/end), GPU start/end, the completion callback (notice) and its completed handlers' start. A command
-// buffer with a render pass into an IOSurface of 1.5 Mpx or more is a frame (CA's framebuffer). Every 5 s, from a commit, one line
-// "native-metal: T 5s: ..." (and a "T2" line of the runtime's scheduler counts) goes to the console and /var/local/mtl2.log.
-// /var/local/mtl2-env SWEET_TIMELINE=0 turns it off (the plugin sets 1 for backboardd).
-size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
-size_t (*native_bridge_metal_cpu_report)(char *,size_t);
-size_t (*native_bridge_metal_ubwc_report)(char *,size_t);
-size_t (*native_bridge_metal_draw_report)(char *,size_t);   // u-gpudraw: Turnip 0112 "T tu-draw"
-size_t (*native_bridge_metal_perf_report)(char *,size_t,unsigned);   // u-perfctr: Turnip 0113 "T tu-perf 5s"
-static bool timelineOn() {
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
- return on==1;
-}
-static uint64_t tlNow() {return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);}
-enum EncCat : uint8_t {EC_PIPE,EC_TEX,EC_BUF,EC_ENC,EC_DRAW,EC_BIND,EC_BLIT,EC_UPLOAD,EC_WAIT,EC_CB,EC_COUNT};
-// u-e: one frame's (command buffer's) encode window split (see EncScope).
-struct EncFrame {float ms[EC_COUNT];uint16_t n[EC_COUNT];uint32_t scopes;float cpuMs,mhz,vkMs;uint16_t vkN;int8_t cpu0,cpu1;bool valid;};
+static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates,gSurfaceFlushSkipped;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
-struct TLRecord {uint64_t created,commit,kStart,kEnd,gStart,gEnd,notice,handler;EncodedWork work;EncFrame enc;uint32_t surface;bool frame,waitedCompleted,waitedScheduled;};
-static std::mutex gTLLock;
-static std::vector<TLRecord> gTL;   // completed since the last report (at most 4096 kept)
-static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs);
-static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
@@ -172,529 +70,63 @@ static void noteProblem(NSString *what) {
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
 extern "C" void sm2_logs(const char *);
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];sm2_logs(nbText.UTF8String);noteProblem(nbText);}while(0)
-// u-encthread (SWEET_ENCTHREAD, see "the encode thread" below): the frontend records render/blit encoder calls and commits and a
-// worker thread replays them into the bridge. The calls that need the replayed state now wait for it (a sync flush, by reason).
-enum EncFlushWhy : uint8_t {EF_SCHEDULED,EF_COMPLETED,EF_RESOURCE,EF_GETBYTES,EF_COMPUTE,EF_PURGEABLE,EF_REPLACE,EF_BACKPRESSURE,EF_WHY_COUNT};
-static bool encThreadOn();
-static void encFlush(EncFlushWhy why);
-// u-e (r33): encode-time accounting (backboardd, with the timeline; /var/local/mtl2-env SWEET_ENCSTAT=0 turns it off). Every
-// Metal call CA makes into this frontend that can cost (creation, encoder begin/end, binds, draws, blits, uploads, waits) runs in
-// an EncScope: two mach_absolute_time reads around the call, counted on the calling thread by category (outermost scope only, so a
-// nested call is never counted twice) and per call site (count, total, max). A command buffer takes the thread's counts at its first
-// encoder and at commit: the frame's time per category, the time inside no category (CA's own work between calls, and calls not
-// instrumented), its thread's CPU time in the window, the CPU it committed on and the core's speed then (a fixed chain of dependent
-// adds, timed: "MHz-eq"). Every 5 s with the T line: "T3" (per-frame categories p50/p95, calls, mean per call), "T4" (the 10 call
-// sites with most time), "T slow frame" (frames whose encode passed 50 ms, split). A single call over SWEET_ENC_SLOW_MS (20) logs
-// "E slow" at once (at most 12 per 5 s) with its category, site and object.
-static const char *const kEncCatName[EC_COUNT]={"pipe","tex","buf","enc","draw","bind","blit","upload","wait","cb"};
-static bool timelineOn();
-static bool fnStatOn() {   // u-gpudraw
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_FNSTAT");on=timelineOn() && e && *e && strcmp(e,"0")?1:0;}
- const int64_t live=gLiveFnStat.load(std::memory_order_relaxed);
- return live>=0?live && timelineOn():on==1;
+// 0111 (device lost): the first report, once, with the counters (Turnip's own first line, phone/turnip/patches/0108, has the reason). backboardd then exits
+// after 0.5 s so launchd restarts it and the UI comes back, instead of cycling old frames; off: file /var/local/mtl2-no-devlost-exit. Other clients stay and
+// get refusals. Log lines off, flood gate too: M2V_DEVLOST_LOG=0 (/var/local/mtl2-env).
+static std::atomic<bool> gDeviceLostSeen{false};
+static bool deviceLostLogOn() {static const bool on=[]{const char *v=getenv("M2V_DEVLOST_LOG");return !v||strcmp(v,"0");}();return on;}
+static void *deviceLostExit(void *) {
+ usleep(500000);
+ if(deviceLostLogOn())sm2_logs("DEVLOST: backboardd exits (70), launchd restarts it");
+ int fd=open("/var/local/mtl2.log",O_WRONLY);if(fd>=0){fsync(fd);close(fd);}
+ _exit(70);
 }
-static bool encStatOn() {
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_ENCSTAT");on=timelineOn() && !(e && !strcmp(e,"0"))?1:0;}
- const int64_t live=gLiveEncStat.load(std::memory_order_relaxed);
- return live>=0?live && timelineOn():on==1;
-}
-static double encTickNs() {
- static double ns=0;
- if(ns==0){mach_timebase_info_data_t tb;mach_timebase_info(&tb);ns=tb.denom?(double)tb.numer/tb.denom:1;}
- return ns;
-}
-static uint64_t encSlowTicks() {
- static uint64_t ticks=0;
- if(!ticks){const char *e=getenv("SWEET_ENC_SLOW_MS");double ms=e && atof(e)>0?atof(e):20;ticks=(uint64_t)(ms*1e6/encTickNs());}
- const int64_t live=gLiveEncSlowMs.load(std::memory_order_relaxed);
- return live>0?(uint64_t)(live*1e6/encTickNs()):ticks;
-}
-// g9: SWEET_LUMA_BOOST (live: 0/1 from /var/local/mtl2-live, -1: the env's, else leave CA alone or restore what was set)
-static void lumaKnob(int64_t live) {
- static int applied=-1;   // what was set: 1 disabled, 0 restored, -1 never touched
- static const bool bb=!strcmp(getprogname(),"backboardd");
- if(!bb)return;
- int want=-1;
- if(live>=0)want=live==0?1:0;
- else{const char *e=getenv("SWEET_LUMA_BOOST");if(e && *e)want=strcmp(e,"0")?0:1;else if(applied==1)want=0;}
- if(want<0 || want==applied)return;
- static void (*set)(int,uint8_t)=(void (*)(int,uint8_t))dlsym(RTLD_DEFAULT,"CASetDebugOption");
- static int (*get)(int)=(int (*)(int))dlsym(RTLD_DEFAULT,"CAGetDebugOption");
- char text[200];
- if(!set){snprintf(text,sizeof text,"native-metal: luma: SWEET_LUMA_BOOST=%d NOT applied (no CASetDebugOption)",want?0:1);sm2_logs(text);applied=want;return;}
- applied=want;
- // off the render thread (CASetDebugOption posts a notification after it sets the byte; its observers may take CA's locks)
- dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
-  set(91,(uint8_t)want);
-  char line[200];
-  snprintf(line,sizeof line,"native-metal: luma: SWEET_LUMA_BOOST=%d applied: CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST, %d), reads back %d",want?0:1,want,get?get(91):-1);
-  sm2_logs(line);
- });
-}
-// once a second at most (one thread wins the slot): the file's mtime; on a change, parse it and publish the values
-static void liveKnobsPoll() {
- static std::atomic<uint64_t> next{0};
- static struct timespec seen;
- static bool had;
- const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
- uint64_t due=next.load(std::memory_order_relaxed);
- if(now<due || !next.compare_exchange_strong(due,now+1000000000ull))return;
- {static bool lumaFirst=false;if(!lumaFirst){lumaFirst=true;lumaKnob(-1);}}   // g9: the env's SWEET_LUMA_BOOST at the first poll
- struct stat st;
- const bool have=stat("/var/local/mtl2-live",&st)==0;
- if(have==had && (!have || (st.st_mtimespec.tv_sec==seen.tv_sec && st.st_mtimespec.tv_nsec==seen.tv_nsec)))return;
- had=have;
- seen=have?st.st_mtimespec:(struct timespec){0,0};
- int64_t cf=-1,es=-1,fs=-1,ms=-1,sc=-1,er=-1,df=-1,lb=-1;
- if(FILE *f=have?fopen("/var/local/mtl2-live","r"):nullptr) {
-  char line[256];
-  while(fgets(line,sizeof line,f)) {
-   line[strcspn(line,"\r\n")]=0;
-   char *eq=strchr(line,'=');
-   if(line[0]=='#' || !eq)continue;
-   *eq=0;
-   const char *v=eq+1;
-   if(!strcmp(line,"SWEET_CPUFAST") && *v)cf=(int64_t)strtoul(v,nullptr,0);
-   else if(!strcmp(line,"SWEET_ENCSTAT"))es=strcmp(v,"0")?1:0;
-   else if(!strcmp(line,"SWEET_FNSTAT"))fs=*v && strcmp(v,"0")?1:0;
-   else if(!strcmp(line,"SWEET_ENC_SLOW_MS") && atof(v)>0)ms=(int64_t)atof(v);
-   else if(!strcmp(line,"SWEET_M2V_SCRATCH"))sc=*v && strcmp(v,"0")?1:0;   // u-combo: as the bridge reads the env
-   else if(!strcmp(line,"SWEET_ENCTHREAD_REPLACE"))er=*v=='1'?1:0;
-   else if(!strcmp(line,"SWEET_DRAWBOX") && atoi(v)>0)gDrawboxLeft.store(std::min(atoi(v),20));   // ovd
-   else if(!strcmp(line,"SWEET_DEADFILL") && *v)df=atoi(v);   // g9
-   else if(!strcmp(line,"SWEET_LUMA_BOOST") && *v)lb=strcmp(v,"0")?1:0;   // g9
-  }
-  fclose(f);
+static void deviceLostFirst(const char *where) {
+ if(gDeviceLostSeen.exchange(true))return;
+ const bool backboardd=!strcmp(getprogname(),"backboardd"),keep=access("/var/local/mtl2-no-devlost-exit",F_OK)==0;
+ if(deviceLostLogOn()){
+  char t[600];snprintf(t,sizeof t,"DEVLOST first (bridge) %s; commits %llu failed %llu completed %llu problems %llu; %s",where,(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
+   (unsigned long long)gCompleted.load(),(unsigned long long)gProblems.load(),!backboardd?"client: no exit, its calls are refused from now on":keep?"mtl2-no-devlost-exit: no exit":"exit in 0.5 s");
+  sm2_logs(t);
  }
- gLiveCpuFast.store(cf,std::memory_order_relaxed);gLiveEncStat.store(es,std::memory_order_relaxed);
- gLiveFnStat.store(fs,std::memory_order_relaxed);gLiveEncSlowMs.store(ms,std::memory_order_relaxed);
- gLiveEncReplace.store(er,std::memory_order_relaxed);
- gLiveDeadfill.store(df,std::memory_order_relaxed);lumaKnob(lb);   // g9
- if(gLiveScratch.exchange(sc)!=sc)nmb_sweet_scratch_live((int32_t)sc);   // u-combo: the bridge, from its next pass
- char text[360];
- snprintf(text,sizeof text,"native-metal: live: %s -> SWEET_CPUFAST=0x%x SWEET_ENCSTAT=%d SWEET_FNSTAT=%d SWEET_ENC_SLOW_MS=%llu"
-  " SWEET_M2V_SCRATCH=%s SWEET_ENCTHREAD_REPLACE=%s SWEET_DEADFILL=%d SWEET_LUMA_BOOST=%s",
-  have?"/var/local/mtl2-live read":"no /var/local/mtl2-live (env values)",cpuFast(),encStatOn(),fnStatOn(),
-  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6),sc<0?"env":sc?"1":"0",er<0?"env":er?"1":"0",deadfillMode(),lb<0?"env":lb?"1":"0");
- sm2_logs(text);
+ if(backboardd&&!keep){pthread_t th;if(pthread_create(&th,NULL,deviceLostExit,NULL)==0)pthread_detach(th);else _exit(70);}
 }
-struct EncTLS {uint64_t ticks[EC_COUNT];uint32_t n[EC_COUNT];uint32_t depth;uint64_t scopes;};
-static __thread EncTLS tEnc;
-static __thread char tEncDetail[200];   // what the current slow call worked on (set by the call, only when it is slow)
-struct EncSite {
- const char *name;uint8_t cat;std::atomic<uint64_t> n,ticks,max;std::atomic<bool> listed;
- constexpr EncSite(const char *nm,uint8_t c):name(nm),cat(c),n(0),ticks(0),max(0),listed(false){}
-};
-enum {kEncSites=128};
-static std::atomic<EncSite *> gEncSites[kEncSites];
-static std::atomic<unsigned> gEncSiteCount;
-static std::atomic<unsigned> gEncSlowLogged;   // E slow lines in this 5 s window
-static void encList(EncSite *s) {
- bool f=false;
- if(s->listed.compare_exchange_strong(f,true)){const unsigned i=gEncSiteCount.fetch_add(1);if(i<kEncSites)gEncSites[i].store(s);}
+extern "C" void nbDeviceLostHook(const char *text) {deviceLostFirst(text);}
+// 0111 flood stop: once the device is lost, each kind of line (its text without digits) at most once per 10 s, with how many were dropped. false: drop this one.
+static bool deviceLostGate(NSString *__strong *text) {
+ if(!gDeviceLostSeen.load(std::memory_order_relaxed)&&[*text rangeOfString:@"DeviceLost"].location!=NSNotFound)deviceLostFirst((*text).UTF8String?:"?");
+ if(!gDeviceLostSeen.load(std::memory_order_relaxed)||!deviceLostLogOn())return true;
+ uint32_t kind=2166136261u;for(const char *c=(*text).UTF8String?:"";*c;c++)if(*c<'0'||*c>'9')kind=(kind^(uint8_t)*c)*16777619u;
+ static struct {uint32_t kind;uint64_t lastUs,dropped;} kinds[32];static std::mutex lock;
+ const uint64_t now=nowUs();std::lock_guard<std::mutex> hold(lock);
+ unsigned at=kind%32;for(unsigned i=0;i<32;i++){const unsigned j=(kind+i)%32;if(kinds[j].kind==kind||!kinds[j].kind){at=j;break;}}
+ auto &k=kinds[at];
+ if(k.kind==kind&&now-k.lastUs<10000000){k.dropped++;gProblems++;return false;}
+ if(k.kind==kind&&k.dropped)*text=[*text stringByAppendingFormat:@" (+%llu in 10 s)",(unsigned long long)k.dropped];
+ k.kind=kind;k.lastUs=now;k.dropped=0;return true;
 }
-static void encSlow(const EncSite *s,uint64_t ticks) {
- if(gEncSlowLogged.fetch_add(1)>=12){tEncDetail[0]=0;return;}
- char line[400];
- snprintf(line,sizeof line,"native-metal: E slow %.1f ms %s %s%s%s",ticks*encTickNs()/1e6,kEncCatName[s->cat],s->name,tEncDetail[0]?": ":"",tEncDetail);
- tEncDetail[0]=0;
- sm2_logs(line);
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];if(deviceLostGate(&nbText)){sm2_logs(nbText.UTF8String);noteProblem(nbText);}}while(0)
+// 0106 (B29, diagnostic): 1-byte texel textures' row pitch, logged without counting as a problem. Off: M2V_B29_LOG=0.
+#define B29LOG(...) do{const char *nbOff=getenv("M2V_B29_LOG");if(!nbOff||strcmp(nbOff,"0"))sm2_logs([NSString stringWithFormat:__VA_ARGS__].UTF8String);}while(0)
+// 0110 (B44, diagnostic): one line per distinct (path, format, width, height, row bytes) of every texture creation, view and upload
+// ("B44 <path> fmt .. type .. WxHxD levels .. storage .. usage .. row .. <extra>"), at most 2000 per process. On: /var/local/mtl2-b44log
+// exists (checked once).
+static bool b44On() {static const bool on=access("/var/local/mtl2-b44log",F_OK)==0;return on;}
+static void b44Log(const char *path,uint64_t fmt,uint64_t type,uint64_t w,uint64_t h,uint64_t z,uint64_t levels,uint64_t storage,uint64_t usage,uint64_t row,NSString *extra) {
+ if(!b44On())return;
+ static std::mutex lock;static std::unordered_map<uint64_t,bool> seen;
+ uint64_t key=std::hash<std::string>()(path);
+ for(uint64_t v:{fmt,w,h,row})key=(key^v)*0x100000001b3ULL;
+ {std::lock_guard<std::mutex> hold(lock);if(seen.size()>=2000 || !seen.emplace(key,true).second)return;}
+ sm2_logs([NSString stringWithFormat:@"B44 %s fmt %llu type %llu %llux%llux%llu levels %llu storage %llu usage %llu row %llu %@",path,fmt,type,w,h,z,levels,storage,usage,row,extra?:@""].UTF8String);
 }
-struct EncScope {
- EncSite *site;uint64_t t0;bool outer;
- explicit EncScope(EncSite *s):site(nullptr),t0(0),outer(false) {
-  if(!encStatOn())return;
-  site=s;
-  if(tEnc.depth++==0){outer=true;tEncDetail[0]=0;t0=mach_absolute_time();}
- }
- // Whether the call has run past the slow threshold so far (a call then describes its object into tEncDetail).
- bool slow() const {return site && outer && mach_absolute_time()-t0>encSlowTicks();}
- ~EncScope() {
-  if(!site)return;
-  tEnc.depth--;
-  if(!outer)return;
-  const uint64_t d=mach_absolute_time()-t0;
-  tEnc.ticks[site->cat]+=d;tEnc.n[site->cat]++;tEnc.scopes++;
-  site->n.fetch_add(1,std::memory_order_relaxed);site->ticks.fetch_add(d,std::memory_order_relaxed);
-  if(d>site->max.load(std::memory_order_relaxed))site->max.store(d,std::memory_order_relaxed);
-  if(!site->listed.load(std::memory_order_relaxed))encList(site);
-  if(d>encSlowTicks())encSlow(site,d);
- }
-};
-#define ENC_SCOPE(cat,name) static EncSite encSite_{name,cat};EncScope encScope_(&encSite_)
-static int encCPU() {
- static int (*cpuNumber)(size_t *)=(int (*)(size_t *))dlsym(RTLD_DEFAULT,"pthread_cpu_number_np");
- size_t n=0;return cpuNumber && cpuNumber(&n)==0?(int)n:-1;
+static void b44Desc(const char *path,MTLTextureDescriptor *d,uint64_t row,NSString *extra) {
+ if(b44On()&&d)b44Log(path,d.pixelFormat,d.textureType,d.width,d.height,d.textureType==MTLTextureType3D?d.depth:d.arrayLength,d.mipmapLevelCount,d.storageMode,d.usage,row,extra);
 }
-// The core's speed: 8192 dependent adds (about one per cycle on the A76 and the A55), timed.
-static float encMHz() {
- uint64_t x=0;const uint64_t t0=mach_absolute_time();
- __asm__ volatile("mov x9, #2048\n1:\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n subs x9, x9, #1\n b.ne 1b\n"
-                  :"+r"(x)::"x9","cc");
- const double ns=(mach_absolute_time()-t0)*encTickNs();
- return ns>0?(float)(8192e3/ns):0;
+static void b44Tex(const char *path,id<MTLTexture> t,uint64_t row,NSString *extra) {
+ if(b44On()&&t)b44Log(path,t.pixelFormat,t.textureType,t.width,t.height,t.textureType==MTLTextureType3D?t.depth:t.arrayLength,t.mipmapLevelCount,t.storageMode,t.usage,row,extra);
 }
-// What one EncScope costs (two clock reads, the thread's counts, the site's three atomics), measured once, for the T3 line.
-static double encScopeNs() {
- static double ns=-1;
- if(ns<0) {
-  static EncSite probe{"probe",EC_CB};
-  const uint64_t t0=mach_absolute_time();
-  for(int i=0;i<2000;i++){volatile uint64_t a=mach_absolute_time();(void)a;volatile uint64_t b=mach_absolute_time();
-   probe.n.fetch_add(1,std::memory_order_relaxed);probe.ticks.fetch_add(b-a,std::memory_order_relaxed);
-   if(b-a>probe.max.load(std::memory_order_relaxed))probe.max.store(b-a,std::memory_order_relaxed);tEnc.scopes+=0;}
-  ns=(mach_absolute_time()-t0)*encTickNs()/2000;
- }
- return ns;
-}
-// The encoding thread, once per thread: its priority and QoS (the scheduler's sweetbig=2 sends threads at 47 or above to an idle big
-// core first). SWEET_RENDER_QOS=ui|in sets its QoS class, SWEET_RENDER_PRI=N a fixed priority N (SCHED_RR) first: both off by default.
-static void encThreadNote() {
- static __thread bool noted;
- if(noted)return;
- noted=true;
- const char *qosKnob=getenv("SWEET_RENDER_QOS"),*priKnob=getenv("SWEET_RENDER_PRI");
- char done[96]="";
- if(qosKnob && (!strcmp(qosKnob,"ui") || !strcmp(qosKnob,"in"))) {
-  const int r=pthread_set_qos_class_self_np(!strcmp(qosKnob,"ui")?QOS_CLASS_USER_INTERACTIVE:QOS_CLASS_USER_INITIATED,0);
-  snprintf(done,sizeof done," | set qos %s: %d",qosKnob,r);
- }
- if(priKnob && atoi(priKnob)>0) {
-  struct sched_param sp={};sp.sched_priority=atoi(priKnob);
-  const int r=pthread_setschedparam(pthread_self(),SCHED_RR,&sp);
-  const size_t at=strlen(done);snprintf(done+at,sizeof done-at," | set pri %d rr: %d",sp.sched_priority,r);
- }
- thread_extended_info_data_t info={};mach_msg_type_number_t count=THREAD_EXTENDED_INFO_COUNT;
- const mach_port_t self=mach_thread_self();
- const kern_return_t kr=thread_info(self,THREAD_EXTENDED_INFO,(thread_info_t)&info,&count);
- mach_port_deallocate(mach_task_self(),self);
- qos_class_t qos=QOS_CLASS_UNSPECIFIED;int relative=0;pthread_get_qos_class_np(pthread_self(),&qos,&relative);
- uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
- (void)encScopeNs();
- char line[400];
- snprintf(line,sizeof line,"native-metal: encode thread %llu '%s': pri cur %d base %d max %d policy %d qos 0x%x%+d cpu %d MHz-eq %.0f%s",
-  (unsigned long long)tid,kr==KERN_SUCCESS?info.pth_name:"?",kr==KERN_SUCCESS?info.pth_curpri:-1,kr==KERN_SUCCESS?info.pth_priority:-1,
-  kr==KERN_SUCCESS?info.pth_maxpriority:-1,kr==KERN_SUCCESS?info.pth_policy:-1,(unsigned)qos,relative,encCPU(),encMHz(),done);
- sm2_logs(line);
-}
-// u-e (r34): render pipeline prewarm. Every render pipeline state CA makes (backboardd, SpringBoard) is recorded once in
-// <cache>/prewarm.v1: both functions by their library's digest (SHA-256 of its bytes, the library kept as prewarm-lib-DIGEST.bin
-// beside it), name and constant values, and the bridge descriptor's bytes. At the next device creation a utility-QoS thread makes them
-// again, in the order CA first asked, before CA asks: the runtime keeps what a making produced by content (translations, libraries of
-// pipeline parts, variants' pipelines), so CA's own creation of the same state finds it made. The prewarmed states are kept for the
-// process's life. Bounded by SWEET_PREWARM_MAX (300 states) and SWEET_PREWARM_MS (30000 ms); "native-metal: prewarm: N pipelines in
-// M ms" when done. /var/local/mtl2-env SWEET_PREWARM=0: no recording, no prewarm.
-static std::string gPrewarmDir;
-static std::mutex gPrewarmLock;
-static std::unordered_map<std::string,bool> gPrewarmSeen;   // recorded lines (the file's and this process's)
-static std::atomic<bool> gPrewarmRunning{false};
-static std::unordered_map<std::string,bool> gPrewarmUsed;   // mode 2: records CA made this process (under gPrewarmLock)
-// G6: 2 = idle priming (SWEET_PREWARM=2), 1 = the prewarm at device creation (default; 0 turns both off through prewarmOn).
-static int prewarmMode() {
- static int mode=-1;
- if(mode<0){const char *e=getenv("SWEET_PREWARM");mode=e && atoi(e)==2?2:1;}
- return mode;
-}
-static bool prewarmOn() {
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_PREWARM"),*p=getprogname();
-  on=!(e && !strcmp(e,"0")) && (!strcmp(p,"backboardd") || !strcmp(p,"SpringBoard"))?1:0;}
- return on==1 && !gPrewarmDir.empty();
-}
-static unsigned prewarmKnob(const char *name,unsigned fallback) {const char *e=getenv(name);return e && atoi(e)>0?(unsigned)atoi(e):fallback;}
-static std::string hexOf(const void *bytes,size_t size) {
- static const char digits[]="0123456789abcdef";std::string out;out.resize(size*2);
- for(size_t i=0;i<size;i++){const uint8_t b=((const uint8_t *)bytes)[i];out[2*i]=digits[b>>4];out[2*i+1]=digits[b&15];}
- return out;
-}
-static bool unhex(const std::string &text,std::vector<uint8_t> &out) {
- if(text.size()%2)return false;
- out.resize(text.size()/2);
- auto v=[](char c)->int{return c>='0' && c<='9'?c-'0':c>='a' && c<='f'?c-'a'+10:-1;};
- for(size_t i=0;i<out.size();i++){const int h=v(text[2*i]),l=v(text[2*i+1]);if(h<0 || l<0)return false;out[i]=(uint8_t)(h<<4|l);}
- return true;
-}
-static std::vector<std::string> splitOn(const std::string &s,char by) {
- std::vector<std::string> out;size_t at=0;
- for(;;){const size_t next=s.find(by,at);out.push_back(s.substr(at,next==std::string::npos?std::string::npos:next-at));if(next==std::string::npos)break;at=next+1;}
- return out;
-}
-// A library's digest (prewarm records name it), its bytes kept once in the cache directory; "" where prewarm is off.
-static std::string prewarmLibrary(const void *bytes,size_t size) {
- if(!prewarmOn() || !bytes || !size)return "";
- unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(bytes,(CC_LONG)size,digest);
- const std::string name=hexOf(digest,16);
- const std::string path=gPrewarmDir+"/prewarm-lib-"+name+".bin";
- if(access(path.c_str(),R_OK)!=0) {
-  const std::string temp=path+".tmp"+std::to_string(getpid());
-  if(FILE *f=fopen(temp.c_str(),"wb")) {
-   const bool ok=fwrite(bytes,1,size,f)==size;
-   if(fclose(f)==0 && ok)rename(temp.c_str(),path.c_str());else unlink(temp.c_str());
-  }
- }
- return name;
-}
-// A function's part of a record: LIB:S|P:NAMEHEX:CONSTANTS (TYPE.INDEX.NAMEHEX.BYTESHEX joined by ',', or -).
-static std::string prewarmFunctionKey(const std::string &library,NSString *name,const NmbConstant *constants,size_t count,bool specialized) {
- if(library.empty() || !name.UTF8String)return "";
- std::string key=library+(specialized?":S:":":P:")+hexOf(name.UTF8String,strlen(name.UTF8String))+":";
- if(!count)key+="-";
- for(size_t i=0;i<count;i++) {
-  const NmbConstant &c=constants[i];
-  char head[48];snprintf(head,sizeof head,"%s%llu.%llu.",i?",":"",(unsigned long long)c.type,(unsigned long long)c.index);
-  key+=head;key+=c.name?hexOf(c.name,strlen(c.name)):"";key+=".";key+=hexOf(c.bytes,(size_t)c.length);
- }
- return key;
-}
-// Record a state CA made: "P1 VERTEX FRAGMENT|- OPTIONS DESCRIPTOR" (the descriptor's bytes, functions zeroed, trailing zeros dropped).
-static void prewarmRecord(const std::string &vertex,const std::string &fragment,const NmbRenderPipelineDescriptor &d,uint64_t options) {
- if(!prewarmOn() || vertex.empty() || fragment=="")return;
- NmbRenderPipelineDescriptor copy=d;copy.vertex=nullptr;copy.fragment=nullptr;
- size_t size=sizeof copy;const uint8_t *bytes=(const uint8_t *)&copy;
- while(size && !bytes[size-1])size--;
- char opts[24];snprintf(opts,sizeof opts,"%llx",(unsigned long long)options);
- const std::string line="P1 "+vertex+" "+fragment+" "+opts+" "+hexOf(bytes,size);
- std::lock_guard<std::mutex> lock(gPrewarmLock);
- if(prewarmMode()==2 && gPrewarmUsed.size()<4000)gPrewarmUsed.emplace(line,true);   // G6: made by CA this boot
- if(gPrewarmSeen.size()>=1000 || !gPrewarmSeen.emplace(line,true).second)return;
- if(FILE *f=fopen((gPrewarmDir+"/prewarm.v1").c_str(),"a")){fputs(line.c_str(),f);fputc('\n',f);fclose(f);}
-}
-// Makes recorded states again (both prewarm modes): the libraries read once, kept for the process's life like the states.
-struct PrewarmMaker {
- std::unordered_map<std::string,NmbLibrary *> libraries;
- unsigned bad=0;
- NmbFunction *function(const std::string &key,bool &missing) {
-  const std::vector<std::string> p=splitOn(key,':');
-  if(p.size()!=4){bad++;return nullptr;}
-  NmbLibrary *library=nullptr;
-  auto at=libraries.find(p[0]);
-  if(at!=libraries.end())library=at->second;
-  else {
-   NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:(gPrewarmDir+"/prewarm-lib-"+p[0]+".bin").c_str()]
-                                       options:NSDataReadingMappedIfSafe error:nil];
-   library=data?nmb_library_new(gDevice,data.bytes,data.length,false):nullptr;
-   libraries[p[0]]=library;
-  }
-  if(!library){missing=true;return nullptr;}
-  std::vector<uint8_t> nameBytes;if(!unhex(p[2],nameBytes)){bad++;return nullptr;}
-  const std::string name(nameBytes.begin(),nameBytes.end());
-  if(p[1]=="P")return nmb_function_new(library,name.c_str());
-  std::vector<NmbConstant> constants;std::vector<std::string> names;std::vector<std::vector<uint8_t>> values;
-  if(p[3]!="-") {
-   const std::vector<std::string> items=splitOn(p[3],',');
-   names.reserve(items.size());values.reserve(items.size());
-   for(const std::string &item:items) {
-    const std::vector<std::string> f=splitOn(item,'.');
-    if(f.size()!=4){bad++;return nullptr;}
-    std::vector<uint8_t> n,v;if(!unhex(f[2],n) || !unhex(f[3],v)){bad++;return nullptr;}
-    names.emplace_back(n.begin(),n.end());values.push_back(v);
-    constants.push_back({strtoull(f[0].c_str(),nullptr,10),strtoull(f[1].c_str(),nullptr,10),nullptr,nullptr,(uint64_t)v.size()});
-   }
-   for(size_t i=0;i<constants.size();i++){constants[i].name=names[i].empty()?nullptr:names[i].c_str();constants[i].bytes=values[i].data();}
-  }
-  return nmb_function_new_specialized(library,name.c_str(),constants.data(),(uint32_t)constants.size());
- }
- // One record: -1 unreadable line (not tried), 0 made (into kept), 1 failed, 2 without its library.
- int make(const std::string &line,std::vector<NmbRenderPipeline *> &kept) {
-  const std::vector<std::string> t=splitOn(line,' ');
-  if(t.size()!=5 || t[0]!="P1"){bad++;return -1;}
-  int result;
-  bool missing=false;
-  NmbFunction *vertex=function(t[1],missing);
-  NmbFunction *fragment=t[2]=="-"?nullptr:function(t[2],missing);
-  std::vector<uint8_t> bytes;
-  NmbRenderPipelineDescriptor d={};
-  if(!vertex || (t[2]!="-" && !fragment) || !unhex(t[4],bytes) || bytes.size()>sizeof d) {
-   result=missing?2:1;
-  } else {
-   memcpy(&d,bytes.data(),bytes.size());d.vertex=vertex;d.fragment=fragment;
-   const NmbPipelineOptions options={strtoull(t[3].c_str(),nullptr,16),nullptr,0};
-   NmbRenderPipeline *state=nmb_render_pipeline_new_with_options(gDevice,&d,&options);
-   if(state){kept.push_back(state);result=0;}else result=1;
-  }
-  if(vertex)nmb_function_release(vertex);
-  if(fragment)nmb_function_release(fragment);
-  return result;
- }
-};
-static std::vector<NmbRenderPipeline *> gPrewarmKept;   // the prewarmed states, for the process's life
-// The prewarm itself (a utility-QoS GCD thread, from device creation).
-static void prewarmRun(std::vector<std::string> lines) {
- gPrewarmRunning=true;
- const uint64_t began=nowUs();
- const unsigned most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
- PrewarmMaker maker;
- unsigned made=0,failed=0,noLibrary=0,tried=0;
- NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
- for(const std::string &line:lines) {
-  if(tried>=most || (nowUs()-began)/1000>=budgetMs)break;
-  const int r=maker.make(line,gPrewarmKept);
-  if(r<0)continue;
-  tried++;
-  if(r==0)made++;else if(r==2)noLibrary++;else failed++;
- }
- const unsigned bad=maker.bad;
- const bool haveC1=haveC0 && nmb_device_shader_cache_stats(gDevice,&c1);
- char line[400];
- snprintf(line,sizeof line,"native-metal: prewarm: %u pipelines in %llu ms (%u records, %u tried, %u failed, %u without their library, %u unreadable)"
-  " | cache: spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu",made,(unsigned long long)((nowUs()-began)/1000),(unsigned)lines.size(),
-  tried,failed,noLibrary,bad,haveC1?(unsigned long long)(c1.hits-c0.hits):0ull,haveC1?(unsigned long long)(c1.misses-c0.misses):0ull,
-  haveC1?(unsigned long long)(c1.driver_loads-c0.driver_loads):0ull,haveC1?(unsigned long long)(c1.driver_saves-c0.driver_saves):0ull,
-  haveC1?(unsigned long long)(c1.driver_unchanged-c0.driver_unchanged):0ull);
- sm2_logs(line);
- gPrewarmRunning=false;
-}
-// G6 (SWEET_PREWARM=2): idle priming, after UniXNU AdrenoMetal f0c3177/PrimeShaders.h (waitForQuiet). Mode 1 makes every record 200 ms
-// after device creation, while the boot animation and the first SpringBoard frames draw. Mode 2 starts SWEET_PREWARM_DELAY_S (90) s
-// after device creation, on a background-QoS thread, and makes only the records CA has not made itself this boot (rechecked before
-// each one). Before each making it waits while backboardd committed more than SWEET_PREWARM_BUSY (8) command buffers in the last
-// 250 ms (an idle 60/90 Hz desktop commits fewer, any animation more), and after such a pause until SWEET_PREWARM_QUIET_MS (500) ms
-// were quiet. backboardd publishes its commit count in /var/local/mtl2-prime-busy (one page, only with mode 2) so SpringBoard pauses
-// for backboardd's work too (its own count where the page is missing). Each record CA itself makes this boot is marked used; mode 2
-// primes only the recorded pipelines not used this boot (CA's own makings already did the rest). SWEET_PREWARM_MAX bounds the makings, SWEET_PREWARM_MS the
-// making time (pauses not counted). "native-metal: PR prime: done/total, paused N, ms" when done.
-struct PrimeBusyPage {uint32_t magic,version;std::atomic<uint64_t> commits;};
-static const uint32_t kPrimeBusyMagic=0x53505242;   // 'SPRB'
-static PrimeBusyPage *gPrimeBusyOut;                // backboardd, mode 2: its commits, published
-// backboardd's commit count (gCommits: submitted command buffers), published at each completion (a few ms late, no hunk in commit).
-static inline void primeNoteCommit() {if(PrimeBusyPage *p=gPrimeBusyOut)p->commits.store(gCommits.load(std::memory_order_relaxed),std::memory_order_relaxed);}
-static PrimeBusyPage *primeBusyMap(bool write) {
- const int fd=open("/var/local/mtl2-prime-busy",write?O_RDWR|O_CREAT:O_RDONLY,0644);
- if(fd<0)return nullptr;
- if(write)fchmod(fd,0644);
- struct stat st;
- if(write?ftruncate(fd,4096)!=0:(fstat(fd,&st)!=0 || st.st_size<(off_t)sizeof(PrimeBusyPage))){close(fd);return nullptr;}
- void *page=mmap(nullptr,4096,write?PROT_READ|PROT_WRITE:PROT_READ,MAP_SHARED,fd,0);
- close(fd);
- if(page==MAP_FAILED)return nullptr;
- PrimeBusyPage *p=(PrimeBusyPage *)page;
- if(write){p->version=1;p->magic=kPrimeBusyMagic;}
- else if(p->magic!=kPrimeBusyMagic){munmap(page,4096);return nullptr;}
- return p;
-}
-// backboardd's commits so far (its page, or this process's own count without one).
-static uint64_t primeCommitCount() {
- static PrimeBusyPage *in;static uint64_t nextTryMs;
- if(gPrimeBusyOut)return gCommits.load(std::memory_order_relaxed);
- if(!in) {
-  const uint64_t ms=nowUs()/1000;
-  if(ms>=nextTryMs){in=primeBusyMap(false);nextTryMs=ms+5000;}
- }
- return in?in->commits.load(std::memory_order_relaxed):gCommits.load(std::memory_order_relaxed);
-}
-// backboardd's commits in the last 250 ms: samples every 50 ms while waiting; after a making (no sample in the last 250-500 ms) it takes
-// a fresh 250 ms window.
-struct PrimeGate {
- uint64_t ms[32],n[32];unsigned head=0,count=0;
- void sample() {ms[head]=nowUs()/1000;n[head]=primeCommitCount();head=(head+1)%32;if(count<32)count++;}
- unsigned recent() {
-  for(int round=0;round<2;round++) {
-   sample();
-   const unsigned newest=(head+31)%32;
-   for(unsigned k=1;k<count;k++) {
-    const unsigned i=(newest+32-k)%32;
-    const uint64_t span=ms[newest]-ms[i];
-    if(span<250)continue;
-    if(span>500)break;
-    const uint64_t d=n[newest]-n[i];return (unsigned)(d*250/span);
-   }
-   count=1;head=(newest+1)%32;   // keep only the newest sample
-   usleep(250000);
-  }
-  return 0;
- }
-};
-static void prewarmIdleRun(std::vector<std::string> lines) {
- const unsigned delayS=prewarmKnob("SWEET_PREWARM_DELAY_S",90),busyMax=prewarmKnob("SWEET_PREWARM_BUSY",8),
-  quietMs=prewarmKnob("SWEET_PREWARM_QUIET_MS",500),most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
- sleep(delayS);
- const uint64_t began=nowUs();
- std::vector<std::string> pending;
- {
-  std::lock_guard<std::mutex> lock(gPrewarmLock);
-  for(const std::string &line:lines)if(!gPrewarmUsed.count(line))pending.push_back(line);
- }
- sm2_logs([NSString stringWithFormat:@"native-metal: PR prime: start, %zu of %zu records not made this boot (busy > %u per 250 ms pauses)",
-  pending.size(),lines.size(),busyMax].UTF8String);
- PrewarmMaker maker;PrimeGate gate;
- unsigned made=0,failed=0,noLibrary=0,tried=0,usedMeanwhile=0,paused=0;
- uint64_t activeUs=0,pausedMs=0;
- NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
- for(const std::string &line:pending) {
-  if(tried>=most || activeUs/1000>=budgetMs)break;
-  // wait for a quiet display
-  bool wasBusy=false;uint64_t pauseBegan=0,quietSince=0;
-  for(;;) {
-   const uint64_t ms=nowUs()/1000;
-   if(gate.recent()>busyMax) {
-    if(!wasBusy){wasBusy=true;paused++;pauseBegan=ms;}
-    quietSince=0;usleep(50000);continue;
-   }
-   if(!wasBusy)break;
-   if(!quietSince)quietSince=ms;
-   if(ms-quietSince>=quietMs){pausedMs+=ms-pauseBegan;break;}
-   usleep(50000);
-  }
-  {std::lock_guard<std::mutex> lock(gPrewarmLock);if(gPrewarmUsed.count(line)){usedMeanwhile++;continue;}}
-  const uint64_t t0=nowUs();
-  gPrewarmRunning=true;
-  const int r=maker.make(line,gPrewarmKept);
-  gPrewarmRunning=false;
-  activeUs+=nowUs()-t0;
-  if(r<0)continue;
-  tried++;
-  if(r==0)made++;else if(r==2)noLibrary++;else failed++;
- }
- const bool haveC1=haveC0 && nmb_device_shader_cache_stats(gDevice,&c1);
- char line[480];
- snprintf(line,sizeof line,"native-metal: PR prime: %u/%zu, paused %u, %llu ms (paused %llu ms, wall %llu ms; %u failed, %u without their library,"
-  " %u unreadable, %u made by CA meanwhile) | cache: spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu",made,pending.size(),paused,
-  (unsigned long long)(activeUs/1000),(unsigned long long)pausedMs,(unsigned long long)((nowUs()-began)/1000),failed,noLibrary,maker.bad,usedMeanwhile,
-  haveC1?(unsigned long long)(c1.hits-c0.hits):0ull,haveC1?(unsigned long long)(c1.misses-c0.misses):0ull,
-  haveC1?(unsigned long long)(c1.driver_loads-c0.driver_loads):0ull,haveC1?(unsigned long long)(c1.driver_saves-c0.driver_saves):0ull,
-  haveC1?(unsigned long long)(c1.driver_unchanged-c0.driver_unchanged):0ull);
- sm2_logs(line);
-}
-static void *prewarmIdleThread(void *arg) {
- std::vector<std::string> *lines=(std::vector<std::string> *)arg;
- pthread_setname_np("sweet.prime");
- @autoreleasepool{prewarmIdleRun(*lines);}
- delete lines;
- return nullptr;
-}
-// At device creation: read the records (they also seed the "seen" set) and start the prewarm.
-static void prewarmStart(const char *cache) {
- if(!cache)return;
- gPrewarmDir=cache;
- if(!prewarmOn())return;
- std::vector<std::string> lines;
- if(FILE *f=fopen((gPrewarmDir+"/prewarm.v1").c_str(),"r")) {
-  std::string line;int c;
-  while((c=fgetc(f))!=EOF) {
-   if(c!='\n'){line+=(char)c;continue;}
-   if(!line.empty()){std::lock_guard<std::mutex> lock(gPrewarmLock);if(gPrewarmSeen.emplace(line,true).second)lines.push_back(line);}
-   line.clear();
-  }
-  fclose(f);
- }
- if(prewarmMode()==2) {   // G6: idle priming
-  if(!strcmp(getprogname(),"backboardd") && !gPrimeBusyOut)gPrimeBusyOut=primeBusyMap(true);
-  if(lines.empty()){sm2_logs("native-metal: PR prime: no records yet");return;}
-  sm2_logs([NSString stringWithFormat:@"native-metal: PR prime: %zu records, idle priming in %u s",lines.size(),prewarmKnob("SWEET_PREWARM_DELAY_S",90)].UTF8String);
-  pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
-  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_BACKGROUND,0);
-  pthread_t thread;auto *copy=new std::vector<std::string>(std::move(lines));
-  if(pthread_create(&thread,&attr,prewarmIdleThread,copy)!=0){delete copy;sm2_logs("native-metal: PR prime: no thread");}
-  pthread_attr_destroy(&attr);
-  return;
- }
- if(lines.empty()){sm2_logs("native-metal: prewarm: no records yet");return;}
- sm2_logs([NSString stringWithFormat:@"native-metal: prewarm: %zu records, starting",lines.size()].UTF8String);
- dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool{prewarmRun(lines);}});
-}
+#define B44R(r) [NSString stringWithFormat:@"region %lu,%lu,%lu %lux%lux%lu",(unsigned long)(r).origin.x,(unsigned long)(r).origin.y,(unsigned long)(r).origin.z,(unsigned long)(r).size.width,(unsigned long)(r).size.height,(unsigned long)(r).size.depth]
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 static void noteFormat(uint32_t format,bool made) {
@@ -719,6 +151,28 @@ static void journal(const std::string &line) {
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 
+// A selector this file lacks: reported once through the missing-selector hook (the same MISSING line) and answered as a no-op
+// returning nil/0, instead of the NSInvalidArgumentException that ended the GPU process (webgl wg3). respondsToSelector: still answers
+// NO, so a caller that asks first keeps its own fallback. Ported from UniXNU/AdrenoMetal 243d63c NativeBridgeMetalFrontend.mm:841-870,
+// 4054-4058 (MIT). SWEET_MISSING_ABORT=1: the old path (hook, then doesNotRecognizeSelector: aborts).
+static bool missingAbort() {static const bool on=[]{const char *p=getenv("SWEET_MISSING_ABORT");return p&&atoi(p)!=0;}();return on;}
+static NSMethodSignature *missingSignature(const char *cls,SEL selector) {
+ static std::mutex lock;static std::unordered_set<std::string> seen;
+ const std::string key=std::string(cls)+" "+sel_getName(selector);
+ {std::lock_guard<std::mutex> hold(lock);if(!seen.insert(key).second)return [NSMethodSignature signatureWithObjCTypes:"@@:"];}
+ if(gMissing)gMissing(cls,sel_getName(selector));
+ noteProblem([NSString stringWithFormat:@"missing %s (answered nil)",key.c_str()]);
+ return [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+// A protocol signature's void method takes no return value (setting one traps in NSInvocation); anything else is answered with
+// zeroes of its own size.
+static void answerMissing(NSInvocation *invocation) {
+ const NSUInteger length=invocation.methodSignature.methodReturnLength;
+ if(!length)return;
+ alignas(16) unsigned char zero[256]={};
+ if(length<=sizeof zero)[invocation setReturnValue:zero];
+}
+
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 @end
@@ -726,38 +180,15 @@ static void journal(const std::string &line) {
 - (id<MTLDevice>)device {return gDeviceObject;}
 // Metal SPI (Metal Performance Shaders asks every encoder and command buffer): an identity for its traces.
 - (uint64_t)globalTraceObjectID {return (uint64_t)(uintptr_t)self;}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ NSMethodSignature *signature=[super methodSignatureForSelector:selector];
+ return signature||missingAbort()?signature:missingSignature(class_getName(object_getClass(self)),selector);
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {answerMissing(invocation);}
 - (void)doesNotRecognizeSelector:(SEL)selector {
  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
  [super doesNotRecognizeSelector:selector];
-}
-// SweetMetal2 (C1): an object that conforms to one of Metal's protocols (MTLFunction, MTLSamplerState, ... added at device open) may be
-// sent any selector the protocol, or Metal's private twin of it (NAME + "SPI"), declares. One this file does not implement is answered
-// 0/nil with the protocol's type encoding, logged once (MISSING line), instead of raising in the render server; any other selector still
-// reaches doesNotRecognizeSelector: as before.
-static const char *declaredTypes(Class cls,SEL selector) {
- for(Class c=cls;c;c=class_getSuperclass(c)) {
-  unsigned count=0;Protocol *__unsafe_unretained *list=class_copyProtocolList(c,&count);
-  for(unsigned i=0;i<count;i++) {
-   Protocol *candidates[2]={list[i],objc_getProtocol([NSString stringWithFormat:@"%s%s",protocol_getName(list[i]),"SPI"].UTF8String)};
-   for(Protocol *p:candidates)for(int required=1;p && required>=0;required--) {
-    struct objc_method_description d=protocol_getMethodDescription(p,selector,required,YES);
-    if(d.types){free(list);return d.types;}
-   }
-  }
-  free(list);
- }
- return nullptr;
-}
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
- if(NSMethodSignature *own=[super methodSignatureForSelector:selector])return own;
- const char *types=declaredTypes(object_getClass(self),selector);
- return types?[NSMethodSignature signatureWithObjCTypes:types]:nil;
-}
-- (void)forwardInvocation:(NSInvocation *)invocation {
- if(gMissing)gMissing(class_getName(object_getClass(self)),[NSString stringWithFormat:@"%s (answered 0: declared by a Metal protocol)",sel_getName(invocation.selector)].UTF8String);
- const NSUInteger length=invocation.methodSignature.methodReturnLength;
- if(length){std::vector<uint8_t> zero(length,0);[invocation setReturnValue:zero.data()];}
 }
 @end
 
@@ -783,41 +214,19 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
 @end
-@interface NBTexture : NBObject {
-@public
- std::atomic<uint32_t> encReplaceEpoch;   // u-encthread: replaceRegion calls (a recorded setTexture's shadow seed is stale past one)
-}
+@interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
-@property(nonatomic) NSUInteger offset,rowBytes,plane;
-@property(nonatomic) uint64_t reportedFormat;   // non-zero: the format the client asked for (a converted copy's)
-@property(nonatomic) uint32_t surfaceSeed;      // a converted copy's: the surface's seed when it was filled
-@property(nonatomic) IOSurfaceRef ycbcrSource;   // a converted copy's surface (retained); not `surface`: the copy is no surface memory
-@property(nonatomic,strong) NSMutableArray *turns; // a converted copy's pictures (textures over buffers of their own, up to 3): the one
-                                                   // bound is borrowed from one of them, filled while the others may still be sampled
-@property(nonatomic) bool borrowedHandle;        // `handle` is a turn's: not released here
-@property(nonatomic,strong) NBTexture *readyTurn; // a converted copy's newest completed picture not bound yet
-@property(nonatomic) uint32_t readySeed,fillSeed; // its surface seed, and the seed of the fill under way
-@property(nonatomic) bool filling;               // a fill runs on the worker
-@property(nonatomic) const void *lastCommandBuffer; // the command buffer that last bound it (identity only)
-@property(nonatomic) NmbTexture *previousHandle; // the picture bound before the current one (its command buffer may not be committed)
-@property(nonatomic) bool ycbcrGPU;              // a two-plane YCbCr texture the runtime converts (its planes' generation set at use)
-@property(nonatomic) bool ycbcr709;              // a converted copy's matrix: BT.709 (else BT.601), read when it was made
+@property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
-@property(nonatomic) uint64_t rotationValue;      // SweetMetal2: a rotated framebuffer's rotation (1-4), 0 otherwise
-@property(nonatomic) bool framebufferOnlyValue;
-- (void)holdSurface:(IOSurfaceRef)surface;
+@property(nonatomic) IOSurfaceRef planarSurface;
+@property(nonatomic) uint32_t planarSeed;
 @end
-static void ycbcrRefresh(NBTexture *texture,id commandBuffer);
-static uint64_t linearAlignment();
-// C4: the device's linear pitch for `format` x `width` rounded up to linearAlignment() (64: Turnip's explicit-layout pitch).
-static uint64_t sweetLinearRow(uint64_t format,uint64_t width);
-static void surfaceHold(IOSurfaceRef surface);
-static void surfaceDrop(IOSurfaceRef surface);
+static void planarFill(NBTexture *t);
 @implementation NBBuffer
 - (void)dealloc {
  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
@@ -833,7 +242,6 @@ static void surfaceDrop(IOSurfaceRef surface);
 - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
 - (void)didModifyRange:(NSRange)range {(void)range;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
- if(state!=MTLPurgeableStateKeepCurrent && encThreadOn())encFlush(EF_PURGEABLE);   // u-encthread: recorded uses replayed first
  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
@@ -873,45 +281,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
-// Core Animation's extended-range "deep" layers (b3a8 surfaces: BGRA plane + A8 plane) are asked for as
-// MTLPixelFormatRGB10A8_2P_XR10(_sRGB), 550/551, which Turnip has no format for: Camera.app's preview area
-// (1125x1500) and some of its controls failed ("Failed to allocate [1125 x 1500] b3a8 framebuffer"). They are made
-// BGRA8Unorm(_sRGB) over the BGRA plane, the same in every texture, view and pipeline, so the only loss is the range
-// beyond 0..1 and the separate alpha plane.
-// (C2 note: what is lost is the range above 1.0 and the A8 plane's alpha, which reads 1. metal2vulkan 720ef1ce can hold 550/551 over
-// a b3a8 surface's two planes itself (texture/surface_two_planes.rs: an R32G32_UINT image and a shadow of both planes) given the
-// surface's facts, which nmb_texture_new_on_surface now passes; not used: every such layer would be copied in and out per pass, and
-// backboardd's framebuffer stays 8-bit (supportsExtendedXR10Formats answers no there).)
-static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
-// SweetMetal2: the descriptor's SPI rotation (0-4) and framebufferOnly (iOS 16's MTLTextureDescriptor has both getters), 0/NO where absent.
-static uint64_t descriptorRotation(MTLTextureDescriptor *d) {
- static SEL sel=sel_registerName("rotation");
- if(!d || ![d respondsToSelector:sel])return 0;
- return (uint64_t)((NSUInteger(*)(id,SEL))objc_msgSend)(d,sel);
-}
-static bool descriptorFramebufferOnly(MTLTextureDescriptor *d) {
- static SEL sel=sel_registerName("framebufferOnly");
- if(!d || ![d respondsToSelector:sel])return false;
- return ((BOOL(*)(id,SEL))objc_msgSend)(d,sel);
-}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
- *out={(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
  return true;
 }
 @implementation NBTexture
-- (void)dealloc {
- if(!_borrowedHandle)nmb_texture_release(_handle);
- if(_surface){surfaceDrop(_surface);CFRelease(_surface);}
- if(_ycbcrSource)CFRelease(_ycbcrSource);
-}
-// The surface whose memory this texture is (retained; its cache state is kept while any texture holds it: flushSurfaces).
-- (void)holdSurface:(IOSurfaceRef)surface {
- if(!surface || _surface)return;
- _surface=(IOSurfaceRef)CFRetain(surface);surfaceHold(_surface);
-}
+- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);if(_planarSurface)CFRelease(_planarSurface);}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
-- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_reportedFormat?_reportedFormat:_descriptor.format);}
+- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
 - (NSUInteger)width {return _descriptor.width;}
 - (NSUInteger)height {return _descriptor.height;}
 - (NSUInteger)depth {return _descriptor.depth;}
@@ -922,177 +300,110 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
-- (BOOL)isFramebufferOnly {return _framebufferOnlyValue;}
-- (IOSurfaceRef)iosurface {return _surface?_surface:_ycbcrSource;}
-- (NSUInteger)iosurfacePlane {return _plane;}
-- (id<MTLBuffer>)buffer {return _surface || _reportedFormat?nil:(id<MTLBuffer>)_buffer;}
+- (BOOL)isFramebufferOnly {return NO;}
+- (IOSurfaceRef)iosurface {return _surface;}
+- (NSUInteger)iosurfacePlane {return 0;}
+- (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
-- (NSUInteger)rotation {return (NSUInteger)_rotationValue;}
+- (NSUInteger)rotation {return 0;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
- if(state!=MTLPurgeableStateKeepCurrent && encThreadOn())encFlush(EF_PURGEABLE);   // u-encthread: recorded uses replayed first
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
 }
 NB_RESOURCE_SPI
-- (id<MTLTexture>)view:(NmbTexture *)handle {ENC_SCOPE(EC_TEX,"newTextureView");
+- (id<MTLTexture>)view:(NmbTexture *)handle {
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+ if(b44On())b44Tex("view",(id<MTLTexture>)view,_rowBytes,[NSString stringWithFormat:@"parent fmt %lu %lux%lu surface %d",(unsigned long)self.pixelFormat,(unsigned long)self.width,(unsigned long)self.height,_surface!=nullptr]);
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- [view holdSurface:_surface];view.ycbcrGPU=_ycbcrGPU;
+ if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
  return (id<MTLTexture>)view;
 }
-// A view of a GPU-converted YCbCr texture in another format (CA's 501 view of a 500 texture: Metal's sRGB twin, which reads the
-// colour linearised) is refused as it was for the CPU copy, whose RGBA8 texture has no such view: on r19a the preview drawn through
-// the runtime's sRGB twin came out washed out, through the plain texture (the CPU copy's case) right. /var/local/mtl2-env
-// SWEET_YCBCR_VIEWS=1 makes them.
-- (bool)refusesView:(MTLPixelFormat)format {
- if(!_ycbcrGPU || (uint64_t)format==_descriptor.format)return false;
- static int allow=-1;if(allow<0){const char *e=getenv("SWEET_YCBCR_VIEWS");allow=e && *e=='1';}
- if(allow)return false;
- static std::atomic<bool> logged{false};
- if(!logged.exchange(true))NBLOG(@"native-metal: view of a YCbCr texture (%llu) as %lu refused (SWEET_YCBCR_VIEWS=1 makes it)",
-                                 (unsigned long long)_descriptor.format,(unsigned long)format);
- return true;
-}
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
- if([self refusesView:format])return nil;
- return [self view:nmb_texture_new_view(_handle,sweetFormat(format),0,nullptr,nullptr,true)];
+ return [self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
- if([self refusesView:format])return nil;
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
- return [self view:nmb_texture_new_view(_handle,sweetFormat(format),type,l,s,false)];
+ return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
 }
-- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {ENC_SCOPE(EC_UPLOAD,"replaceRegion");if(encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"%lux%lu of %lux%lu fmt %lu",(unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)self.width,(unsigned long)self.height,(unsigned long)self.pixelFormat);
- if(encThreadOn()) {   // u-encthread: a recorded bind of this texture not replayed yet must not take the old shadow seed
-  encReplaceEpoch.fetch_add(1);
-  static const bool flushFirst=[]{const char *e=getenv("SWEET_ENCTHREAD_REPLACE");return e && *e=='1';}();
-  const int64_t live=gLiveEncReplace.load(std::memory_order_relaxed);   // u-combo: live knob
-  if(live>=0?live==1:flushFirst)encFlush(EF_REPLACE);
- }
+// ANGLE asks for swizzled views (WebGL's luminance/alpha formats, GL texture swizzle). Ported from UniXNU/AdrenoMetal 243d63c
+// NativeBridgeMetalFrontend.mm:1116-1118,1191-1195 (MIT). Bit 32 marks an explicit swizzle (the bridge's packing).
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
+ const uint64_t l[2]={levels.location,levels.length},r[2]={slices.location,slices.length};
+ const uint64_t packed=(1ull<<32)|(uint64_t)swizzle.red|((uint64_t)swizzle.green<<8)|((uint64_t)swizzle.blue<<16)|((uint64_t)swizzle.alpha<<24);
+ return [self view:nmb_texture_new_view_swizzle(_handle,format,type,l,r,packed)];
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+ if(b44On())b44Tex("replaceRegion",(id<MTLTexture>)self,row,[NSString stringWithFormat:@"%@ level %lu slice %lu image %lu surface %d buffer %d",B44R(r),(unsigned long)level,(unsigned long)slice,(unsigned long)image,_surface!=nullptr,_buffer!=nil]);
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
- if(shadowSeedOn() && self.surface)nmb_texture_set_bytes_generation(_handle,0);   // u-f: bytes changed with no seed
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
 }
-- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {ENC_SCOPE(EC_UPLOAD,"getBytes");
- if(encThreadOn())encFlush(EF_GETBYTES);   // u-encthread: what was committed is in the bridge before the CPU reads
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+ if(b44On())b44Tex("getBytes",(id<MTLTexture>)self,row,[NSString stringWithFormat:@"%@ level %lu slice %lu image %lu",B44R(r),(unsigned long)level,(unsigned long)slice,(unsigned long)image]);
  if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level {
  [self getBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height fromRegion:r mipmapLevel:level slice:0];
 }
 @end
-// SweetMetal2 (C3): the A620 does not snoop the CPU's caches, so an IOSurface the GPU uses is cleaned (dc civac) before its
-// command buffer runs and, where the GPU wrote it, cleaned and invalidated again once it completed. Before, every surface of
-// every command buffer was flushed twice (the 11 MB CA frame and each camera picture included). Now:
-// - at commit a surface is cleaned only if its seed (IOSurface's, moved on by every write unlock: the CPU wrote it) differs from
-//   the seed at this process's last clean of it, or it was never cleaned here;
-// - at completion only the surfaces the command buffer wrote (attachments, blit destinations, shader-writable textures) are
-//   flushed, and their seed recorded.
-// A CPU writer that writes without a lock is not seen: /var/local/mtl2-env SWEET_FLUSH=all restores the old flushes.
-// The state lives while a texture holds the surface (surfaceHold/surfaceDrop), keyed by the IOSurfaceRef it retains.
-struct SurfaceState {uint32_t seed=0;bool known=false;uint32_t refs=0;};
-static std::mutex gSurfaceStateLock;
-static std::unordered_map<const void *,SurfaceState> gSurfaceStates;
-static std::atomic<uint64_t> gSurfaceCleanSkips,gSurfaceInvalidates;
-static bool flushAll() {
- static int all=-1;
- if(all<0){const char *e=getenv("SWEET_FLUSH");all=e && !strcmp(e,"all");}
- return all>0;
+// sweet surf flush (SWEET_SURF_FLUSH, bits; unset 3 = both, today's behaviour; 0 neither): 1 = clean+invalidate at commit, 2 = at completion.
+// The A640 doesn't snoop. Commit (1) is the one correctness needs: it writes back CPU-dirty lines (the kernel's bzero at create, SweetSurface.cpp:992,
+// cacheable map :994; any CPU writer through IOSurfaceLock) before the GPU renders, else they land later over its pixels (and the kernel present's
+// clean_dcache64, sweet_gpu.c:1125, would push them out too). Completion (2) only drops stale CPU lines for CPU readers: the kernel's CPU-copy present
+// fallback (SweetFramebuffer.cpp:1257, cacheable getBytesNoCopy, no maintenance; only when the GPU present is off or fails) and user-space readers
+// (snapshots, IOSurfaceLock). The GPU present (default) reads DRAM by the GPU; flame-shot reads the panel carveout, not these surfaces.
+static int surfFlushMode() {
+ static const int mode=[]{const char *p=getenv("SWEET_SURF_FLUSH");const int m=p&&*p?(atoi(p)&3):3;
+  char t[64];snprintf(t,sizeof t,"SWEET SURF FLUSH: mode %d (1 commit, 2 completion)",m);sm2_logs(t);return m;}();
+ return mode;
 }
-static void surfaceHold(IOSurfaceRef surface) {std::lock_guard<std::mutex> l(gSurfaceStateLock);gSurfaceStates[surface].refs++;}
-static void surfaceDrop(IOSurfaceRef surface) {
- std::lock_guard<std::mutex> l(gSurfaceStateLock);
- auto it=gSurfaceStates.find(surface);
- if(it!=gSurfaceStates.end() && --it->second.refs==0)gSurfaceStates.erase(it);
-}
-// completion: false at commit (clean what the CPU wrote since), true at completion (flush what the GPU wrote: `surfaces` holds those).
-// u-f (r36): SWEET_SHADOW_SEED=1 (off by default). The runtime skips a surface texture's shadow copy in while its image holds the
-// bytes of the seed the texture is bound at (bridge patch 0107): setTexture gives it the seed + 1, replaceRegion 0. As the GPU's
-// writes of surfaces complete, their seeds are moved on (a lock/unlock pair), so another process's shadow of them copies in again; the
-// clean-flush state takes the new seed (the bytes were just invalidated).
-static void bumpWrittenSeeds(NSSet *surfaces);
-static void flushSurfaces(NSSet *surfaces,bool completion) {
+// A command can use many independent imports/views of one IOSurface. Their
+// owners keep the mapping live through this phase. Maintain each exact CPU
+// range once; no address identity or decision is carried into another phase
+// or command, and distinct/partially overlapping ranges retain their calls.
+static void flushSurfaces(NSMutableSet *surfaces,int bit) {
  if(!surfaces.count)return;
- const bool all=flushAll();
- std::vector<IOSurfaceRef> distinct;
- distinct.reserve(surfaces.count);
- std::vector<IOSurfaceRef> rotated;   // rotfb4: surfaces under a rotated texture, whose CPU writes the runtime must copy in again
- for(NBTexture *texture in surfaces)if(texture.surface){distinct.push_back(texture.surface);if(texture.rotationValue)rotated.push_back(texture.surface);}
- std::sort(distinct.begin(),distinct.end());
- const auto last=std::unique(distinct.begin(),distinct.end());
- gSurfaceFlushDuplicates+=(uint64_t)(distinct.end()-last);
- for(auto it=distinct.begin();it!=last;++it) {
-  IOSurfaceRef surface=*it;
-  const uint32_t seed=IOSurfaceGetSeed(surface);   // read before the flush: a write after it moves the seed on again
-  if(!completion && !all) {
-   std::lock_guard<std::mutex> l(gSurfaceStateLock);
-   auto state=gSurfaceStates.find(surface);
-   if(state!=gSurfaceStates.end() && state->second.known && state->second.seed==seed){gSurfaceCleanSkips++;continue;}
-  }
-  if(!completion && std::find(rotated.begin(),rotated.end(),surface)!=rotated.end())nmb_rotated_planes_written();
-  const uint64_t began=nowUs();const size_t bytes=IOSurfaceGetAllocSize(surface);
-  sys_dcache_flush(IOSurfaceGetBaseAddress(surface),bytes);
-  gSurfaceFlushBytes+=bytes;gTimeSurfaceFlush.add(began);
-  if(completion)gSurfaceInvalidates++;
-  std::lock_guard<std::mutex> l(gSurfaceStateLock);
-  auto state=gSurfaceStates.find(surface);
-  if(state!=gSurfaceStates.end()){state->second.seed=seed;state->second.known=true;}
+ if(!(surfFlushMode()&bit)){gSurfaceFlushSkipped+=surfaces.count;return;}   // sweet surf flush: off for this phase
+ std::vector<std::pair<uintptr_t,size_t>> ranges;
+ ranges.reserve(surfaces.count);
+ for(NBTexture *texture in surfaces)if(texture.surface)
+  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
+ std::sort(ranges.begin(),ranges.end());
+ const auto last=std::unique(ranges.begin(),ranges.end());
+ gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
+ for(auto it=ranges.begin();it!=last;++it) {
+  const uint64_t began=nowUs();
+  sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
+  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
  }
-}
-static void bumpWrittenSeeds(NSSet *surfaces) {
- if(!surfaces.count)return;
- std::vector<IOSurfaceRef> distinct;
- for(NBTexture *texture in surfaces)if(texture.surface)distinct.push_back(texture.surface);
- std::sort(distinct.begin(),distinct.end());
- distinct.erase(std::unique(distinct.begin(),distinct.end()),distinct.end());
- for(IOSurfaceRef surface:distinct) {
-  uint32_t seed=0;
-  if(IOSurfaceLock(surface,0,&seed)!=0)continue;
-  IOSurfaceUnlock(surface,0,&seed);
-  seed=IOSurfaceGetSeed(surface);
-  std::lock_guard<std::mutex> l(gSurfaceStateLock);
-  auto state=gSurfaceStates.find(surface);
-  if(state!=gSurfaceStates.end() && state->second.known)state->second.seed=seed;
- }
-}
-// Whether a texture bound to a shader may be written by it (a storage texture): such a surface is flushed at completion too.
-static bool shaderWritable(NBTexture *texture) {return (texture.descriptor.usage&MTLTextureUsageShaderWrite)!=0;}
-// C4: a texture over memory (a buffer, a surface) whose rows are not 64-byte multiples is one Turnip refuses as an explicit layout
-// (the runtime then keeps an image of its own and copies): the first 24 kinds (format, row mod 64, what) are logged, so the makers
-// left can be found.
-static void noteUnalignedRow(uint64_t format,uint64_t width,uint64_t row,const char *what) {
- if(!(row%64))return;
- static std::mutex lock;static std::vector<uint64_t> seen;
- const uint64_t key=(format<<16)^((row%64)<<8)^(uint64_t)what[0];
- {std::lock_guard<std::mutex> l(lock);if(seen.size()>=24 || std::find(seen.begin(),seen.end(),key)!=seen.end())return;seen.push_back(key);}
- sm2_logs([NSString stringWithFormat:@"native-metal: %s texture fmt %llu width %llu over rows of %llu bytes (not 64-byte multiples: Turnip copies it)",
-           what,(unsigned long long)format,(unsigned long long)width,(unsigned long long)row].UTF8String);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
- if(d.textureType!=MTLTextureTypeTextureBuffer)noteUnalignedRow(descriptor.format,descriptor.width,row,surface?"surface":"buffer");
  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
+static uint64_t sweetTexelBytes(MTLPixelFormat f);
 @implementation NBBuffer (Textures)
-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {ENC_SCOPE(EC_TEX,"newTexture(buffer)");
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
+ // 0107 (B29, diagnostic): 1-byte texels or rows not 64-byte aligned, the layouts Turnip refuses. Off: M2V_B29_LOG=0.
+ if(sweetTexelBytes(d.pixelFormat)==1 || row%64)B29LOG(@"B29 bufferTexture %lux%lu fmt %lu usage %lu storage %lu offset %lu row %lu len %lu",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long)d.storageMode,(unsigned long)offset,(unsigned long)row,(unsigned long)self.length);
+ if(b44On())b44Desc("bufferTexture",d,row,[NSString stringWithFormat:@"offset %lu len %lu",(unsigned long)offset,(unsigned long)self.length]);
  return (id<MTLTexture>)textureOnBuffer(self,d,offset,row,false);
 }
-- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {ENC_SCOPE(EC_TEX,"newTexture(linear)");
+- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
- noteUnalignedRow(descriptor.format,descriptor.width,row,"linear");
+ if(b44On())b44Desc("linearTexture",d,row,[NSString stringWithFormat:@"offset %lu image %lu len %lu",(unsigned long)offset,(unsigned long)image,(unsigned long)self.length]);
  NmbTexture *handle=nmb_texture_new_linear(self.handle,&descriptor,offset,row,image);
  if(!handle){NBLOG(@"native-metal: linear texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -1103,38 +414,16 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 // ---- libraries, functions, states ----
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
-@property(nonatomic) std::string prewarmDigest;   // u-e: its bytes' digest (prewarm records), "" where prewarm is off
 @end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
-@property(nonatomic) std::string prewarmKey;      // u-e: library digest, name and constants (prewarm records), "" where prewarm is off
 @end
-// SweetMetal2 (C1): iOS 16.7 Metal checks a pipeline descriptor's functions against the MTLFunction protocol and NSLogs
-// "vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction." on a miss (r18g: 450 lines from backboardd,
-// one per function of each pipeline Core Animation made). NBFunction now conforms (native_bridge_metal_open adds the protocol, as
-// for MTLTextureImplementation) and answers the whole public protocol: no reflection is offered (no vertex/stage-input attributes,
-// no function constants named), which is what a Metal function built without reflection answers. Any other selector Metal's own
-// function protocols declare is answered 0/nil (logged once each) rather than raising, so a validation path that the conformance
-// newly opens cannot take backboardd down.
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
-- (MTLPatchType)patchType {return MTLPatchTypeNone;}
-- (NSInteger)patchControlPointCount {return 0;}
-- (NSArray *)vertexAttributes {return @[];}
-- (NSArray *)stageInputAttributes {return @[];}
-- (NSDictionary *)functionConstantsDictionary {return @{};}
-- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
- if(gMissing)gMissing("NBFunction","newArgumentEncoderWithBufferIndex: (argument buffers)");
- (void)index;return nil;
-}
-- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index reflection:(MTLAutoreleasedArgument *)reflection {
- if(reflection)*reflection=nil;
- return [self newArgumentEncoderWithBufferIndex:index];
-}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -1177,7 +466,7 @@ static uint64_t constantBytes(uint64_t type) {
 static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
-- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newFunction(constants)");if(encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"%s",name.UTF8String?:"?");
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
   NBLOG(@"native-metal: %@: unqualified function constant values (%s)",name,values?object_getClassName(values):"nil");
   if(error)*error=nbError(@"unqualified function constant values");return nil;
@@ -1217,12 +506,18 @@ static std::string quartzCoreCallers();
   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.constantsText=text;function.prewarmKey=prewarmFunctionKey(self.prewarmDigest,name,constants.data(),constants.size(),true);
- if(error)*error=nil;return (id<MTLFunction>)function;
+ function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
  handler(function,error);
+}
+// 0111 (B24): Maps asks with a pipeline library; there is none here, so it is ignored.
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)library error:(NSError **)error {
+ (void)library;return [self newFunctionWithName:name constantValues:values error:error];
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];handler(function,error);
 }
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
@@ -1241,12 +536,11 @@ static std::string quartzCoreCallers();
  }
  return names;
 }
-- (id<MTLFunction>)newFunctionWithName:(NSString *)name {ENC_SCOPE(EC_PIPE,"newFunction");if(encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"%s",name.UTF8String?:"?");
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.prewarmKey=prewarmFunctionKey(self.prewarmDigest,name,nullptr,0,false);
  return (id<MTLFunction>)function;
 }
 @end
@@ -1258,14 +552,22 @@ static std::string quartzCoreCallers();
 - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
 - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
 @end
-@interface NBRenderPipeline : NBObject {
-@public
- char encNames[80];   // u-e: its vertex + fragment function names, for "E slow" draws
- // ovd (SWEET_DRAWBOX): colour attachment 0's blend and mask, the label's tail, attribute 0 (format, offset, buffer, stride)
- char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride,dbCFmt,dbCOff;   // + the first 4-wide colour-like attribute after 0 (half4/float4/uchar4n)
- uint8_t dfMasks[8],dfSamples;bool dfA2C;   // g10: every colour's write mask (0 where no format), raster sample count, alpha to coverage
-}
+@interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
+@property(nonatomic) std::string vertexName,fragmentName;   // sweet drawlog: what a draw's pipeline was (only filled when SWEET_DRAWLOG is set)
+@property(nonatomic) std::string dlState;   // sweet drawlog: blend factors of target 0 and the CA fragment's destination-read constants
+@property(nonatomic) BOOL blend;
+@property(nonatomic) NSUInteger writeMask;
+@property(nonatomic) unsigned opaqueMask,writtenMask;   // sweet cull: colour attachments written with blending off and a full write mask
+@property(nonatomic) NSUInteger vstride;   // sweet cull: stride of vertex layout 1 (0: no vertex descriptor)
+@property(nonatomic) BOOL vpos0;           // sweet cull: vertex descriptor has a float4 attribute at offset 0 of buffer 1
+// sweet deadfill: attribute 0 (format, offset, buffer, its layout's stride), the first 4-wide colour attribute of the same buffer, raster samples, alpha to coverage
+@property(nonatomic) unsigned dfPosFmt,dfPosOff,dfPosBuf,dfStride,dfColFmt,dfColOff,dfSamples;
+@property(nonatomic) BOOL dfA2C;
+@property(nonatomic) BOOL dfNoDest;   // sweet cull 2: its fragment function's constants say it reads no destination (only set under SWEET_CULL=2)
+@property(nonatomic) BOOL m0;   // sweet mask0: writes no colour attachment, rasterizes, and is one of CA's known shader pairs (only set under SWEET_CULL_MASK0=1)
+@property(nonatomic) unsigned daRead;   // sweet deadatt: colour attachments a draw with it may read (0xff unless set under SWEET_CULL_DEADATT)
+@property(nonatomic) BOOL daKnown;      // sweet deadatt: CA's label and a known shader pair, may be dropped
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -1277,10 +579,44 @@ static std::string quartzCoreCallers();
 @end
 @interface NBSampler : NBObject
 @property(nonatomic) NmbSampler *handle;
+@property(nonatomic) NmbSamplerDescriptor descriptor;   // what made it, for a binding that replaces its LOD clamps
 @end
-@implementation NBSampler
+// sweet resolve: an attachment's resolve texture (ANGLE's MSAA WebGL framebuffers resolve colour and depth at endEncoding: its
+// finalizeLoadStoreAction sets Store -> StoreAndMultisampleResolve where a resolveTexture is set) goes to the runtime, which refused the
+// resolving store action without it ("ResolveWithoutTexture(Depth)": every antialiased WebGL context lost). Ported from UniXNU/AdrenoMetal
+// 243d63c NativeBridgeMetalFrontend.mm:2987-3007 (MIT; its single-sample mode left out). A resolving store action with no resolve texture
+// is what Apple's driver tolerates: StoreAndMultisampleResolve -> Store, MultisampleResolve -> DontCare. SWEET_RESOLVE_FIX=0: neither, as
+// before.
+static bool resolveFixOn() {static const bool on=[]{const char *p=getenv("SWEET_RESOLVE_FIX");return !p||!*p||atoi(p)!=0;}();return on;}
+static void resolveFixNote(unsigned kind,bool store) {   // kind: colour 0..7, 8 depth, 9 stencil; once per process each
+ static std::atomic<uint32_t> said{0};
+ if(said.fetch_or(1u<<kind)&(1u<<kind))return;
+ NSString *what=kind==8?@"depth":kind==9?@"stencil":[NSString stringWithFormat:@"color %u",kind];
+ NBLOG(@"SWEET MTL: %@ resolve without texture -> %s (as Apple's driver)",what,store?"store":"dontcare");
+}
+// A binding's lodMinClamp:lodMaxClamp: (ANGLE binds every sampler so, for GL's TEXTURE_MIN_LOD/MAX_LOD and base level) is this sampler with
+// its clamps replaced: made once per pair and kept, at most 64 pairs (a caller that varies them every draw starts over rather than growing
+// without bound). Ported from UniXNU/AdrenoMetal 243d63c NativeBridgeMetalFrontend.mm:1650-1671 (MIT). SWEET_LODCLAMP=0: the clamps are
+// dropped (the sampler's own apply), as before.
+static bool lodClampOn() {static const bool on=[]{const char *p=getenv("SWEET_LODCLAMP");return !p||!*p||atoi(p)!=0;}();return on;}
+@implementation NBSampler {
+ NSMutableDictionary<NSString *,NBSampler *> *_clamped;
+}
 - (void)dealloc {nmb_sampler_release(_handle);}
 - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
+- (NBSampler *)withLodMin:(float)lodMin max:(float)lodMax {
+ if(!lodClampOn() || (lodMin==_descriptor.lod_min && lodMax==_descriptor.lod_max))return self;
+ NSString *key=[NSString stringWithFormat:@"%a %a",lodMin,lodMax];
+ @synchronized(self) {
+  if(!_clamped || _clamped.count>=64)_clamped=[NSMutableDictionary dictionary];
+  if(NBSampler *found=_clamped[key])return found;
+  NmbSamplerDescriptor d=_descriptor;d.lod_min=lodMin;d.lod_max=lodMax;
+  NmbSampler *handle=nmb_sampler_new(gDevice,&d);
+  if(!handle){NBLOG(@"native-metal: sampler with LOD clamps refused: %@",lastError());return nil;}
+  NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=d;_clamped[key]=sampler;
+  return sampler;
+ }
+}
 @end
 @interface NBDepthStencil : NBObject
 @property(nonatomic) NmbDepthStencil *handle;
@@ -1336,22 +672,41 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
+// sweet ctl (SWEET_CTL=/path): per command buffer mach_absolute_time stamps of the commit -> completion chain, to split the
+// GPU end -> SwapEnd gap. Off (one cached getenv) unless set. Line: "CTL pid idx C D F0 F1 Q H" (hex mach ticks).
+static const char *ctlPath(){
+ static const char *path=[]{const char *p=getenv("SWEET_CTL");return p&&*p?p:(const char *)nullptr;}();
+ return path;
+}
+struct CtlRec{uint32_t idx;uint64_t c,d,f0,f1,q,h;};
+static CtlRec gCtlBuf[512];
+static int gCtlN=0;
+static uint64_t gCtlLastFlush=0;
+static std::mutex gCtlLock;
+static void ctlFlushLocked(){
+ if(!gCtlN)return;
+ std::string out;char line[160];const int pid=(int)getpid();
+ for(int i=0;i<gCtlN;i++){
+  const CtlRec &r=gCtlBuf[i];
+  int n=snprintf(line,sizeof line,"CTL %d %x %llx %llx %llx %llx %llx %llx\n",pid,r.idx,(unsigned long long)r.c,(unsigned long long)r.d,
+   (unsigned long long)r.f0,(unsigned long long)r.f1,(unsigned long long)r.q,(unsigned long long)r.h);
+  out.append(line,n);
+ }
+ gCtlN=0;
+ int fd=open(ctlPath(),O_WRONLY|O_CREAT|O_APPEND,0666);
+ if(fd>=0){(void)!write(fd,out.data(),out.size());close(fd);}
+}
+static void ctlPush(const CtlRec &r){
+ std::lock_guard<std::mutex> lock(gCtlLock);
+ gCtlBuf[gCtlN++]=r;
+ const uint64_t now=mach_absolute_time();
+ if(gCtlN==512||now-gCtlLastFlush>2*19200000ull){gCtlLastFlush=now;ctlFlushLocked();}
+}
 @interface NBCommandBuffer : NBObject {
 @public
+ uint64_t ctlC,ctlD,ctlF0,ctlF1,ctlQ;   // sweet ctl stamps
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
- // u-t frame timeline (SWEET_TIMELINE, backboardd): CLOCK_MONOTONIC_RAW ns, the runtime's host clock (its GPU and kernel times)
- uint64_t tlCreated,tlFirstEncoder,tlCommit,tlNotice;
- uint32_t tlSurface;   // the frame's framebuffer IOSurface ID (CA's swap chain: how many it cycles through)
- // u-e: the encoding thread's counts at the first encoder (EncScope), its CPU time, CPU, and the runtime's VkPipeline makings then
- EncTLS encStart;uint64_t encCpuStart,encThread,encVkStart[2];int8_t encCpu0;EncFrame encFrame;
- bool tlFrame,tlWaitedCompleted,tlWaitedScheduled;
- uint32_t dbFrame,dbPasses;   // ovd: SWEET_DRAWBOX frame number (0: not logged), passes so far
- // u-encthread: recorded for the worker (SWEET_ENCTHREAD, fixed at creation); the commit was replayed (the bridge has it);
- // and returned (waits may use the bridge's); the recorded encoder not ended yet (kept alive by its recorded creation until its
- // end or discard is replayed)
- bool encDeferred;std::atomic<bool> encCommitStarted,encCommitDone;__unsafe_unretained id encOpen;
- uint64_t encCommitTick;   // g4: the caller's commit (mach ticks), for the submit-lag telemetry
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1359,10 +714,8 @@ static void notified(void *context,uint64_t value) {
 @property(atomic) BOOL committed,failedLocally;
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
-@property(nonatomic) BOOL rotatedFrame;   // rotfb4: a pass of it renders a rotated (landscape framebuffer) texture
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
-@property(nonatomic,strong) NSMutableSet *surfaces;          // every surface texture it uses (cleaned at commit if the CPU wrote it)
-@property(nonatomic,strong) NSMutableSet *writtenSurfaces;   // those the GPU may write (flushed at completion)
+@property(nonatomic,strong) NSMutableSet *surfaces;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -1370,348 +723,12 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
-- (void)commitSubmit;
 @end
-
-// ---- u-encthread: the encode thread (SWEET_ENCTHREAD) ----
-// prof (Settings flings): the bridge's draw path (frontend -> metal2vulkan -> Turnip record) is ~46% of CA's display thread, ~70-80 us
-// a draw, and it runs inline between CA's own work, so a frame's first GPU submit waits for both. With SWEET_ENCTHREAD=1 (backboardd;
-// 2: every process) the render and blit encoders' calls, encoder creation/end, encoded events and commit are recorded by the frontend
-// (validation, resource ownership, counters and CA-visible state at the call, as before) into a compact command list, with small
-// inline data (setBytes, the pass descriptor, blit regions) copied, and replayed into the bridge in call order by one worker thread
-// ("sweet.encthread", user-interactive QoS), which starts while CA still records. Every bridge call on a recorded command buffer or
-// its encoders happens on the worker. Ownership: buffers and textures a command names are the command buffer's resourceOwners (as
-// today, released at completion); pipeline, sampler, depth/stencil, fence and event objects are retained by their command; an encoder
-// is retained by its recorded creation until its end (or discard) is replayed; an event or commit command retains its command buffer.
-// Waits (must-flush, the worker catches up with everything recorded so far first): waitUntilScheduled / waitUntilCompleted /
-// commitAndWaitUntilSubmitted of a command buffer whose commit is not replayed yet, a resource's waitUntilComplete, getBytes,
-// setPurgeableState (not KeepCurrent), a compute encoder on a recorded command buffer (compute stays inline, after the flush),
-// SWEET_ENCTHREAD_REPLACE=1 replaceRegion, and over 32768 commands queued (backpressure). Synchronous as before (no flush): every
-// creation, query and CPU-visible answer (contents, pixel formats, sizes), replaceRegion (its bytes are written now, as Metal does;
-// a bind recorded before it re-copies its surface's shadow), shared event CPU calls. status/error/GPU times answer Committed/none
-// until the commit is replayed. A refusal at replay fails the command buffer as before (logged, completed with an error).
-// "native-metal: T enc-thread 5s:" (with the timeline) counts it. SWEET_ENCTHREAD_SPIN_US (50): the worker's spin before it sleeps;
-// SWEET_ENCTHREAD_PRI (54, CA's display thread's; 0 = user-interactive QoS only): its fixed RR priority.
-// SWEET_ENCTHREAD=3 (g4, backboardd): the same, handed over in batches (UniXNU's design; see "g4 mode 3" below).
-enum EncOp : uint8_t {EO_RENDER_NEW,EO_BLIT_NEW,EO_END,EO_DISCARD,EO_BUFFER,EO_OFFSET,EO_BYTES,EO_TEXTURE,EO_SAMPLER,EO_FENCE,EO_PIPELINE,
- EO_DSS,EO_VIEWPORT,EO_SCISSOR,EO_RASTER,EO_DEPTH_BIAS,EO_LINE_WIDTH,EO_VISIBILITY,EO_STENCIL_REF,EO_BLEND_COLOR,EO_DRAW,EO_DRAW_INDEXED,
- EO_COPY_BUFFER,EO_FILL_BUFFER,EO_COPY_TEXTURE,EO_BUFFER_TO_TEXTURE,EO_TEXTURE_TO_BUFFER,EO_MIPMAPS,EO_EVENT,EO_COMMIT,EO_COUNT};
-enum : uint8_t {ECF_RETAIN_A=1,ECF_NULL_BYTES=2};
-// target: the encoder (or, for EO_EVENT/EO_COMMIT, the command buffer, retained); a/b: the objects named; off/len: inline data
-struct EncCmd {uint8_t op,stage,flags,mask;uint32_t index;void *target,*a,*b;uint64_t u[6];uint32_t off,len;};
-struct EncChunk {std::vector<EncCmd> cmds;std::vector<uint8_t> bytes;uint64_t handTick=0;};   // handTick: g4, mode 3's hand-off
-static void encReplay(const EncCmd &c,const uint8_t *bytes);
-// g4 (SWEET_ENCTHREAD=3, backboardd only): the same recorded commands, handed to the worker in batches (see "batched" below).
-static int encThreadMode() {
- static int mode=-1;
- if(mode<0){const char *e=getenv("SWEET_ENCTHREAD");const int v=e && *e?atoi(e):0;const bool bb=!strcmp(getprogname(),"backboardd");
-  mode=v==2 || (v==1 && bb)?1:v==3 && bb?3:0;}
- return mode;
-}
-static bool encThreadOn() {return encThreadMode()!=0;}
-static bool encBatched() {return encThreadMode()==3;}
-static os_unfair_lock gEqLock=OS_UNFAIR_LOCK_INIT;
-static EncChunk *gEqOpen;                        // what the worker takes next (gEqLock)
-static std::vector<EncChunk *> gEqFree;          // replayed chunks for reuse (gEqLock)
-static std::atomic<uint64_t> gEqAppended{0},gEqReplayed{0};   // commands recorded / replayed since start
-static std::atomic<bool> gEqIdle{false},gEqStarted{false};
-static bool gEqBroken;   // the worker could not be started: commands replay at once on the caller
-static std::atomic<unsigned> gEqWaiters{0};
-static std::mutex gEqSleepLock;static std::condition_variable gEqWake,gEqDone;
-static pthread_t gEqThread;
-// telemetry (cumulative; the 5 s line takes deltas)
-static std::atomic<uint64_t> gEtOps[EO_COUNT],gEtRecordTicks,gEtReplayTicks,gEtBatches,gEtBatchMax,gEtDepthMax,gEtWakes,gEtCommits;
-static std::atomic<uint64_t> gEtFlushCalls[EF_WHY_COUNT],gEtFlushWaits[EF_WHY_COUNT],gEtFlushTicks[EF_WHY_COUNT],gEtFlushOnWorker,gEtStalls;
-static const char *const kEncFlushName[EF_WHY_COUNT]={"sched","done","resource","getbytes","compute","purgeable","replace","backpressure"};
-static __thread uint32_t tEtDepth;
-// g4: the submit's lag, per replayed commit (both modes): caller's commit -> the worker starts commitSubmit; the worker's wake (if
-// it slept after the commit was handed, else the commit) -> that start; commitSubmit's own time; a frame's first encoder -> that
-// start. Batches replayed on a big core (cpu 6-7). The 5 s "T enc-lat" line prints them (p50/p95) with batches/s.
-static std::mutex gEtLatLock;static std::vector<int64_t> gEtLat[4];   // ns: commit->submit, wake->submit, submit call, frame enc->submit
-static std::atomic<uint64_t> gEtBatchBig,gEtBatchCmds;
-static uint64_t gEqWakeTick;   // the worker's last return from its sleep (the worker's alone)
-// g4 mode 3: UniXNU's batching (UniXNU/AdrenoMetal feat/ipados27-gpu-parity 6c7b0a0 "one thread of its own, fed in batches",
-// f1f51bf "calls as closures in reused batch memory"; credit UniXNU, BSD-2-Clause-Patent): each recording thread fills a batch of
-// its own (no shared lock, no wake per command) and hands it over at 64 commands, at an encoder's end or an encoded event, at a commit (at once: the
-// worker submits it as it reaches it, no further hop) and before every flush; the worker sleeps on a
-// condition variable (no spin) and wakes once per batch handed while it sleeps. As UniXNU's: an encoder's calls and its command
-// buffer's commit come from one thread (CA's case; Metal requires the encoder ended before the commit), since another thread's
-// open batch is not handed by this thread's flush or commit. Our commands stay the compact EncCmd records
-// (UniXNU's f1f51bf moved from blocks to closures in reused memory: ours were never blocks). Not ported: mimalloc.
-static __thread EncChunk *tEqBatch;           // mode 3: this thread's batch being filled
-static std::deque<EncChunk *> gEqBatches;     // mode 3: handed over, in order (gEqSleepLock)
-// The caller's time inside a recording call (outermost only): what the display thread still pays.
-struct EtRec {
- uint64_t t0;bool outer;
- EtRec():t0(0),outer(tEtDepth++==0){if(outer)t0=mach_absolute_time();}
- ~EtRec(){tEtDepth--;if(outer)gEtRecordTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);}
-};
-#define ET_REC EtRec etRec_
-static void encWake() {
- std::lock_guard<std::mutex> l(gEqSleepLock);
- if(gEqIdle.exchange(false)){gEtWakes.fetch_add(1,std::memory_order_relaxed);gEqWake.notify_one();}
-}
-static EncChunk *encChunk() {   // gEqLock held
- if(gEqFree.empty())return new EncChunk();
- EncChunk *k=gEqFree.back();gEqFree.pop_back();return k;
-}
-static void *encWorkerMain(void *) {
- pthread_setname_np("sweet.encthread");
- // CA's display thread runs at a fixed priority 54 (RR): the work it hands over keeps that (SWEET_ENCTHREAD_PRI=N, 0: QoS only)
- const char *pri=getenv("SWEET_ENCTHREAD_PRI");const int priority=pri && *pri?atoi(pri):54;
- if(priority>0){struct sched_param sp={};sp.sched_priority=priority;pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
- encThreadNote();
- static const uint64_t spinTicks=[]{const char *e=getenv("SWEET_ENCTHREAD_SPIN_US");const double us=e && *e?atof(e):50;
-  return (uint64_t)(std::max(0.0,us)*1e3/encTickNs());}();
- for(;;) {
-  EncChunk *k=nullptr;
-  os_unfair_lock_lock(&gEqLock);
-  if(!gEqOpen->cmds.empty()){k=gEqOpen;gEqOpen=encChunk();}
-  os_unfair_lock_unlock(&gEqLock);
-  if(!k) {
-   // nothing recorded: spin a little (the next call is usually microseconds away), then sleep until a recording wakes it
-   const uint64_t until=mach_absolute_time()+spinTicks;
-   while(gEqAppended.load()==gEqReplayed.load() && mach_absolute_time()<until)__asm__ volatile("yield");
-   if(gEqAppended.load()!=gEqReplayed.load())continue;
-   gEqIdle.store(true);
-   os_unfair_lock_lock(&gEqLock);const bool empty=gEqOpen->cmds.empty();os_unfair_lock_unlock(&gEqLock);
-   if(!empty){gEqIdle.store(false);continue;}
-   std::unique_lock<std::mutex> l(gEqSleepLock);
-   gEqWake.wait(l,[]{return !gEqIdle.load();});
-   gEqWakeTick=mach_absolute_time();   // g4 telemetry
-   continue;
-  }
-  const uint64_t t0=mach_absolute_time();
-  @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
-  gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
-  const uint64_t n=k->cmds.size();
-  gEtBatches.fetch_add(1,std::memory_order_relaxed);
-  gEtBatchCmds.fetch_add(n,std::memory_order_relaxed);if(encCPU()>=6)gEtBatchBig.fetch_add(1,std::memory_order_relaxed);   // g4
-  uint64_t seen=gEtBatchMax.load();while(n>seen && !gEtBatchMax.compare_exchange_weak(seen,n)){}
-  gEqReplayed.fetch_add(n);
-  if(gEqWaiters.load()){std::lock_guard<std::mutex> l(gEqSleepLock);gEqDone.notify_all();}
-  k->cmds.clear();
-  if(k->bytes.capacity()>(1u<<20))std::vector<uint8_t>().swap(k->bytes);else k->bytes.clear();
-  os_unfair_lock_lock(&gEqLock);
-  if(gEqFree.size()<4){gEqFree.push_back(k);k=nullptr;}
-  os_unfair_lock_unlock(&gEqLock);
-  delete k;
- }
- return nullptr;
-}
-// g4 mode 3: the worker takes handed batches in order; asleep on gEqWake while there are none (UniXNU 6c7b0a0's thread).
-static void *encBatchWorkerMain(void *) {
- pthread_setname_np("sweet.encthread");
- const char *pri=getenv("SWEET_ENCTHREAD_PRI");const int priority=pri && *pri?atoi(pri):54;   // as mode 1 (0: QoS only, UniXNU's)
- int pr=0;   // logged: a priority above the user range (MAXPRI_USER 63, e.g. r66's 80) is refused and leaves the QoS priority
- if(priority>0){struct sched_param sp={};sp.sched_priority=priority;pr=pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
- {char line[120];snprintf(line,sizeof line,"native-metal: enc-thread mode 3 worker: SCHED_RR %d -> %d",priority,pr);sm2_logs(line);}
- encThreadNote();
- for(;;) {
-  EncChunk *k;
-  {
-   std::unique_lock<std::mutex> l(gEqSleepLock);
-   if(gEqBatches.empty()) {
-    gEqIdle.store(true);
-    gEqWake.wait(l,[]{return !gEqBatches.empty();});
-    gEqIdle.store(false);
-    gEqWakeTick=mach_absolute_time();
-   }
-   k=gEqBatches.front();gEqBatches.pop_front();
-  }
-  const uint64_t t0=mach_absolute_time();
-  @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
-  gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
-  const uint64_t n=k->cmds.size();
-  gEtBatches.fetch_add(1,std::memory_order_relaxed);
-  gEtBatchCmds.fetch_add(n,std::memory_order_relaxed);if(encCPU()>=6)gEtBatchBig.fetch_add(1,std::memory_order_relaxed);
-  uint64_t seen=gEtBatchMax.load();while(n>seen && !gEtBatchMax.compare_exchange_weak(seen,n)){}
-  gEqReplayed.fetch_add(n);
-  if(gEqWaiters.load()){std::lock_guard<std::mutex> l(gEqSleepLock);gEqDone.notify_all();}
-  k->cmds.clear();
-  if(k->bytes.capacity()>(1u<<20))std::vector<uint8_t>().swap(k->bytes);else k->bytes.clear();
-  os_unfair_lock_lock(&gEqLock);
-  if(gEqFree.size()<8){gEqFree.push_back(k);k=nullptr;}
-  os_unfair_lock_unlock(&gEqLock);
-  delete k;
- }
- return nullptr;
-}
-static void encStart() {
- static dispatch_once_t once;
- dispatch_once(&once,^{
-  gEqOpen=new EncChunk();
-  pthread_attr_t attr;pthread_attr_init(&attr);
-  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
-  pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
-  const int r=pthread_create(&gEqThread,&attr,encBatched()?encBatchWorkerMain:encWorkerMain,nullptr);
-  pthread_attr_destroy(&attr);
-  if(r){NBLOG(@"native-metal: enc-thread: worker not started (%d): commands are replayed at once by the caller",r);gEqBroken=true;return;}
-  gEqStarted=true;
-  sm2_logs([NSString stringWithFormat:@"native-metal: enc-thread on (SWEET_ENCTHREAD=%s): render/blit encoders and commits replayed on 'sweet.encthread'%s",
-            encBatched()?"3, batched":"1",r?" (NOT STARTED)":""].UTF8String);
- });
-}
-static bool encOnWorker() {return gEqStarted.load() && pthread_equal(pthread_self(),gEqThread);}
-// g4 mode 3: this thread's batch to the worker (UniXNU's encodeFlush), woken only if it sleeps; counted as recorded at the hand-off.
-static void encHand() {
- EncChunk *k=tEqBatch;
- if(!k || k->cmds.empty())return;
- tEqBatch=nullptr;
- const uint64_t n=k->cmds.size();
- k->handTick=mach_absolute_time();
- bool wake;uint64_t depth;
- {
-  std::lock_guard<std::mutex> l(gEqSleepLock);
-  gEqBatches.push_back(k);
-  depth=gEqAppended.fetch_add(n)+n-gEqReplayed.load();   // with the push, under the lock: a flush's target covers every batch before it
-  wake=gEqIdle.load();
- }
- if(wake){gEtWakes.fetch_add(1,std::memory_order_relaxed);gEqWake.notify_one();}
- uint64_t seen=gEtDepthMax.load(std::memory_order_relaxed);
- while(depth>seen && !gEtDepthMax.compare_exchange_weak(seen,depth)){}
- if(depth>32768)encFlush(EF_BACKPRESSURE);
-}
-static void encPushBatched(EncCmd &c,const void *extra,size_t length) {
- EncChunk *k=tEqBatch;
- if(!k){os_unfair_lock_lock(&gEqLock);k=encChunk();os_unfair_lock_unlock(&gEqLock);tEqBatch=k;}
- if(extra && length) {
-  const size_t at=(k->bytes.size()+7)&~(size_t)7;
-  k->bytes.resize(at+length);memcpy(k->bytes.data()+at,extra,length);
-  c.off=(uint32_t)at;c.len=(uint32_t)length;
- }
- k->cmds.push_back(c);
- // UniXNU's points, and an encoded event (outside an encoder: its commit may come from another thread); a discard precedes its commit
- if(k->cmds.size()>=64 || c.op==EO_END || c.op==EO_EVENT || c.op==EO_COMMIT)encHand();
-}
-static bool dfStash(EncCmd &c,const void *extra,size_t length);   // g9: an encoder capturing behind a held fill keeps it
-// Records a command (and `length` bytes of inline data) for the worker, in call order.
-static void encPush(EncCmd &c,const void *extra=nullptr,size_t length=0) {
- if(gDfCapturing.load(std::memory_order_relaxed)>0 && c.op>=EO_BUFFER && c.op<=EO_DRAW_INDEXED && dfStash(c,extra,length))return;   // g9
- encStart();
- gEtOps[c.op].fetch_add(1,std::memory_order_relaxed);
- if(gEqBroken){c.off=0;c.len=(uint32_t)length;@autoreleasepool{encReplay(c,(const uint8_t *)extra);}return;}
- if(encBatched()){encPushBatched(c,extra,length);return;}   // g4
- os_unfair_lock_lock(&gEqLock);
- EncChunk *k=gEqOpen;
- if(extra && length) {
-  const size_t at=(k->bytes.size()+7)&~(size_t)7;
-  k->bytes.resize(at+length);memcpy(k->bytes.data()+at,extra,length);
-  c.off=(uint32_t)at;c.len=(uint32_t)length;
- }
- k->cmds.push_back(c);
- const uint64_t depth=gEqAppended.fetch_add(1)+1-gEqReplayed.load();
- os_unfair_lock_unlock(&gEqLock);
- uint64_t seen=gEtDepthMax.load(std::memory_order_relaxed);
- while(depth>seen && !gEtDepthMax.compare_exchange_weak(seen,depth)){}
- if(gEqIdle.load())encWake();
- if(depth>32768)encFlush(EF_BACKPRESSURE);
-}
-// Waits until the worker replayed every command recorded so far (not on the worker itself: it replays in order anyway).
-static void encFlush(EncFlushWhy why) {
- if(!gEqStarted.load())return;
- gEtFlushCalls[why].fetch_add(1,std::memory_order_relaxed);
- if(encOnWorker()){gEtFlushOnWorker.fetch_add(1,std::memory_order_relaxed);return;}
- if(encBatched())encHand();   // g4 mode 3: what this thread recorded goes first (other threads' open batches are theirs, as UniXNU's drain)
- const uint64_t target=gEqAppended.load();
- if(gEqReplayed.load()>=target)return;
- gEtFlushWaits[why].fetch_add(1,std::memory_order_relaxed);
- const uint64_t t0=mach_absolute_time();
- gEqWaiters.fetch_add(1);
- if(!encBatched() && gEqIdle.load())encWake();   // g4: mode 3's worker wakes on the batches themselves
- {
-  std::unique_lock<std::mutex> l(gEqSleepLock);
-  bool logged=false;
-  while(gEqReplayed.load()<target) {
-   if(!gEqDone.wait_for(l,std::chrono::seconds(2),[&]{return gEqReplayed.load()>=target;}) && !logged) {
-    logged=true;gEtStalls.fetch_add(1);
-    char line[200];snprintf(line,sizeof line,"native-metal: enc-thread: %s flush waits > 2 s (%llu commands behind)",kEncFlushName[why],
-     (unsigned long long)(target-gEqReplayed.load()));
-    sm2_logs(line);
-   }
-  }
- }
- gEqWaiters.fetch_sub(1);
- gEtFlushTicks[why].fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
-}
-// u-gpudraw: SWEET_FNSTAT=1 (backboardd, with the timeline): draws per render pipeline (its vertex + fragment function
-// names) every 5 s as "T fn" lines, with one draw's inputs per pipeline: the vertex count, the last setVertexBytes /
-// setFragmentBytes (index and the first 64 bytes as floats) and 64 bytes of vertex buffer 0 at the draw's offset.
-// Matches Turnip 0112's fragment shader census (T tu-draw) by draw counts.
-static bool fnStatOn();
-struct FnSnap {uint8_t b[64];uint16_t n,index;};
-static thread_local FnSnap tFnBytes[3];   // by stage: 1 vertex, 2 fragment
-static thread_local __unsafe_unretained id tFnVb0;static thread_local NSUInteger tFnVb0Off;static thread_local const void *tFnVb0Enc;
-struct FnEnt {char name[80];uint32_t draws,verts,inst;FnSnap vb,fb,v0;bool have;};
-static std::mutex gFnLock;static FnEnt gFn[48];static unsigned gFnN;static uint64_t gFnOther;
-static void fnNote(const void *enc,const char *name,uint32_t verts,uint32_t inst,NSUInteger vertexStart) {
- std::lock_guard<std::mutex> l(gFnLock);
- unsigned i=0;for(;i<gFnN && strncmp(gFn[i].name,name,sizeof gFn[i].name);i++);
- if(i==gFnN){if(gFnN==48){gFnOther++;return;}gFnN++;memset(&gFn[i],0,sizeof gFn[i]);snprintf(gFn[i].name,sizeof gFn[i].name,"%s",name);}
- FnEnt &e=gFn[i];e.draws++;e.verts+=verts;e.inst+=inst;
- if(!e.have || (e.draws%64)==0) {   // a sample now and then
-  e.have=true;e.vb=tFnBytes[1];e.fb=tFnBytes[2];memset(&e.v0,0,sizeof e.v0);
-  if(tFnVb0 && tFnVb0Enc==enc && [tFnVb0 respondsToSelector:@selector(contents)] && [tFnVb0 respondsToSelector:@selector(length)]) {
-   const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)tFnVb0 contents];NSUInteger len=[(id<MTLBuffer>)tFnVb0 length];
-   if(c && tFnVb0Off<len){e.v0.n=(uint16_t)std::min<NSUInteger>(64,len-tFnVb0Off);memcpy(e.v0.b,c+tFnVb0Off,e.v0.n);}
-  }
-  (void)vertexStart;
- }
-}
-static void fnPut(char *out,size_t size,const char *what,const FnSnap &s) {
- size_t at=strlen(out);if(!s.n)return;
- at+=snprintf(out+at,size>at?size-at:0," %s[%u] %u:",what,s.index,s.n);
- for(unsigned k=0;k+4<=s.n && k<64;k+=4){float f;memcpy(&f,s.b+k,4);at+=snprintf(out+at,size>at?size-at:0," %.4g",f);}
-}
-static void fnReport() {
- if(!fnStatOn())return;
- std::vector<FnEnt> v;uint64_t other;
- {std::lock_guard<std::mutex> l(gFnLock);v.assign(gFn,gFn+gFnN);gFnN=0;other=gFnOther;gFnOther=0;}
- std::sort(v.begin(),v.end(),[](const FnEnt &a,const FnEnt &b){return a.draws>b.draws;});
- for(size_t i=0;i<v.size() && i<12;i++) {
-  char line[1300];
-  snprintf(line,sizeof line,"native-metal: T fn %s: d%u v%.1f i%.1f",v[i].name,v[i].draws,v[i].draws?(double)v[i].verts/v[i].draws:0,
-   v[i].draws?(double)v[i].inst/v[i].draws:0);
-  fnPut(line,sizeof line,"vbytes",v[i].vb);fnPut(line,sizeof line,"fbytes",v[i].fb);fnPut(line,sizeof line,"vb0",v[i].v0);
-  sm2_logs(line);
- }
- if(other){char line[80];snprintf(line,sizeof line,"native-metal: T fn: %llu draws of more pipelines",(unsigned long long)other);sm2_logs(line);}
-}
-@interface NBEncoder : NBObject {
-@public
- // ovd (SWEET_DRAWBOX): this encoder logs (its command buffer's DB frame, pass index); vertex-stage buffers and bytes by index (0..7)
- uint32_t dbFrame,dbPass,dbDraws;__unsafe_unretained id dbVb[8];NSUInteger dbVbOff[8];std::vector<uint8_t> dbVbytes[8];
- // g9 (SWEET_DEADFILL): vertex-stage bindings tracked (dfTrack); calls recorded behind a held fill (dfCapturing: dfList, inline
- // data in dfBytes; an entry whose op is EO_COUNT is skipped), the held draw's index there (-1: none), the creation held (mode 2),
- // and whether the encoder is a direct one (encDeferred only while capturing)
- bool dfTrack,dfCapturing,dfPending,dfDirect,dfHeldPx;int8_t dfMode;int32_t dfHeld;uint32_t dfHeldD;float dfHeldCol[4];
- uint8_t dfAttached,dfWhy;__unsafe_unretained id dfHeldPipe;   // g10: the pass's colours 1..7 attached (bit i); why the held fill may not clear (bits); its pipeline
- std::vector<EncCmd> dfList;std::vector<uint8_t> dfBytes;NmbRenderPassDescriptor *dfPass;uint64_t dfPx,dfHeldBind;
- bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
-}
+@interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
-- (bool)check:(bool)ok what:(const char *)what;
-- (void)dfCapture;
-- (void)dfRelease:(bool)drop clear:(bool)clear;
 @end
-// u-encthread: a recording call on an encoder already ended fails its command buffer (never recorded: the encoder may be gone).
-#define ENC_LIVE() do{if(encEnded){[self.commandBuffer refuse:@"encoder call after endEncoding"];return;}}while(0)
-// g9: a recording call of an encoder capturing behind a held fill: kept (with its inline data) until the hold resolves
-static bool dfStash(EncCmd &c,const void *extra,size_t length) {
- NBEncoder *e=(__bridge NBEncoder *)c.target;
- if(!e || !e->dfCapturing)return false;
- if(extra && length) {
-  const size_t at=(e->dfBytes.size()+7)&~(size_t)7;
-  e->dfBytes.resize(at+length);memcpy(e->dfBytes.data()+at,extra,length);
-  c.off=(uint32_t)at;c.len=(uint32_t)length;
- }
- e->dfList.push_back(c);
- return true;
-}
 static void waitForResource(id resource) {
- ENC_SCOPE(EC_WAIT,"waitForResource");
- if(encThreadOn())encFlush(EF_RESOURCE);   // u-encthread: committed command buffers are in gInFlight once replayed
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending) {
@@ -1726,151 +743,55 @@ static void waitForResource(id resource) {
  gTimeResourceWait.add(began);
 }
 @implementation NBEncoder
-- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);delete dfPass;if(dfCapturing)gDfCapturing.fetch_sub(1);}
+- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
 - (bool)check:(bool)ok what:(const char *)what {
  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
  return ok;
 }
-// g9 (SWEET_DEADFILL): start holding (the calls from here are recorded into dfList; a direct encoder records as a deferred one)
-- (void)dfCapture {
- if(dfCapturing)return;
- dfCapturing=true;gDfCapturing.fetch_add(1);
- dfDirect=!encDeferred;encDeferred=true;
-}
-// mode 2: the held creation made now (a clear to the held fill's colour when `clear`)
-- (void)dfCreate:(bool)clear {
- if(!dfPending)return;
- NmbRenderPassDescriptor pass=*dfPass;delete dfPass;dfPass=nullptr;dfPending=false;
- if(clear){pass.colors[0].load=MTLLoadActionClear;for(int i=0;i<4;i++)pass.colors[0].clear[i]=std::min(255.,std::max(0.,floor(dfHeldCol[i]*255.+0.5)))/255.;}   // g10: the 8-bit code
- NBCommandBuffer *cb=_commandBuffer;
- if(dfDirect) {
-  NmbEncoder *h=cb.committed?nullptr:nmb_render_encoder_new(cb.handle,&pass);
-  if(!h)[cb refuse:[NSString stringWithFormat:@"renderCommandEncoder: %@",lastError()]];
-  _handle=h;
- } else {
-  EncCmd c={};c.op=EO_RENDER_NEW;c.target=(__bridge_retained void *)self;   // released as its end (or discard) is replayed
-  const bool was=dfCapturing;dfCapturing=false;encPush(c,&pass,sizeof pass);dfCapturing=was;
- }
-}
-// the hold ends: `drop` drops the held fill (`clear`: the held creation clears to its colour instead); the recorded calls go out in order
-- (void)dfRelease:(bool)drop clear:(bool)clear {
- if(!dfCapturing)return;
- if(dfHeld>=0 && drop)dfList[(size_t)dfHeld].op=EO_COUNT;
- dfCapturing=false;gDfCapturing.fetch_sub(1);
- [self dfCreate:clear];
- if(dfDirect)encDeferred=false;
- std::vector<EncCmd> list;list.swap(dfList);std::vector<uint8_t> bytes;bytes.swap(dfBytes);
- for(EncCmd c:list) {
-  if(c.op==EO_COUNT)continue;
-  if(dfDirect){c.target=(__bridge void *)self;encReplay(c,bytes.data());}
-  else encPush(c,c.len?bytes.data()+c.off:nullptr,c.len);
- }
- dfHeld=-1;dfDirect=false;
-}
 - (void)endEncoding {
- if(dfCapturing) {   // g9: a fill still held at the end is the pass's last draw: it goes out (mode 2: a pass of only fills clears)
-  const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;
-  if(dfPending && dfHeld>=0 && !dfHeldPx)gDfNoClear.fetch_add(1);
-  if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (pass end)",dbFrame,dbPass,dfHeldD);sm2_logs(l);}}
-  [self dfRelease:clearIt clear:clearIt];
- }
- static EncSite renderEnd{"endEncoding(render)",EC_ENC},blitEnd{"endEncoding(blit)",EC_ENC},computeEnd{"endEncoding(compute)",EC_ENC};
- EncScope encScope_([self respondsToSelector:@selector(setRenderPipelineState:)]?&renderEnd:
-                    [self respondsToSelector:@selector(setComputePipelineState:)]?&computeEnd:&blitEnd);
- if(encDeferred) {
-  ET_REC;
-  if(encEnded){[_commandBuffer refuse:@"endEncoding twice"];return;}
-  encEnded=true;
-  if(_commandBuffer->encOpen==self)_commandBuffer->encOpen=nil;
-  EncCmd c={};c.op=EO_END;c.target=(__bridge void *)self;encPush(c);
-  return;
- }
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
- if(encScope_.slow()) {
-  uint64_t work[10]={};NBCommandBuffer *cb=_commandBuffer;
-  if(gDevice && nmb_device_work_stats(gDevice,work) && cb->encThread)
-   snprintf(tEncDetail,sizeof tEncDetail,"%u draws in the frame; VkPipelines this frame so far %llu in %.1f ms",cb->encodedWork.draws,
-    (unsigned long long)(work[0]-cb->encVkStart[0]),(work[1]-cb->encVkStart[1])/1e3);
- }
 }
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
 - (void)popDebugGroup {}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
-- (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBuffer");
- if((dbFrame || dfTrack) && stage==1 && index<8){dbVb[index]=buffer;dbVbOff[index]=offset;dbVbytes[index].clear();}   // ovd, g9
- if(stage==1 && index==0 && fnStatOn()){tFnVb0=buffer;tFnVb0Off=offset;tFnVb0Enc=(__bridge const void *)self;}
+- (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
-  EncCmd c={};c.op=EO_BUFFER;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.a=(__bridge void *)buffer;c.u[0]=offset;
-  encPush(c);return;
- }
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
-- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setTexture");
+- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
- if(encDeferred) {   // u-encthread: the YCbCr refresh, the shadow seed and the handle (a YCbCr copy's turn) are the replay's
-  ET_REC;ENC_LIVE();
-  if(texture)[_commandBuffer.resourceOwners addObject:texture];
-  if(texture && [(NBTexture *)texture surface]) {
-   [_commandBuffer.surfaces addObject:texture];
-   if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
-  }
-  EncCmd c={};c.op=EO_TEXTURE;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.a=(__bridge void *)texture;
-  if(texture)c.u[0]=((NBTexture *)texture)->encReplaceEpoch.load();
-  encPush(c);return;
- }
- if(texture)ycbcrRefresh((NBTexture *)texture,_commandBuffer);
- if(texture && shadowSeedOn() && [(NBTexture *)texture surface] && !((NBTexture *)texture).ycbcrGPU)
-  nmb_texture_set_bytes_generation([(NBTexture *)texture handle],(uint64_t)IOSurfaceGetSeed([(NBTexture *)texture surface])+1);
+ if(texture)[_commandBuffer.resourceOwners addObject:texture];
+ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture planarSurface])planarFill((NBTexture *)texture); // 0112: refresh the converted copy
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
-- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setSamplerState");
+- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_SAMPLER;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;
-  if(sampler){c.a=(__bridge_retained void *)sampler;c.flags=ECF_RETAIN_A;}
-  encPush(c);return;
- }
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
-- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBytes");
- if((dbFrame || dfTrack) && stage==1 && index<8){dbVb[index]=nil;dbVbytes[index].assign((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?std::min<NSUInteger>(length,65536):0));}   // ovd
- if(stage<3 && fnStatOn()){FnSnap &f=tFnBytes[stage];f.n=(uint16_t)std::min<NSUInteger>(64,length);f.index=(uint16_t)index;if(bytes)memcpy(f.b,bytes,f.n);}
- if(encDeferred) {   // the bytes are the caller's only during the call: copied
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_BYTES;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;
-  if(!bytes || !length){c.flags=ECF_NULL_BYTES;c.u[0]=(uint64_t)(uintptr_t)bytes;c.u[1]=length;encPush(c);}
-  else encPush(c,bytes,length);
-  return;
- }
+// The sampler with its LOD clamps replaced (NBSampler withLodMin:max:); nil and the command buffer refused where the runtime refuses it.
+// Ported from UniXNU/AdrenoMetal 243d63c NativeBridgeMetalFrontend.mm:2282-2287 (MIT).
+- (id<MTLSamplerState>)sampler:(id<MTLSamplerState>)sampler lodMin:(float)lodMin max:(float)lodMax {
+ if(!sampler || ![(id)sampler isKindOfClass:[NBSampler class]])return sampler;   // nil, or foreign: sampler:index:stage: refuses it
+ NBSampler *clamped=[(NBSampler *)sampler withLodMin:lodMin max:lodMax];
+ if(!clamped)[_commandBuffer refuse:@"sampler with LOD clamps refused"];
+ return (id<MTLSamplerState>)clamped;
+}
+- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
-- (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {ENC_SCOPE(EC_BIND,"fence");
+- (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_FENCE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)fence;c.flags=ECF_RETAIN_A;c.u[0]=stages;c.u[1]=update;
-  encPush(c);return;
- }
  NmbFence *handle=[(NBFence *)fence handle];
  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
 }
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
-- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBufferOffset");
- if((dbFrame || dfTrack) && stage==1 && index<8)dbVbOff[index]=offset;   // ovd, g9
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_OFFSET;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.u[0]=offset;
-  encPush(c);return;
- }
+- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
 }
 @end
@@ -1879,7 +800,7 @@ static void waitForResource(id resource) {
 @end
 @implementation NBComputeEncoder
 - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
-- (void)setComputePipelineState:(id<MTLComputePipelineState>)state {ENC_SCOPE(EC_BIND,"setComputePipelineState");
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
 }
@@ -1894,10 +815,14 @@ static void waitForResource(id resource) {
  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
 }
 - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
+- (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
+ id<MTLSamplerState> c=[self sampler:s lodMin:lo max:hi];if(s && !c)return;
+ [self sampler:c index:i stage:0];
+}
 - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
 }
-- (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {ENC_SCOPE(EC_DRAW,"dispatch");
+- (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
  [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
@@ -1908,335 +833,690 @@ static void waitForResource(id resource) {
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
-@interface NBRenderEncoder : NBEncoder {
-@public
- char encPipeline[80];   // u-e: the bound pipeline's function names (copied: "E slow" draws name it)
- uint64_t rasterCull,rasterWinding,rasterFill;   // Metal's defaults (0) until set (were associated objects: a global lock and an NSNumber each)
- // u-cpu 0x2: the values the last accepted setViewport:/setScissorRect: set (have*: one was accepted)
- bool haveViewport,haveScissor;double lastViewport[6];uint64_t lastScissor[4];
- // ovd: the bound pipeline, viewport/scissor as set (any CPUFAST), the colour attachment's size and load action
- NBRenderPipeline *dbPipe;double dbVp[4];uint64_t dbSc[4];bool dbHaveVp,dbHaveSc;uint32_t dbW,dbH,dbLoad;
- bool dfDss,dfClipKind,dfClearOK;uint8_t dfWhyLast;   // g9: a depth/stencil state was set; the last fill tested was in clip space (else pixels); g10: it may be the clear
+// sweet drawlog (SWEET_DRAWLOG=/path): a text dump of what the big Core Animation passes draw, to see why they are slow. Off (one cached getenv)
+// unless set; only passes with a colour target >= 1000x2000 are recorded, and only the first 20 such passes with >= 10 draws are written.
+// SWEET_DRAWLOG_MIN=N (default 10): only passes with >= N draws; SWEET_DRAWLOG_SKIP=K (default 0): skip the first K such passes;
+// SWEET_DRAWLOG_COUNT=C (default 20): write C passes. E.g. MIN=100 skips Home's ~60-draw passes and catches Control Center's ~134.
+// SWEET_DRAWLOG_MINPX=N (unset: the 1000x2000 rule above): instead record passes whose colour target 0 has >= N pixels (e.g. 100000 catches
+// Control Center's 284x611 blur passes). The pass header also lists every attachment (" cI=WxH fmt= ld= st= mem=", " d=", " s="): the Metal
+// load/store actions and storageMode (3 = memoryless) as CA asked for them; the bridge passes them through unchanged (Vulkan side: runtime).
+static const char *drawLogPath() {
+ static const char *path=[]{const char *p=getenv("SWEET_DRAWLOG");return p&&*p?p:(const char *)nullptr;}();
+ return path;
 }
-@end
-@implementation NBRenderEncoder
-// ovd (SWEET_DRAWBOX): one "DB" line for a draw: where its pixels can go (viewport, scissor) and where its vertices are.
-- (void)dbDraw:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
-        offset:(NSUInteger)ioff base:(int32_t)base {
- NBRenderPipeline *p=dbPipe;const uint32_t d=dbDraws++;
- char line[1400];size_t at=0;
-#define DBP(...) do{at+=snprintf(line+at,at<sizeof line?sizeof line-at:0,__VA_ARGS__);}while(0)
- DBP("native-metal: DB f%u p%u d%u %s [%s] bl%d m%x f%d/%d/%d/%d prim%u n%u i%u%s",dbFrame,dbPass,d,p?p->encNames:"?",p?p->dbLabel:"?",p?p->dbBlend:-1,p?p->dbMask:0,
-  p?p->dbSrc:0,p?p->dbDst:0,p?p->dbSrcA:0,p?p->dbDstA:0,prim,count,inst,ib?" idx":"");
- if(dbHaveVp)DBP(" vp %.0f,%.0f %.0fx%.0f",dbVp[0],dbVp[1],dbVp[2],dbVp[3]);else DBP(" vp -");
- if(dbHaveSc)DBP(" sc %llu,%llu %llux%llu",(unsigned long long)dbSc[0],(unsigned long long)dbSc[1],(unsigned long long)dbSc[2],(unsigned long long)dbSc[3]);else DBP(" sc -");
- // the position attribute (pipeline attribute 0) of the vertices drawn: float2/3/4 or half2/4
- const uint32_t fmt=p?p->dbFmt:0,buf=p?p->dbBuf:99;
- const uint8_t *src=nullptr;size_t len=0;
- if(fmt && buf<8) {
-  if(!dbVbytes[buf].empty()){src=dbVbytes[buf].data();len=dbVbytes[buf].size();}
-  else if(id vb=dbVb[buf]){if([vb respondsToSelector:@selector(contents)]){const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];NSUInteger l=[(id<MTLBuffer>)vb length];
-   if(c && dbVbOff[buf]<l){src=c+dbVbOff[buf];len=l-dbVbOff[buf];}}}
+static int drawLogEnv(const char *name,int dflt) {const char *p=getenv(name);return p&&*p?atoi(p):dflt;}
+static int drawLogMin() {static const int n=drawLogEnv("SWEET_DRAWLOG_MIN",10);return n;}
+static int drawLogSkip() {static const int n=drawLogEnv("SWEET_DRAWLOG_SKIP",0);return n;}
+static int drawLogCount() {static const int n=drawLogEnv("SWEET_DRAWLOG_COUNT",20);return n;}
+static long drawLogMinPx() {static const long n=[]{const char *p=getenv("SWEET_DRAWLOG_MINPX");return p&&*p?atol(p):-1L;}();return n;}
+static bool drawLogBig(unsigned long w,unsigned long h) {const long n=drawLogMinPx();return n<0?(w>=1000&&h>=2000):(long)(w*h)>=n;}   // sweet drawlog: SWEET_DRAWLOG_MINPX
+static std::atomic<int> gDrawLogBlocks,gDrawLogMatched;
+// sweet drawlog: the hex value of one specialization constant in an NBFunction's constantsText ("name:type:hex ..."), "" if absent
+static std::string dlConst(const std::string &t,const char *name) {
+ const std::string k=std::string(name)+":";size_t p=0;
+ while((p=t.find(k,p))!=std::string::npos){if(p==0||t[p-1]==' ')break;p++;}
+ if(p==std::string::npos)return "";
+ const size_t c=t.find(':',p+k.size());if(c==std::string::npos)return "";
+ const size_t e=t.find(' ',c);return t.substr(c+1,e==std::string::npos?std::string::npos:e-c-1);
+}
+static void dlFloats(std::string &out,const void *p,size_t bytes,unsigned maxFloats) {
+ char t[32];const float *f=(const float *)p;size_t n=bytes/4;if(n>maxFloats)n=maxFloats;
+ for(size_t i=0;i<n;i++){float v;memcpy(&v,f+i,4);snprintf(t,sizeof t,"%s%g",i?",":"",v);out+=t;}
+}
+struct DrawLog {
+ unsigned long w=0,h=0,format=0,load=0,store=0;bool depth=false;
+ std::string text,atts;unsigned draws=0;   // atts: the attachment list of the pass header
+ std::string tail;   // sweet drawlog: " t=<mach time at pass start> tex=<c0 id> pid=<pid>", last in the header
+ std::string pipeline="-";bool blend=false;unsigned long mask=0;
+ struct VB {__unsafe_unretained NBBuffer *b=nil;unsigned long offset=0;} vbs[31];
+ struct FT {__unsafe_unretained NBTexture *t=nil;bool sampler=false;} fts[16];
+ bool viewport=false,scissor=false;double vp[6]={};unsigned long sc[4]={};
+ std::string vbytes,fbytes;   // setVertexBytes / setFragmentBytes calls since the previous draw
+ void bytes(std::string &out,const void *p,NSUInteger n,NSUInteger i,unsigned maxFloats) {
+  char t[48];snprintf(t,sizeof t," [%lu len=%lu: ",(unsigned long)i,(unsigned long)n);out+=t;dlFloats(out,p,n,maxFloats);out+="]";
  }
- const int comps=fmt==MTLVertexFormatFloat2?2:fmt==MTLVertexFormatFloat3?3:fmt==MTLVertexFormatFloat4?4:fmt==MTLVertexFormatHalf2?-2:fmt==MTLVertexFormatHalf4?-4:0;
- if(src && comps) {
-  const uint8_t *ix=nullptr;size_t ilen=0;
-  if(ib){const uint8_t *c=(const uint8_t *)[ib contents];NSUInteger l=[ib length];if(c && ioff<l){ix=c+ioff;ilen=l-ioff;}}
-  float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f,w0=1e30f,w1=-1e30f;uint32_t got=0;
-  const uint32_t stride=p->dbStride?p->dbStride:(uint32_t)(abs(comps)*(comps>0?4:2));
-  for(uint32_t k=0;k<count && k<4096;k++) {
-   int64_t v;
-   if(ib){if(!ix)break;if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)break;v=((const uint16_t *)ix)[k];}else{if((k+1)*4>ilen)break;v=((const uint32_t *)ix)[k];}v+=base;}
-   else v=(int64_t)start+k;
-   const size_t o=(size_t)v*stride+p->dbOff;if(v<0 || o+(comps>0?comps*4:-comps*2)>len)continue;
-   float c4[4]={0,0,0,1};
-   if(comps>0)memcpy(c4,src+o,comps*4);else{const __fp16 *h=(const __fp16 *)(src+o);for(int q=0;q<-comps;q++)c4[q]=(float)h[q];}
-   x0=std::min(x0,c4[0]);x1=std::max(x1,c4[0]);y0=std::min(y0,c4[1]);y1=std::max(y1,c4[1]);
-   const float w=(comps==4||comps==-4)?c4[3]:1;w0=std::min(w0,w);w1=std::max(w1,w);got++;
+ void draw(unsigned long prim,unsigned long start,unsigned long count,unsigned long inst,bool indexed) {
+  char t[160];
+  snprintf(t,sizeof t,"draw %u prim=%lu %s=%lu/%lu inst=%lu blend=%d mask=%lu pipe=",draws,prim,indexed?"idx":"vtx",start,count,inst,(int)blend,mask);
+  text+=t;text+=pipeline;
+  if(viewport){snprintf(t,sizeof t," vp=%g,%g,%g,%g",vp[0],vp[1],vp[2],vp[3]);text+=t;}
+  if(scissor){snprintf(t,sizeof t," sc=%lu,%lu,%lu,%lu",sc[0],sc[1],sc[2],sc[3]);text+=t;}
+  text+="\n";
+  if(!vbytes.empty()){text+="  vbytes:"+vbytes+"\n";vbytes.clear();}
+  for(unsigned i=0;i<31;i++)if(vbs[i].b) {
+   NBBuffer *b=vbs[i].b;snprintf(t,sizeof t,"  vbuf %u off=%lu len=%lu",i,vbs[i].offset,(unsigned long)b.length);text+=t;
+   void *c=b.storageMode==MTLStorageModeShared?b.contents:nullptr;
+   if(c && vbs[i].offset<b.length){text+=" f=";dlFloats(text,(const char *)c+vbs[i].offset,b.length-vbs[i].offset,16);}
+   text+="\n";
   }
-  if(got) {
-   DBP(" pos %.1f,%.1f..%.1f,%.1f w%.2f..%.2f (%u)",x0,y0,x1,y1,w0,w1,got);
-   {   // the first drawn vertex's colour attribute
-    int64_t v0=start;if(ib && ix && ilen>=4)v0=(itype==MTLIndexTypeUInt16?((const uint16_t *)ix)[0]:((const uint32_t *)ix)[0])+base;
-    const size_t o=(size_t)v0*stride+p->dbCOff;float c[4];bool ok=p->dbCFmt && v0>=0;
-    if(ok && p->dbCFmt==MTLVertexFormatHalf4 && o+8<=len){const __fp16 *h=(const __fp16 *)(src+o);for(int q=0;q<4;q++)c[q]=(float)h[q];}
-    else if(ok && p->dbCFmt==MTLVertexFormatFloat4 && o+16<=len)memcpy(c,src+o,16);
-    else if(ok && p->dbCFmt==MTLVertexFormatUChar4Normalized && o+4<=len){for(int q=0;q<4;q++)c[q]=src[o+q]/255.f;}
-    else ok=false;
-    if(ok)DBP(" col %.3f,%.3f,%.3f,%.3f",c[0],c[1],c[2],c[3]);
-   }
-   // as clip space with w 1, in the viewport (else the attachment): pixels
-   const double vx=dbHaveVp?dbVp[0]:0,vy=dbHaveVp?dbVp[1]:0,vw=dbHaveVp?dbVp[2]:dbW,vh=dbHaveVp?dbVp[3]:dbH;
-   if(w0==1 && w1==1 && x0>=-1.01f && x1<=1.01f && y0>=-1.01f && y1<=1.01f)
-    DBP(" px %.0f,%.0f %.0fx%.0f",vx+(x0*0.5+0.5)*vw,vy+(0.5-y1*0.5)*vh,(x1-x0)*0.5*vw,(y1-y0)*0.5*vh);
-  } else DBP(" pos none");
- } else DBP(" pos ?fmt%u buf%u",fmt,buf);
- // the vertex stage's other bytes (CA's transform/uniforms): the first set index other than the position's, 16 floats
- for(uint32_t k=0;k<8;k++) if(k!=buf && !dbVbytes[k].empty()) {
-  DBP(" u%u/%zu:",k,dbVbytes[k].size());
-  for(size_t q=0;q+4<=dbVbytes[k].size() && q<64;q+=4){float f;memcpy(&f,dbVbytes[k].data()+q,4);DBP(" %.4g",f);}
-  break;
+  for(unsigned i=0;i<16;i++)if(fts[i].t||fts[i].sampler) {
+   if(fts[i].t){NBTexture *x=fts[i].t;id p=x.parent;const bool ios=x.surface||([p isKindOfClass:[NBTexture class]]&&((NBTexture *)p).surface);
+    snprintf(t,sizeof t,"  ftex %u %lux%lu fmt=%lu mips=%lu ios=%d",i,(unsigned long)x.width,(unsigned long)x.height,(unsigned long)x.pixelFormat,(unsigned long)x.mipmapLevelCount,(int)ios);}
+   else snprintf(t,sizeof t,"  ftex %u none",i);
+   text+=t;if(fts[i].sampler)text+=" sampler";text+="\n";
+  }
+  if(!fbytes.empty()){text+="  fbytes:"+fbytes+"\n";fbytes.clear();}
+  draws++;
  }
- // g9: and the first vertex buffer other than the position's (CA's transform when it is not set as bytes): 16 floats at its offset
- for(uint32_t k=0;k<8;k++) if(k!=buf && dbVbytes[k].empty() && dbVb[k] && [dbVb[k] isKindOfClass:[NBBuffer class]]) {
-  const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)dbVb[k] contents];const NSUInteger l=[(id<MTLBuffer>)dbVb[k] length];
-  if(!c || dbVbOff[k]>=l)continue;
-  DBP(" b%u+%lu:",k,(unsigned long)dbVbOff[k]);
-  for(size_t q=0;q+4<=l-dbVbOff[k] && q<64;q+=4){float f;memcpy(&f,c+dbVbOff[k]+q,4);DBP(" %.4g",f);}
-  break;
+ void finish() {
+  if(!drawLogBig(w,h)||(int)draws<drawLogMin()||gDrawLogBlocks>=drawLogCount())return;
+  const int match=gDrawLogMatched++;if(match<drawLogSkip())return;   // sweet drawlog: SWEET_DRAWLOG_SKIP
+  gDrawLogBlocks++;
+  if(FILE *f=fopen(drawLogPath(),"a")) {
+   fprintf(f,"=== pass %lux%lu fmt=%lu load=%lu store=%lu depthstencil=%d draws=%u match=%d%s%s\n%s",w,h,format,load,store,(int)depth,draws,match,atts.c_str(),tail.c_str(),text.c_str());
+   fclose(f);
+  }
  }
-#undef DBP
- sm2_logs(line);
+};
+// sweet cull (SWEET_CULL=1): dead-draw culling. Off (one cached getenv) unless set. A render pass with one colour target and no depth/stencil defers
+// every encoder call; at endEncoding, draws before the last full-target opaque rectangle draw (whitelisted Core Animation pipelines) are skipped.
+static bool cullEnabled() {
+ static const bool on=[]{const char *p=getenv("SWEET_CULL");return p&&atoi(p)!=0&&atoi(p)!=2&&atoi(p)!=3;}();   // 2, 3: see cull2On, cull3On, not this cull
+ return on;
 }
-// g9 (SWEET_DEADFILL): is this draw a full-target opaque constant-colour fill? Only Core Animation's untextured, unblended
-// "draw.PBGRAXm_A2Xhf" pipeline (all channels written), one instance of triangles, no depth/stencil state, viewport and scissor
-// the whole attachment (or unset), the position attribute (float4, w 1) spanning exactly [0,W]x[0,H] pixels or [-1,1] clip space,
-// and every drawn vertex's colour attribute the same with alpha 1. Its colour into col.
-- (bool)dfIsFill:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
-          offset:(NSUInteger)ioff base:(int32_t)base color:(float *)col {
- NBRenderPipeline *p=dbPipe;
- if(!p || dfDss || inst!=1 || (prim!=MTLPrimitiveTypeTriangle && prim!=MTLPrimitiveTypeTriangleStrip) || count<3 || count>64)return false;
- if(strcmp(p->dbLabel,"draw.PBGRAXm_A2Xhf") || p->dbBlend || p->dbMask!=0xf)return false;
- if(p->dfSamples>1 || p->dfA2C || rasterCull!=MTLCullModeNone || rasterFill!=MTLTriangleFillModeFill)return false;   // g10: every pixel, once
- if(p->dbFmt!=MTLVertexFormatFloat4 && p->dbFmt!=MTLVertexFormatFloat2)return false;
- if(p->dbCFmt!=MTLVertexFormatHalf4 && p->dbCFmt!=MTLVertexFormatFloat4 && p->dbCFmt!=MTLVertexFormatUChar4Normalized)return false;
- if(!dbW || !dbH || p->dbBuf>=8)return false;
- if(dbHaveVp && (dbVp[0]!=0 || dbVp[1]!=0 || dbVp[2]!=dbW || dbVp[3]!=dbH))return false;
- if(dbHaveSc && (dbSc[0]!=0 || dbSc[1]!=0 || dbSc[2]!=dbW || dbSc[3]!=dbH))return false;
- const uint8_t *src=nullptr;size_t len=0;
- if(!dbVbytes[p->dbBuf].empty()){src=dbVbytes[p->dbBuf].data();len=dbVbytes[p->dbBuf].size();}
- else if(id vb=dbVb[p->dbBuf]){if(![vb isKindOfClass:[NBBuffer class]])return false;const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];
-  const NSUInteger l=[(id<MTLBuffer>)vb length];if(c && dbVbOff[p->dbBuf]<l){src=c+dbVbOff[p->dbBuf];len=l-dbVbOff[p->dbBuf];}}
- if(!src)return false;
- const uint8_t *ix=nullptr;size_t ilen=0;
- if(ib){if(![(id)ib isKindOfClass:[NBBuffer class]])return false;const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)ib contents];const NSUInteger l=[(id<MTLBuffer>)ib length];
-  if(!c || ioff>=l)return false;ix=c+ioff;ilen=l-ioff;}
- const int comps=p->dbFmt==MTLVertexFormatFloat4?4:2;
- const uint32_t stride=p->dbStride?p->dbStride:(uint32_t)comps*4;
- if(!(prim==MTLPrimitiveTypeTriangle?count==6:count==4))return false;   // one rectangle: two triangles
- float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;float c0[4]={0,0,0,0};float vx[6],vy[6],vz[6];
- for(uint32_t k=0;k<count;k++) {
-  int64_t v;
-  if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)return false;v=((const uint16_t *)ix)[k];}else{if((k+1)*4>ilen)return false;v=((const uint32_t *)ix)[k];}v+=base;}
-  else v=(int64_t)start+k;
-  if(v<0)return false;
-  const size_t o=(size_t)v*stride+p->dbOff;if(o+comps*4>len)return false;
-  float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
-  if(q[3]!=1)return false;
-  vx[k]=q[0];vy[k]=q[1];vz[k]=comps==4?q[2]:0;
-  x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
-  const size_t co=(size_t)v*stride+p->dbCOff;float c[4];
-  if(p->dbCFmt==MTLVertexFormatHalf4){if(co+8>len)return false;const __fp16 *h=(const __fp16 *)(src+co);for(int i=0;i<4;i++)c[i]=(float)h[i];}
-  else if(p->dbCFmt==MTLVertexFormatFloat4){if(co+16>len)return false;memcpy(c,src+co,16);}
-  else{if(co+4>len)return false;for(int i=0;i<4;i++)c[i]=src[co+i]/255.f;}
-  if(k==0)memcpy(c0,c,sizeof c0);else if(memcmp(c0,c,sizeof c0))return false;
- }
- if(c0[3]!=1)return false;
- const bool pixels=fabsf(x0)<=0.01f && fabsf(y0)<=0.01f && fabsf(x1-(float)dbW)<=0.01f && fabsf(y1-(float)dbH)<=0.01f;
- const bool clip=fabsf(x0+1)<=1e-4f && fabsf(y0+1)<=1e-4f && fabsf(x1-1)<=1e-4f && fabsf(y1-1)<=1e-4f;
- if(!pixels && !clip)return false;
- // the two triangles cover the rectangle: their vertices are its corners, each triangle three distinct ones, and the two they share
- // are opposite corners (a diagonal)
- int cr[6];
- for(uint32_t k=0;k<count;k++) {
-  const bool lx=vx[k]==x0,hx=vx[k]==x1,ly=vy[k]==y0,hy=vy[k]==y1;
-  if(!(lx||hx) || !(ly||hy))return false;
-  cr[k]=(hx?1:0)|(hy?2:0);
- }
- const int t0[3]={cr[0],cr[1],cr[2]},t1[3]={prim==MTLPrimitiveTypeTriangle?cr[3]:cr[1],prim==MTLPrimitiveTypeTriangle?cr[4]:cr[2],prim==MTLPrimitiveTypeTriangle?cr[5]:cr[3]};
- auto distinct=[](const int *t){return t[0]!=t[1] && t[1]!=t[2] && t[0]!=t[2];};
- if(!distinct(t0) || !distinct(t1))return false;
- int shared[3],ns=0;
- for(int a=0;a<3;a++)for(int b=0;b<3;b++)if(t0[a]==t1[b] && ns<3)shared[ns++]=t0[a];
- if(ns!=2 || (shared[0]^shared[1])!=3)return false;
- memcpy(col,c0,sizeof c0);
- dfClipKind=clip;
- // g10: may this fill become the pass's clear? CA's fixed vertex function, no other attached colour written, and its transform (the first
- // vertex binding other than the position's: a column-major 4x4, as DRAWBOX prints it) taking every vertex exactly onto a corner of clip
- // space with w 1 and z in [0,1]: the rectangle drawn is the whole target, whatever the positions' space
- // (a clear writes colour 0 only: a fill that may write a lasting colour 1..7 too keeps its draw)
- uint8_t why=0;
- if(strncmp(p->encNames,"fixed_vert_lph_spc + ",21))why|=1;
- for(int i=1;i<8;i++)if(((dfAttached>>i)&1) && p->dfMasks[i])why|=2;
- const float *m=[self dfTransform];
- if(!m)why|=4;
- bool clr=!why;
- float cx0=1e30f,cx1=-1e30f,cy0=1e30f,cy1=-1e30f;
- for(uint32_t k=0;k<count && clr;k++) {
-  const float x=vx[k],y=vy[k],z=vz[k];
-  const float cx=m[0]*x+m[4]*y+m[8]*z+m[12],cy=m[1]*x+m[5]*y+m[9]*z+m[13],cz=m[2]*x+m[6]*y+m[10]*z+m[14],cw=m[3]*x+m[7]*y+m[11]*z+m[15];
-  if(fabsf(cw-1)>1e-5f || fabsf(fabsf(cx)-1)>1e-4f || fabsf(fabsf(cy)-1)>1e-4f || cz<0 || cz>1)clr=false;
-  cx0=std::min(cx0,cx);cx1=std::max(cx1,cx);cy0=std::min(cy0,cy);cy1=std::max(cy1,cy);
- }
- if(clr && (cx0>-0.999f || cx1<0.999f || cy0>-0.999f || cy1<0.999f))clr=false;
- if(!why && !clr)why|=8;
- dfClearOK=clr;dfWhyLast=why;
+static std::atomic<unsigned> gCullPasses,gCullDraws;
+// sweet cull: why a whitelisted draw was not covering (first 12 times per process)
+static void cullWhy(int why,NSString *l,const char *extra="") {
+ static std::atomic<int> said{0},img{0};if([l hasSuffix:@"Isrc"]?img++>=12:said++>=4)return;   // the wallpaper quad gets its own 12
+ char t[300];snprintf(t,sizeof t,"SWEET CULL: not covering #%d %s %s",why,l.UTF8String,extra);sm2_logs(t);
+}
+// sweet deadfill (SWEET_DEADFILL, from ios-redfin's frontend, MIT): 0 off, unset 3, 1 drop Core Animation's full-target opaque
+// constant-colour fills (draw.PBGRAXm_A2Xhf) whose next draw is the same fill (same pipeline, same other vertex bindings: the same
+// pixels), 2 also: the creation of a pass loading colour 0 waits for endEncoding, and if its first surviving draw is such a fill whose
+// transform maps it onto the whole target, the pass clears to its colour (8-bit code) and the draw goes. backboardd's passes only:
+// colour 0 an 8-bit unorm single-sample 2D IOSurface, no depth/stencil/visibility; colours 1..7 may be attached (a clear is refused when
+// the fill writes one that is not memoryless). Uses sweet cull's deferral; the telemetry's "DF" row counts drops and clears.
+// 3 as 2 (the clear still needs a fill covering the target), and fills needn't cover the target to be dropped: one also goes when the next fill's rectangle contains its own,
+// both flat at one z. Same pipeline and bindings: the same transform, so what contains in vertex space contains on screen.
+static int deadfillMode() {
+ static const int mode=[]{const char *p=getenv("SWEET_DEADFILL");if(strcmp(getprogname(),"backboardd"))return 0;if(!p||!*p)return 3;return std::max(0,std::min(3,atoi(p)));}();   // default 3 (speed defaults, 2026-11-01); 0 off
+ return mode;
+}
+// sweet cull 2 (SWEET_CULL=2, only with SWEET_DEADFILL=3; ignored otherwise, off: unset): a fill also goes when a later whitelisted opaque draw (the wallpaper) covers all its pixels and
+// no draw in between may read the destination. Draws in between need no rectangle: what they leave on the fill's pixels is overwritten too. Sweet cull's own loop stays off.
+static bool cull2On() {static const bool on=[]{const char *p=getenv("SWEET_CULL");return p&&(atoi(p)==2||atoi(p)==3)&&deadfillMode()==3;}();return on;}   // 3 uses its machinery (see cull3On)
+// sweet cull 3 (SWEET_CULL=3, only with SWEET_DEADFILL=3; off: unset or any other value): cover cull. As 2's covering draws, plus CA's opaque blurred-backdrop quad
+// (draw.PBGRAXm_TimgA2Xhfn_IsrcCcl: Isrc's constants but fc_coord_function0 5). Any earlier draw goes, not only fills, when its pixels (clip within its vertices'
+// bbox through CA's transform, rounded outward) lie inside a later cover's, it writes no target the cover doesn't overwrite, and no draw in between may read
+// the destination and write a target the cover leaves (reads are per pixel: what they read of it is overwritten too). 2's own fill loop stays off. Telemetry: "DF3" row.
+static bool cull3On() {static const bool on=[]{const char *p=getenv("SWEET_CULL");return p&&atoi(p)==3&&deadfillMode()==3;}();return on;}
+static std::atomic<uint64_t> gC3Draws,gC3Px;   // sweet cull 3: draws dropped under a cover, and their boxes' pixels
+// sweet deadatt (SWEET_CULL_DEADATT=1, only with cull 3; off: unset or 0): after cull 3, walking back, a surviving draw goes when every target it writes is
+// dead (colour 1..7, no resolve, memoryless or store DontCare) and no later surviving draw may read it (CA's c1 writers whose IsrcM1 readers went under
+// the cover, gt1). May read: blending or a partial write mask on it; any destination read or memoryless input (label "M<digit>", fc_memoryless_index* set)
+// counts as reading every target of its pipeline. Only CA's known shader pairs go (they store nothing); others read all. Telemetry: "deadatt" in the DF3 row.
+static bool deadattOn() {static const bool on=[]{const char *p=getenv("SWEET_CULL_DEADATT");return p&&atoi(p)!=0;}();return on;}
+static std::atomic<uint64_t> gDeadAtt;
+// sweet mask0 (SWEET_CULL_MASK0=1; off: unset or 0): a draw that writes nothing is never recorded: its pipeline has write mask 0 on every colour attachment
+// and rasterization on, the pass has no depth, stencil or visibility buffer, and the pipeline is Core Animation's (label) with a vertex/fragment pair known
+// to store nothing to memory (the bridge has no reflection of shader stores, so other shaders are kept). CA's S1 (stencil) draws in its no-stencil passes,
+// about 2.65 Mpx per full-size Home pass (cc dl3). Any pass, deferred or not: a skipped draw never exists for sweet cull / deadfill. Telemetry: "M0" row.
+static bool mask0On() {static const bool on=[]{const char *p=getenv("SWEET_CULL_MASK0");return p&&atoi(p)!=0;}();return on;}
+static std::atomic<uint64_t> gM0Skipped;
+// sweet cull 2: is this "name:type:hex" among a function's constants?
+static bool dfConstIs(const std::string &t,const std::string &kv) {
+ const size_t p=t.find(kv);return p!=std::string::npos&&(p==0||t[p-1]==' ')&&(p+kv.size()==t.size()||t[p+kv.size()]==' ');
+}
+// sweet cull 2: a rectangle through CA's pixels-to-clip transform, back to pixels. Only an axis-aligned 2D transform with w 1 and z in the clip range; the viewport must be the target.
+static bool dfPixelRect(const float *m,float x0,float y0,float x1,float y1,float z,unsigned long tw,unsigned long th,double *r) {
+ for(int i=0;i<16;i++)if(!std::isfinite(m[i]))return false;
+ if(m[0]==0||m[5]==0||m[1]!=0||m[2]!=0||m[3]!=0||m[4]!=0||m[6]!=0||m[7]!=0||m[8]!=0||m[9]!=0||m[11]!=0||m[15]!=1)return false;
+ const double cz=(double)m[10]*z+m[14];if(!(cz>=0&&cz<=1))return false;
+ const double ax=((double)m[0]*x0+m[12]+1)*0.5*tw,bx=((double)m[0]*x1+m[12]+1)*0.5*tw,ay=(1-((double)m[5]*y0+m[13]))*0.5*th,by=(1-((double)m[5]*y1+m[13]))*0.5*th;
+ r[0]=std::min(ax,bx);r[1]=std::min(ay,by);r[2]=std::max(ax,bx);r[3]=std::max(ay,by);
+ for(int i=0;i<4;i++)if(!(fabs(r[i])<1e6))return false;
  return true;
 }
-// g10: the vertex transform: the first vertex-stage binding other than the position's with 16 floats (bytes, else a buffer at its offset)
-- (const float *)dfTransform {
- const uint32_t buf=dbPipe?dbPipe->dbBuf:99;
- for(uint32_t k=0;k<8;k++) {
-  if(k==buf)continue;
-  if(!dbVbytes[k].empty())return dbVbytes[k].size()>=64?(const float *)dbVbytes[k].data():nullptr;
-  if(id vb=dbVb[k]) {
-   if(![vb isKindOfClass:[NBBuffer class]])return nullptr;
-   const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];const NSUInteger l=[(id<MTLBuffer>)vb length];
-   if(!c || dbVbOff[k]+64>l || (dbVbOff[k]&3))return nullptr;
-   return (const float *)(c+dbVbOff[k]);
+// sweet cull 2: the first pixel whose centre is at or past v (margin 1/256 pixel, the rasterizer's grid at most; + moves it right)
+static long dfPix(double v,double margin) {return (long)ceil(v-0.5+margin/256);}
+static std::atomic<uint64_t> gDfDropped,gDfCleared,gDfPasses;
+// sweet dfwhy (SWEET_DFWHY=1): why fills weren't dropped: per 5 s, how many draws each test of dfNote turned away, and of the fills it found, why dfResolve
+// kept them (next: the next surviving draw is no fill; pipe, bind: another fill; rect: mode 3, its rectangle not contained; last: none follows; nocull: the pass
+// doesn't cull; cullrect: sweet cull 2, a covering draw doesn't contain it; cullbetween: sweet cull 2, a draw that may read the destination comes first). Counts only. Off: unset. SWEET_DFWHY=2 also logs a not-full fill's rectangle and target, at most once per second.
+enum {DFW_NOPIPE,DFW_DSS,DFW_VIS,DFW_INST,DFW_PRIM,DFW_LABEL,DFW_OPAQUE,DFW_MSAA,DFW_BLEND,DFW_CULL,DFW_VFMT,DFW_VP,DFW_SC,DFW_DATA,DFW_INDEX,DFW_RANGE,DFW_W,DFW_COL,DFW_ALPHA,DFW_NOTFULL,DFW_CORNER,DFW_TRIS,DFW_NEXT,DFW_PIPE,DFW_BIND,DFW_LAST,DFW_NOCULL,DFW_RECT,DFW_CULLBETWEEN,DFW_CULLRECT,DFW_N};
+static const char *const gDfWhyName[DFW_N]={"nopipe","dss","vis","inst","prim","label","opaque","msaa","blend","cull","vfmt","vp","sc","data","index","range","w","col","alpha","notfull","corner","tris","next","pipe","bind","last","nocull","rect","cullbetween","cullrect"};
+static std::atomic<uint64_t> gDfWhy[DFW_N];
+static bool dfWhyOn() {static const bool on=[]{const char *p=getenv("SWEET_DFWHY");return p&&atoi(p)!=0;}();return on;}
+static void dfWhy(int why) {if(dfWhyOn())gDfWhy[why]++;}
+static void dfWhyLog() {
+ if(!dfWhyOn())return;
+ static std::atomic<uint64_t> last{0},lastDrop{0};const uint64_t now=nowUs();uint64_t was=last.load();
+ if(now-was<5000000||!last.compare_exchange_strong(was,now))return;
+ const uint64_t dr=gDfDropped.load();char t[640];int n=snprintf(t,sizeof t,"SWEET DFWHY: 5s dropped %llu |",(unsigned long long)(dr-lastDrop.exchange(dr)));
+ for(int i=0;i<DFW_N&&n<(int)sizeof t-32;i++)if(const uint64_t c=gDfWhy[i].exchange(0))n+=snprintf(t+n,sizeof t-n," %s %llu",gDfWhyName[i],(unsigned long long)c);
+ sm2_logs(t);
+}
+static void dfRectProbe(float x0,float y0,float x1,float y1,unsigned long tw,unsigned long th) {
+ static const bool on=[]{const char *p=getenv("SWEET_DFWHY");return p&&atoi(p)==2;}();if(!on)return;
+ static std::atomic<uint64_t> last{0};const uint64_t now=nowUs();uint64_t was=last.load();
+ if(now-was<1000000||!last.compare_exchange_strong(was,now))return;
+ char t[128];snprintf(t,sizeof t,"SWEET DFWHY: notfull rect %.3f,%.3f..%.3f,%.3f target %lux%lu",x0,y0,x1,y1,tw,th);sm2_logs(t);
+}
+#define DFRET(why) do{dfWhy(why);return;}while(0)
+struct CullEntry {bool fill=false,clearOK=false,full=false,rok=false;float col[4]={},rx0=0,ry0=0,rx1=0,ry1=0,rz=0;uint64_t bind=0;__unsafe_unretained NBRenderPipeline *fpipe=nil;   // sweet deadfill: r*: mode 3, the fill's vertex bbox and z; rok: finite, one z
+ bool prok=false,reads=true;long px0=0,py0=0,px1=0,py1=0;   // sweet cull 2: p*: the pixels a fill may touch, known if prok; reads: the draw may read the destination
+ bool hok=false;long hx0=0,hy0=0,hx1=0,hy1=0;   // sweet cull 3: h*: the pixels any draw may touch, known if hok
+ unsigned dar=0xff;bool dok=false;   // sweet deadatt: targets the draw may read; dok: it may be dropped
+ void (^blk)(void)=nil;bool draw=false,covering=false;unsigned writes=0xff,over=0;long cx0=0,cy0=0,cx1=0,cy1=0;NSString *label=nil;};   // c*: the draw's clip (scissor within the target)   // writes: targets the draw may change; over: targets a covering draw overwrites
+@interface NBRenderEncoder : NBEncoder
+- (void)drawLogStart:(MTLRenderPassDescriptor *)d;
+- (bool)dfHold:(const NmbRenderPassDescriptor &)pass load:(MTLLoadAction)load;
+- (bool)m0Skip;
+@end
+@implementation NBRenderEncoder {
+ std::unique_ptr<DrawLog> _dl;   // sweet drawlog: null unless this pass is a big one and SWEET_DRAWLOG is set
+ // sweet cull
+ BOOL _defer,_noCull,_vpSet,_scSet;
+ unsigned long _tw,_th;unsigned _attMask;
+ std::vector<CullEntry> _ops;
+ NBRenderPipeline *_pipe;
+ NBBuffer *_cvb;NSUInteger _cvbOff;
+ double _cvp[6];unsigned long _csc[4];
+ NSUInteger _cvis;
+ // sweet deadfill: vertex-stage bindings 0..7 (buffer + offset, or bytes), a depth/stencil state set, the held pass (mode 2), colours 1..7 not memoryless
+ BOOL _cvRect;long _cvr[4];   // sweet cull 2: from coversPrim to recDraw: the pixels surely covered
+ BOOL _dfOn,_dfDss,_dfPending,_cullPass;NBBuffer *_dfVb[8];NSUInteger _dfVbOff[8];std::vector<uint8_t> _dfVbytes[8];
+ NmbRenderPassDescriptor _dfPass;unsigned _dfAttached;
+ unsigned _daDead;   // sweet deadatt: colours 1..7 whose contents end with the pass (no resolve, memoryless or store DontCare)
+ BOOL _m0Pass;NBRenderPipeline *_m0Pipe;   // sweet mask0: the pass has no depth/stencil/visibility; the pipeline set last
+}
+- (bool)m0Skip {if(!_m0Pass||!_m0Pipe.m0)return false;gM0Skipped++;return true;}   // sweet mask0
+- (void)rec:(void (^)(void))b {CullEntry e;e.blk=[b copy];_ops.push_back(e);}
+- (void)clip:(long *)c {   // sweet cull: scissor within the target
+ c[0]=0;c[1]=0;c[2]=(long)_tw;c[3]=(long)_th;
+ if(_scSet){c[0]=std::max(c[0],(long)_csc[0]);c[1]=std::max(c[1],(long)_csc[1]);c[2]=std::min(c[2],(long)(_csc[0]+_csc[2]));c[3]=std::min(c[3],(long)(_csc[1]+_csc[3]));}
+}
+- (void)recDraw:(void (^)(void))b covering:(bool)c {CullEntry e;e.blk=[b copy];e.draw=true;e.covering=c;
+ {long r[4];[self clip:r];e.cx0=r[0];e.cy0=r[1];e.cx1=r[2];e.cy1=r[3];}
+ if(c&&_cvRect){e.cx0=_cvr[0];e.cy0=_cvr[1];e.cx1=_cvr[2];e.cy1=_cvr[3];}   // sweet cull 2: the clip within the vertex bbox
+ e.reads=!_pipe||!_pipe.dfNoDest;   // sweet cull 2
+ e.label=_pipe.label;
+ if(_pipe){e.writes=_pipe.writtenMask&_attMask;e.over=_pipe.opaqueMask&_attMask;e.dar=_pipe.daRead;e.dok=_pipe.daKnown;}_ops.push_back(e);}   // sweet deadatt: dar, dok
+// sweet cull: is this draw an opaque, exactly-rectangular, full-target draw of a whitelisted pipeline?
+- (bool)coversPrim:(unsigned long)prim start:(NSUInteger)s count:(NSUInteger)n inst:(NSUInteger)inst indexed:(bool)indexed indexType:(MTLIndexType)ik
+         indexBuffer:(NBBuffer *)ib indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv {
+ _cvRect=NO;
+ if(!_defer||_noCull||!_cullPass||!_pipe||prim!=MTLPrimitiveTypeTriangle||inst!=1||n!=6||_cvis)return false;
+ NSString *l=_pipe.label;
+ const bool ccl=cull3On()&&[l isEqualToString:@"com.apple.coreanimation.draw.PBGRAXm_TimgA2Xhfn_IsrcCcl"];   // sweet cull 3: the blurred backdrop
+ if(!l||!([l isEqualToString:@"com.apple.coreanimation.draw.PBGRAXm_A2Xhf"]||[l isEqualToString:@"com.apple.coreanimation.draw.PBGRAXm_TimgA2Xhfn_Isrc"]||ccl))return false;
+ if(cull2On()&&![l isEqualToString:@"com.apple.coreanimation.draw.PBGRAXm_TimgA2Xhfn_Isrc"]&&!ccl)return false;   // sweet cull 2: labels known not to discard: exactly this one (3: and IsrcCcl, unverified)
+ if(!(_pipe.opaqueMask&1)){char t[64];snprintf(t,sizeof t,"opaque %x att %x",_pipe.opaqueMask,_attMask);cullWhy(1,l,t);return false;}   // overwrites target 0 at least; per-draw targets are checked at replay
+ long cr[4];[self clip:cr];if(cr[0]>=cr[2]||cr[1]>=cr[3])return false;
+ if(_vpSet&&!(_cvp[0]<=cr[0]&&_cvp[1]<=cr[1]&&_cvp[0]+_cvp[2]>=cr[2]&&_cvp[1]+_cvp[3]>=cr[3])){cullWhy(2,l);return false;}
+ if(!_cvb||_cvb.storageMode!=MTLStorageModeShared){cullWhy(4,l);return false;}
+ const char *vc=(const char *)_cvb.contents;if(!vc){cullWhy(5,l);return false;}
+ NSUInteger stride=48;   // assumed (drawlog); the vertex descriptor, when present, must agree on a float4 position at offset 0
+ if(_pipe.vstride){if(!_pipe.vpos0){char t[64];snprintf(t,sizeof t,"vstride %lu",(unsigned long)_pipe.vstride);cullWhy(6,l,t);return false;}stride=_pipe.vstride;}
+ if(stride<16){cullWhy(7,l);return false;}
+ long vid[6];
+ for(unsigned k=0;k<6;k++) {
+  if(!indexed)vid[k]=(long)(s+k);
+  else {
+   if(!ib||ib.storageMode!=MTLStorageModeShared||!ib.contents){cullWhy(8,l);return false;}
+   const NSUInteger isz=ik==MTLIndexTypeUInt16?2:4;
+   if(io+(k+1)*isz>ib.length){cullWhy(9,l);return false;}
+   uint32_t ix;const char *ip=(const char *)ib.contents+io+k*isz;
+   if(isz==2){uint16_t t;memcpy(&t,ip,2);ix=t;}else memcpy(&ix,ip,4);
+   vid[k]=(long)ix+(long)bv;
   }
+ }
+ float p[6][2],pz[6];
+ for(unsigned k=0;k<6;k++) {
+  if(vid[k]<0){cullWhy(10,l);return false;}
+  const NSUInteger off=_cvbOff+(NSUInteger)vid[k]*stride;
+  if(off+16>_cvb.length){cullWhy(11,l);return false;}
+  float v[4];memcpy(v,vc+off,16);
+  if(!std::isfinite(v[0])||!std::isfinite(v[1])||v[3]!=1.0f){cullWhy(12,l);return false;}   // pixel space: w == 1
+  p[k][0]=v[0];p[k][1]=v[1];pz[k]=v[2];
+ }
+ float x0=p[0][0],x1=x0,y0=p[0][1],y1=y0;
+ for(unsigned k=1;k<6;k++){x0=std::min(x0,p[k][0]);x1=std::max(x1,p[k][0]);y0=std::min(y0,p[k][1]);y1=std::max(y1,p[k][1]);}
+ if(!(x0<x1&&y0<y1)){cullWhy(13,l);return false;}
+ unsigned id[6];
+ for(unsigned k=0;k<6;k++) {
+  if(!(p[k][0]==x0||p[k][0]==x1)||!(p[k][1]==y0||p[k][1]==y1)){cullWhy(14,l);return false;}
+  id[k]=(p[k][0]==x1?1u:0u)|(p[k][1]==y1?2u:0u);
+ }
+ // two triangles, each three distinct corners, sharing a diagonal: together exactly the rectangle
+ if(id[0]==id[1]||id[0]==id[2]||id[1]==id[2]||id[3]==id[4]||id[3]==id[5]||id[4]==id[5]){cullWhy(15,l);return false;}
+ unsigned ma=(1u<<id[0])|(1u<<id[1])|(1u<<id[2]),mb=(1u<<id[3])|(1u<<id[4])|(1u<<id[5]);
+ if((ma|mb)!=15||__builtin_popcount(ma&mb)!=2){cullWhy(16,l);return false;}
+ unsigned sh=ma&mb,a=(unsigned)__builtin_ctz(sh),b=(unsigned)(31-__builtin_clz(sh));
+ if((a^b)!=3){cullWhy(17,l);return false;}
+ if(cull2On()) {   // sweet cull 2: blend off and every pixel of its rectangle written, whatever the texture's alpha; the rectangle may be smaller than the clip
+  NBRenderPipeline *q=_pipe;NSNumber *cm=objc_getAssociatedObject(self,"cull"),*fm=objc_getAssociatedObject(self,"fill");
+  if(_dfDss||q.dfSamples>1||q.dfA2C||(q.writtenMask&~q.opaqueMask)||!q.dfNoDest||q.dfPosBuf!=1||q.vertexName.compare(0,18,"fixed_vert_lph_spc")||cm.unsignedLongLongValue!=MTLCullModeNone||fm.unsignedLongLongValue!=MTLTriangleFillModeFill){cullWhy(20,l);return false;}
+  if(_vpSet&&(_cvp[0]!=0||_cvp[1]!=0||_cvp[2]!=_tw||_cvp[3]!=_th)){cullWhy(21,l);return false;}
+  for(unsigned k=1;k<6;k++)if(pz[k]!=pz[0]){cullWhy(22,l);return false;}
+  const float *m=[self dfTransform:1];double r[4];
+  if(!m||!dfPixelRect(m,x0,y0,x1,y1,pz[0],_tw,_th,r)){cullWhy(23,l);return false;}
+  _cvr[0]=std::max(cr[0],dfPix(r[0],1));_cvr[1]=std::max(cr[1],dfPix(r[1],1));_cvr[2]=std::min(cr[2],dfPix(r[2],-1));_cvr[3]=std::min(cr[3],dfPix(r[3],-1));
+  if(_cvr[0]>=_cvr[2]||_cvr[1]>=_cvr[3]){cullWhy(24,l);return false;}
+  _cvRect=YES;return true;
+ }
+ if(!(x0<=(float)cr[0]&&y0<=(float)cr[1]&&x1>=(float)cr[2]&&y1>=(float)cr[3])){char t[160];snprintf(t,sizeof t,"rect %.1f,%.1f..%.1f,%.1f",x0,y0,x1,y1);cullWhy(99,l,t);return false;}
+ return true;
+}
+// sweet deadfill: vertex binding k's bytes from its offset (set bytes, else a shared buffer's contents)
+- (const uint8_t *)dfData:(unsigned)k length:(size_t *)len {
+ if(k>=8)return nullptr;
+ if(!_dfVbytes[k].empty()){*len=_dfVbytes[k].size();return _dfVbytes[k].data();}
+ NBBuffer *b=_dfVb[k];if(!b||b.storageMode!=MTLStorageModeShared||!b.contents||_dfVbOff[k]>=b.length)return nullptr;
+ *len=b.length-_dfVbOff[k];return (const uint8_t *)b.contents+_dfVbOff[k];
+}
+// sweet deadfill: the transform (the first vertex binding other than the position's with 16 floats, column-major 4x4)
+- (const float *)dfTransform:(unsigned)pos {
+ for(unsigned k=0;k<8;k++) {
+  if(k==pos||(_dfVbytes[k].empty()&&!_dfVb[k]))continue;
+  size_t l=0;const uint8_t *c=[self dfData:k length:&l];
+  return c&&l>=64&&!((uintptr_t)c&3)?(const float *)c:nullptr;
  }
  return nullptr;
 }
-// g9: the vertex stage's bindings other than the position's (CA's transform/uniforms): a held fill is dropped only for a fill drawn
-// with the same ones (same positions and same transform: the same pixels)
-- (uint64_t)dfBindHash {
- const uint32_t buf=dbPipe?dbPipe->dbBuf:99;uint64_t h=1469598103934665603ull;
+// sweet deadfill: the vertex bindings other than the position's (contents, first 256 bytes: CA's uniforms sit in a ring buffer)
+- (uint64_t)dfBindHash:(unsigned)pos {
+ uint64_t h=1469598103934665603ull;
  auto mix=[&](const void *p,size_t n){const uint8_t *b=(const uint8_t *)p;for(size_t i=0;i<n;i++){h^=b[i];h*=1099511628211ull;}};
- for(uint32_t k=0;k<8;k++) {
-  if(k==buf)continue;
-  // the bound bytes (CA's per-draw uniforms come from a ring buffer at changing offsets: their contents, not where they are)
-  if(!dbVbytes[k].empty()){mix(&k,sizeof k);mix(dbVbytes[k].data(),std::min<size_t>(dbVbytes[k].size(),256));}
-  else if(id vb=dbVb[k]) {
-   mix(&k,sizeof k);
-   if([vb isKindOfClass:[NBBuffer class]]){const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];const NSUInteger l=[(id<MTLBuffer>)vb length];
-    if(c && dbVbOff[k]<l)mix(c+dbVbOff[k],std::min<size_t>(l-dbVbOff[k],256));else{const void *o=(__bridge const void *)vb;mix(&o,sizeof o);}}
-   else{const void *o=(__bridge const void *)vb;mix(&o,sizeof o);}
-  }
+ for(unsigned k=0;k<8;k++) {
+  if(k==pos||(_dfVbytes[k].empty()&&!_dfVb[k]))continue;
+  mix(&k,sizeof k);size_t l=0;
+  if(const uint8_t *c=[self dfData:k length:&l])mix(c,std::min<size_t>(l,256));else{const void *o=(__bridge const void *)_dfVb[k];mix(&o,sizeof o);mix(&_dfVbOff[k],sizeof _dfVbOff[k]);}
  }
  return h;
 }
-// g9: before a draw goes out: resolve a held fill against it. True: this draw is held itself (it is a fill), recorded as the stash's next entry.
-- (void)dfDraw:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
-        offset:(NSUInteger)ioff base:(int32_t)base {
- float col[4];
- const bool fill=[self dfIsFill:prim start:start count:count inst:inst index:ib type:itype offset:ioff base:base color:col];
- const uint32_t d=dbDraws?dbDraws-1:0;
- if(fill) {
-  const uint64_t bind=[self dfBindHash]^(dfClipKind?0x9e3779b97f4a7c15ull:0);
-  if(dfCapturing && dfHeld>=0 && (bind!=dfHeldBind || (id)dbPipe!=dfHeldPipe)) {   // another transform or pipeline: the held one goes out first (kept)
-   const bool clearIt=false;[self dfRelease:clearIt clear:clearIt];
-  }
-  if(dfCapturing && dfHeld>=0) {   // the held fill is completely overwritten by this one
-   dfList[(size_t)dfHeld].op=EO_COUNT;gDfDropped.fetch_add(1);gDfPx.fetch_add(dfPx);
-   if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF dropped (overwritten by d%u)",dbFrame,dbPass,dfHeldD,d);sm2_logs(l);}
-  }
-  gDfDeferred.fetch_add(1);
-  [self dfCapture];
-  dfHeld=(int32_t)dfList.size();dfHeldD=d;memcpy(dfHeldCol,col,sizeof col);dfPx=(uint64_t)dbW*dbH;dfHeldBind=bind;dfHeldPx=dfClearOK;dfWhy=dfWhyLast;dfHeldPipe=dbPipe;
-  return;
+// sweet deadfill: marks the draw just recorded when it is a full-target opaque constant-colour fill (and whether it may be the clear)
+- (void)dfNote:(MTLPrimitiveType)prim start:(NSUInteger)start count:(NSUInteger)count inst:(NSUInteger)inst indexBuffer:(NBBuffer *)ib type:(MTLIndexType)itype
+        offset:(NSUInteger)ioff base:(NSInteger)base {
+ NBRenderPipeline *p=_pipe;CullEntry &e=_ops.back();
+ dfWhyLog();
+ if(!p)DFRET(DFW_NOPIPE);
+ if(_dfDss)DFRET(DFW_DSS);
+ if(_cvis)DFRET(DFW_VIS);
+ if(inst!=1)DFRET(DFW_INST);
+ if(!(prim==MTLPrimitiveTypeTriangle?count==6:prim==MTLPrimitiveTypeTriangleStrip&&count==4))DFRET(DFW_PRIM);
+ if(![p.label isEqualToString:@"com.apple.coreanimation.draw.PBGRAXm_A2Xhf"])DFRET(DFW_LABEL);
+ if(!(p.opaqueMask&1))DFRET(DFW_OPAQUE);
+ if(p.dfSamples>1||p.dfA2C)DFRET(DFW_MSAA);
+ if(p.writtenMask&~p.opaqueMask)DFRET(DFW_BLEND);   // a blended or partly masked colour attachment isn't overwritten by the next fill
+ NSNumber *cm=objc_getAssociatedObject(self,"cull"),*fm=objc_getAssociatedObject(self,"fill");
+ if(cm.unsignedLongLongValue!=MTLCullModeNone||fm.unsignedLongLongValue!=MTLTriangleFillModeFill)DFRET(DFW_CULL);   // every pixel, once
+ if((p.dfPosFmt!=MTLVertexFormatFloat4&&p.dfPosFmt!=MTLVertexFormatFloat2)||!p.dfColFmt)DFRET(DFW_VFMT);
+ if(_vpSet&&(_cvp[0]!=0||_cvp[1]!=0||_cvp[2]!=_tw||_cvp[3]!=_th))DFRET(DFW_VP);
+ if(_scSet&&(_csc[0]!=0||_csc[1]!=0||_csc[2]!=_tw||_csc[3]!=_th))DFRET(DFW_SC);
+ size_t len=0;const uint8_t *src=[self dfData:p.dfPosBuf length:&len];if(!src)DFRET(DFW_DATA);
+ const uint8_t *ix=nullptr;size_t ilen=0;
+ if(ib){if(ib.storageMode!=MTLStorageModeShared||!ib.contents||ioff>=ib.length)DFRET(DFW_INDEX);ix=(const uint8_t *)ib.contents+ioff;ilen=ib.length-ioff;}
+ const unsigned comps=p.dfPosFmt==MTLVertexFormatFloat4?4:2,stride=p.dfStride?p.dfStride:comps*4;
+ float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f,c0[4]={};float vx[6],vy[6],vz[6];
+ for(unsigned k=0;k<count;k++) {
+  int64_t v;
+  if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)DFRET(DFW_INDEX);uint16_t t;memcpy(&t,ix+k*2,2);v=t;}else{if((k+1)*4>ilen)DFRET(DFW_INDEX);uint32_t t;memcpy(&t,ix+k*4,4);v=t;}v+=base;}
+  else v=(int64_t)start+k;
+  if(v<0)DFRET(DFW_RANGE);
+  const size_t o=(size_t)v*stride+p.dfPosOff;if(o+comps*4>len)DFRET(DFW_RANGE);
+  float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
+  if(q[3]!=1)DFRET(DFW_W);
+  vx[k]=q[0];vy[k]=q[1];vz[k]=q[2];
+  x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
+  const size_t co=(size_t)v*stride+p.dfColOff;float c[4];
+  if(p.dfColFmt==MTLVertexFormatHalf4){if(co+8>len)DFRET(DFW_RANGE);__fp16 h[4];memcpy(h,src+co,8);for(int i=0;i<4;i++)c[i]=(float)h[i];}
+  else if(p.dfColFmt==MTLVertexFormatFloat4){if(co+16>len)DFRET(DFW_RANGE);memcpy(c,src+co,16);}
+  else{if(co+4>len)DFRET(DFW_RANGE);for(int i=0;i<4;i++)c[i]=src[co+i]/255.f;}
+  if(k==0)memcpy(c0,c,sizeof c0);else if(memcmp(c0,c,sizeof c0))DFRET(DFW_COL);
  }
- if(!dfCapturing)return;
- const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (g10: covering the target): a clear instead
- if(dfPending && dfHeld>=0 && !dfHeldPx){gDfNoClear.fetch_add(1);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF no clear (why 0x%x: 1 function 2 other colour written 4 no transform 8 not the target)",dbFrame,dbPass,dfHeldD,dfWhy);sm2_logs(l);}}
- if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[160];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (load->clear %.3f,%.3f,%.3f,%.3f)",dbFrame,dbPass,dfHeldD,
-  dfHeldCol[0],dfHeldCol[1],dfHeldCol[2],dfHeldCol[3]);sm2_logs(l);}}
- [self dfRelease:clearIt clear:clearIt];
+ if(c0[3]!=1)DFRET(DFW_ALPHA);
+ const bool pixels=fabsf(x0)<=0.01f&&fabsf(y0)<=0.01f&&fabsf(x1-(float)_tw)<=0.01f&&fabsf(y1-(float)_th)<=0.01f;
+ const bool clip=fabsf(x0+1)<=1e-4f&&fabsf(y0+1)<=1e-4f&&fabsf(x1-1)<=1e-4f&&fabsf(y1-1)<=1e-4f;
+ if(!pixels&&!clip){dfRectProbe(x0,y0,x1,y1,_tw,_th);if(deadfillMode()!=3)DFRET(DFW_NOTFULL);}   // sweet deadfill: mode 3 goes on (its rectangle is tested in dfResolve)
+ // two triangles, each three distinct corners, sharing a diagonal (as sweet cull's test)
+ int cr[6];
+ for(unsigned k=0;k<count;k++){if(!(vx[k]==x0||vx[k]==x1)||!(vy[k]==y0||vy[k]==y1))DFRET(DFW_CORNER);cr[k]=(vx[k]==x1?1:0)|(vy[k]==y1?2:0);}
+ const bool list=prim==MTLPrimitiveTypeTriangle;
+ const int t0[3]={cr[0],cr[1],cr[2]},t1[3]={list?cr[3]:cr[1],list?cr[4]:cr[2],list?cr[5]:cr[3]};
+ auto distinct=[](const int *t){return t[0]!=t[1]&&t[1]!=t[2]&&t[0]!=t[2];};
+ if(!distinct(t0)||!distinct(t1))DFRET(DFW_TRIS);
+ unsigned ma=(1u<<t0[0])|(1u<<t0[1])|(1u<<t0[2]),mb=(1u<<t1[0])|(1u<<t1[1])|(1u<<t1[2]),sh=ma&mb;
+ if((ma|mb)!=15||__builtin_popcount(sh)!=2||(__builtin_ctz(sh)^(31-__builtin_clz(sh)))!=3)DFRET(DFW_TRIS);
+ e.fill=true;memcpy(e.col,c0,sizeof c0);e.fpipe=p;e.bind=[self dfBindHash:p.dfPosBuf]^(clip?0x9e3779b97f4a7c15ull:0);
+ e.full=pixels||clip;e.rx0=x0;e.ry0=y0;e.rx1=x1;e.ry1=y1;e.rz=vz[0];e.rok=std::isfinite(x0)&&std::isfinite(y0)&&std::isfinite(x1)&&std::isfinite(y1);
+ for(unsigned k=0;k<count;k++)e.rok=e.rok&&vz[k]==vz[0];   // NaN z: refused
+ if(cull2On()&&e.rok&&!clip&&!p.vertexName.compare(0,18,"fixed_vert_lph_spc"))if(const float *m=[self dfTransform:p.dfPosBuf]) {   // sweet cull 2: the fill's pixels, rounded outward (scissor and viewport are the target, tested above)
+  double r[4];if(dfPixelRect(m,x0,y0,x1,y1,vz[0],_tw,_th,r)){e.px0=std::max(0L,dfPix(r[0],-1));e.py0=std::max(0L,dfPix(r[1],-1));e.px1=std::min((long)_tw,dfPix(r[2],1));e.py1=std::min((long)_th,dfPix(r[3],1));e.prok=true;}
+ }
+ // may it be the pass's clear? CA's fixed vertex function, no lasting colour 1..7 written, and the transform taking every vertex onto
+ // a corner of clip space (w 1, z in [0,1]): the whole target whatever the positions' space
+ if(!e.full||p.vertexName.compare(0,18,"fixed_vert_lph_spc")||(p.writtenMask&_dfAttached))return;
+ const float *m=[self dfTransform:p.dfPosBuf];if(!m)return;
+ float cx0=1e30f,cx1=-1e30f,cy0=1e30f,cy1=-1e30f;
+ for(unsigned k=0;k<count;k++) {
+  const float x=vx[k],y=vy[k],z=vz[k];
+  const float cx=m[0]*x+m[4]*y+m[8]*z+m[12],cy=m[1]*x+m[5]*y+m[9]*z+m[13],cz=m[2]*x+m[6]*y+m[10]*z+m[14],cw=m[3]*x+m[7]*y+m[11]*z+m[15];
+  if(fabsf(cw-1)>1e-5f||fabsf(fabsf(cx)-1)>1e-4f||fabsf(fabsf(cy)-1)>1e-4f||cz<0||cz>1)return;
+  cx0=std::min(cx0,cx);cx1=std::max(cx1,cx);cy0=std::min(cy0,cy);cy1=std::max(cy1,cy);
+ }
+ e.clearOK=cx0<=-0.999f&&cx1>=0.999f&&cy0<=-0.999f&&cy1>=0.999f;
 }
-// u-e: a draw past the slow threshold: its pipeline, and the VkPipelines the runtime made in this frame so far (it makes them at draws).
-- (void)encDescribeSlowDraw {
- uint64_t work[10]={};NBCommandBuffer *cb=self.commandBuffer;
- if(gDevice && nmb_device_work_stats(gDevice,work) && cb->encThread)
-  snprintf(tEncDetail,sizeof tEncDetail,"%s; VkPipelines this frame so far %llu in %.1f ms",encPipeline[0]?encPipeline:"?",
-   (unsigned long long)(work[0]-cb->encVkStart[0]),(work[1]-cb->encVkStart[1])/1e3);
- else snprintf(tEncDetail,sizeof tEncDetail,"%s",encPipeline[0]?encPipeline:"?");
+// sweet cull 3: the pixels the draw just recorded may touch: its clip within its vertices' bbox through CA's transform, rounded outward (triangles lie in
+// their vertices' bbox). CA's fixed vertex function, one instance, filled triangles (at most 64 vertices) or a 4-vertex strip, w 1, one z, viewport the target;
+// anything else: unknown (hok false), the draw stays.
+- (void)c3Note:(MTLPrimitiveType)prim start:(NSUInteger)start count:(NSUInteger)count inst:(NSUInteger)inst indexBuffer:(NBBuffer *)ib type:(MTLIndexType)itype
+        offset:(NSUInteger)ioff base:(NSInteger)base {
+ NBRenderPipeline *p=_pipe;CullEntry &e=_ops.back();
+ if(!p||_dfDss||_cvis||inst!=1||p.dfSamples>1||p.vertexName.compare(0,18,"fixed_vert_lph_spc"))return;
+ if(!(prim==MTLPrimitiveTypeTriangle?count>=3&&count<=64&&count%3==0:prim==MTLPrimitiveTypeTriangleStrip&&count==4))return;
+ NSNumber *fm=objc_getAssociatedObject(self,"fill");if(fm.unsignedLongLongValue!=MTLTriangleFillModeFill)return;
+ if(p.dfPosFmt!=MTLVertexFormatFloat4&&p.dfPosFmt!=MTLVertexFormatFloat2)return;
+ if(_vpSet&&(_cvp[0]!=0||_cvp[1]!=0||_cvp[2]!=_tw||_cvp[3]!=_th))return;
+ size_t len=0;const uint8_t *src=[self dfData:p.dfPosBuf length:&len];if(!src)return;
+ const uint8_t *ix=nullptr;size_t ilen=0;
+ if(ib){if(ib.storageMode!=MTLStorageModeShared||!ib.contents||ioff>=ib.length)return;ix=(const uint8_t *)ib.contents+ioff;ilen=ib.length-ioff;}
+ const unsigned comps=p.dfPosFmt==MTLVertexFormatFloat4?4:2,stride=p.dfStride?p.dfStride:comps*4;
+ float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f,z0=0;
+ for(unsigned k=0;k<count;k++) {
+  int64_t v;
+  if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)return;uint16_t t;memcpy(&t,ix+k*2,2);v=t;}else{if((k+1)*4>ilen)return;uint32_t t;memcpy(&t,ix+k*4,4);v=t;}v+=base;}
+  else v=(int64_t)start+k;
+  if(v<0)return;
+  const size_t o=(size_t)v*stride+p.dfPosOff;if(o+comps*4>len)return;
+  float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
+  if(q[3]!=1||!std::isfinite(q[0])||!std::isfinite(q[1]))return;
+  if(k==0)z0=q[2];else if(q[2]!=z0)return;   // NaN z: refused
+  x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
+ }
+ const float *m=[self dfTransform:p.dfPosBuf];double r[4];
+ if(!m||!dfPixelRect(m,x0,y0,x1,y1,z0,_tw,_th,r))return;
+ long c[4];[self clip:c];
+ e.hx0=std::max(c[0],dfPix(r[0],-1));e.hy0=std::max(c[1],dfPix(r[1],-1));e.hx1=std::min(c[2],dfPix(r[2],1));e.hy1=std::min(c[3],dfPix(r[3],1));
+ e.hok=e.hx0<e.hx1&&e.hy0<e.hy1;
 }
-- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {ENC_SCOPE(EC_BIND,"setRenderPipelineState");
+// sweet deadfill mode 2: hold the creation of a deferred pass that loads colour 0 (made in dfResolve)
+- (bool)dfHold:(const NmbRenderPassDescriptor &)pass load:(MTLLoadAction)load {
+ if(!_dfOn||deadfillMode()<2||(load!=MTLLoadActionLoad&&load!=MTLLoadActionDontCare))return false;
+ _dfPass=pass;_dfPending=YES;gDfPasses++;
+ return true;
+}
+// sweet deadfill: a fill whose next surviving draw is the same fill is dropped; mode 2: the first surviving draw, a fill covering the
+// target, becomes the held pass's clear. Then the held pass is made. Mode 3: a pair not both covering the target also needs a's rectangle
+// inside b's and one z (a z outside the clip range would leave b's pixels undrawn).
+- (void)dfResolve:(const std::vector<CullEntry> &)ops dead:(std::vector<char> &)dead {
+ bool clear=false;float col[4]={};
+ if(_noCull&&dfWhyOn())for(const CullEntry &o:ops)if(o.draw&&o.fill)dfWhy(DFW_NOCULL);   // sweet dfwhy
+ if(!_noCull) {
+  long prev=-1;
+  auto covered=[](const CullEntry &a,const CullEntry &b){   // sweet deadfill: modes 0..2 only note fills covering the target
+   return (a.full&&b.full)||(a.rx0>=b.rx0&&a.ry0>=b.ry0&&a.rx1<=b.rx1&&a.ry1<=b.ry1&&a.rok&&b.rok&&a.rz==b.rz);};
+  for(long i=0;i<(long)ops.size();i++) {
+   if(!ops[i].draw||dead[i])continue;
+   if(prev>=0&&ops[prev].fill&&ops[i].fill&&ops[prev].fpipe==ops[i].fpipe&&ops[prev].bind==ops[i].bind&&covered(ops[prev],ops[i])){dead[prev]=1;gDfDropped++;}
+   else if(prev>=0&&ops[prev].fill)dfWhy(!ops[i].fill?DFW_NEXT:ops[prev].fpipe!=ops[i].fpipe?DFW_PIPE:ops[prev].bind!=ops[i].bind?DFW_BIND:DFW_RECT);   // sweet dfwhy
+   prev=i;
+  }
+  if(prev>=0&&ops[prev].fill)dfWhy(DFW_LAST);   // sweet dfwhy
+  for(long i=0;i<(long)ops.size()&&_dfPending;i++) {
+   if(!ops[i].draw||dead[i])continue;
+   if(ops[i].fill&&ops[i].clearOK){dead[i]=1;clear=true;memcpy(col,ops[i].col,sizeof col);gDfCleared++;}
+   break;
+  }
+  if(cull3On()&&_cullPass)for(long d=(long)ops.size()-1;d>=0;d--) {   // sweet cull 3: after the clear, as 2
+   const CullEntry &o=ops[d];
+   if(!o.draw||dead[d]||!o.covering)continue;
+   for(long e=d-1;e>=0;e--) {
+    const CullEntry &f=ops[e];
+    if(!f.draw||dead[e]||!f.hok||(f.writes&~o.over)||f.hx0<o.cx0||f.hy0<o.cy0||f.hx1>o.cx1||f.hy1>o.cy1)continue;
+    bool safe=true;
+    for(long m=e+1;m<d&&safe;m++) {   // a surviving reader that writes a target the cover leaves, on f's pixels, keeps f
+     const CullEntry &q=ops[m];if(!q.draw||dead[m]||!q.reads||!(q.writes&~o.over))continue;
+     const long a0=q.hok?q.hx0:q.cx0,b0=q.hok?q.hy0:q.cy0,a1=q.hok?q.hx1:q.cx1,b1=q.hok?q.hy1:q.cy1;   // covering draws (inner c*) never read
+     if(a0<f.hx1&&f.hx0<a1&&b0<f.hy1&&f.hy0<b1)safe=false;
+    }
+    if(safe){dead[e]=1;gC3Draws++;gC3Px+=(uint64_t)((f.hx1-f.hx0)*(f.hy1-f.hy0));}
+   }
+  }
+  if(deadattOn()&&cull3On()&&_cullPass&&_daDead){unsigned rd=0;   // sweet deadatt: after cull 3, back to front; rd: targets a later survivor may read
+   for(long e=(long)ops.size()-1;e>=0;e--) {
+    const CullEntry &f=ops[e];if(!f.draw||dead[e])continue;
+    if(f.dok&&f.writes&&!(f.writes&~(_daDead&~rd))){dead[e]=1;gDeadAtt++;continue;}
+    rd|=f.dar;
+   }
+  }
+  if(cull2On()&&!cull3On()&&_cullPass)for(long e=0;e<(long)ops.size();e++) {   // sweet cull 2: after the clear, which costs less than a load under the same fill
+   if(!ops[e].draw||dead[e]||!ops[e].fill)continue;
+   int why=-1;
+   for(long m=e+1;m<(long)ops.size();m++) {
+    const CullEntry &o=ops[m],&f=ops[e];
+    if(!o.draw||dead[m])continue;
+    if(o.covering) {
+     if(f.prok&&!(f.writes&~o.over)&&f.px0>=o.cx0&&f.py0>=o.cy0&&f.px1<=o.cx1&&f.py1<=o.cy1){dead[e]=1;gDfDropped++;why=-1;break;}
+     why=DFW_CULLRECT;   // a later one may still contain it
+    }
+    if(o.reads){why=DFW_CULLBETWEEN;break;}
+   }
+   if(why>=0)dfWhy(why);
+  }
+ }
+ if(!_dfPending)return;
+ _dfPending=NO;
+ NmbRenderPassDescriptor pass=_dfPass;
+ if(clear){pass.colors[0].load=MTLLoadActionClear;for(int i=0;i<4;i++)pass.colors[0].clear[i]=std::min(255.,std::max(0.,floor(col[i]*255.+0.5)))/255.;}   // the 8-bit code
+ NBCommandBuffer *cb=self.commandBuffer;
+ NmbEncoder *h=cb.committed?nullptr:nmb_render_encoder_new(cb.handle,&pass);
+ if(!h){[cb refuse:[NSString stringWithFormat:@"renderCommandEncoder: %@",lastError()]];return;}
+ self.handle=h;
+}
+- (void)cullReplay {
+ _defer=NO;
+ std::vector<CullEntry> ops;ops.swap(_ops);
+ // sweet cull: a draw E is dead if a later covering draw D overwrites E's whole clip on every target E writes,
+ // and no surviving draw between them touches E's clip (it could read what E left, e.g. programmable blending)
+ std::vector<char> dead(ops.size(),0);long last=-1;
+ auto inside=[](const CullEntry &a,const CullEntry &b){return a.cx0>=b.cx0&&a.cy0>=b.cy0&&a.cx1<=b.cx1&&a.cy1<=b.cy1;};
+ auto overlap=[](const CullEntry &a,const CullEntry &b){return a.cx0<b.cx1&&b.cx0<a.cx1&&a.cy0<b.cy1&&b.cy0<a.cy1;};
+ if(!_noCull&&_cullPass&&!cull2On())for(long d=(long)ops.size()-1;d>=0;d--) {
+  if(!ops[d].draw||!ops[d].covering||dead[d])continue;
+  for(long e=d-1;e>=0;e--) {
+   if(!ops[e].draw||dead[e]||!inside(ops[e],ops[d])||(ops[e].writes&~ops[d].over))continue;
+   bool safe=true;
+   for(long m=e+1;m<d&&safe;m++)if(ops[m].draw&&!dead[m]&&overlap(ops[m],ops[e]))safe=false;
+   if(safe){dead[e]=1;last=std::max(last,d);}
+  }
+ }
+ {static std::atomic<int> dumps{0};size_t nd=0;bool cov=false;for(auto &o:ops)if(o.draw){nd++;cov|=o.covering;}   // sweet cull: dump the first big passes
+  if(nd>=10&&cov&&dumps++<3)for(size_t i=0;i<ops.size();i++)if(ops[i].draw){const CullEntry &o=ops[i];NSString *lb=o.label?[o.label stringByReplacingOccurrencesOfString:@"com.apple.coreanimation.draw." withString:@""]:@"-";
+   char t[240];snprintf(t,sizeof t,"SWEET CULL: d%zu %s clip %ld,%ld,%ld,%ld w%x o%x cov%d dead%d",i,lb.UTF8String,o.cx0,o.cy0,o.cx1,o.cy1,o.writes,o.over,(int)o.covering,(int)dead[i]);sm2_logs(t);}}
+ if(_dfOn)[self dfResolve:ops dead:dead];   // sweet deadfill
+ unsigned culled=0;
+ for(size_t i=0;i<ops.size();i++) {
+  if(dead[i]){culled++;continue;}
+  ops[i].blk();
+ }
+ gCullDraws+=culled;
+ const unsigned n=++gCullPasses;
+ if(n==1||(culled&&gCullDraws.load()==culled)){char t[96];snprintf(t,sizeof t,"SWEET CULL: replay ops %zu last %ld culled %u",ops.size(),last,culled);sm2_logs(t);}   // sweet cull: first replay, first cull
+ if(n%300==0){char t[96];snprintf(t,sizeof t,"SWEET CULL: passes %u culled draws %u",n,gCullDraws.load());sm2_logs(t);}
+}
+- (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!_defer){[super buffer:buffer offset:offset index:index stage:stage];return;}
+ if(stage==1&&index==1){_cvb=[(id)buffer isKindOfClass:[NBBuffer class]]?(NBBuffer *)buffer:nil;_cvbOff=offset;}   // sweet cull
+ if(stage==1&&index<8){_dfVb[index]=[(id)buffer isKindOfClass:[NBBuffer class]]?(NBBuffer *)buffer:nil;_dfVbOff[index]=offset;_dfVbytes[index].clear();}   // sweet deadfill
+ [self rec:^{[super buffer:buffer offset:offset index:index stage:stage];}];
+}
+- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!_defer){[super offset:offset index:index stage:stage];return;}
+ if(stage==1&&index==1)_cvbOff=offset;
+ if(stage==1&&index<8)_dfVbOff[index]=offset;   // sweet deadfill
+ [self rec:^{[super offset:offset index:index stage:stage];}];
+}
+- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!_defer){[super texture:texture index:index stage:stage];return;}
+ [self rec:^{[super texture:texture index:index stage:stage];}];
+}
+- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!_defer){[super sampler:sampler index:index stage:stage];return;}
+ [self rec:^{[super sampler:sampler index:index stage:stage];}];
+}
+- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!_defer){[super bytes:bytes length:length index:index stage:stage];return;}
+ if(stage==1&&index==1)_cvb=nil;
+ if(stage==1&&index<8){_dfVb[index]=nil;_dfVbytes[index].assign((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?std::min<NSUInteger>(length,256):0));}   // sweet deadfill
+ NSData *copy=[NSData dataWithBytes:bytes length:length];   // transient: setVertexBytes/setFragmentBytes contents
+ [self rec:^{[super bytes:copy.bytes length:length index:index stage:stage];}];
+}
+- (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
+ if(!_defer){[super fence:fence stages:stages update:update];return;}
+ _noCull=YES;   // sweet cull: fences order work against draws, keep the pass unchanged
+ [self rec:^{[super fence:fence stages:stages update:update];}];
+}
+- (void)drawLogStart:(MTLRenderPassDescriptor *)d {
+ _m0Pass=mask0On()&&!d.depthAttachment.texture&&!d.stencilAttachment.texture&&!d.visibilityResultBuffer;   // sweet mask0
+ if(deadfillMode()) {   // sweet deadfill: the composited frame's passes are deferred (and tracked) too
+  id<MTLTexture> t=d.colorAttachments[0].texture;const MTLPixelFormat pf=t?t.pixelFormat:MTLPixelFormatInvalid;
+  if(t&&(pf==MTLPixelFormatBGRA8Unorm||pf==MTLPixelFormatRGBA8Unorm)&&t.sampleCount<=1&&t.textureType==MTLTextureType2D&&
+     [(id)t isKindOfClass:[NBTexture class]]&&((NBTexture *)t).surface&&!d.depthAttachment.texture&&!d.stencilAttachment.texture&&
+     !d.visibilityResultBuffer&&d.colorAttachments[0].level==0&&d.colorAttachments[0].slice==0) {
+   _dfOn=YES;_defer=YES;_tw=t.width;_th=t.height;_dfAttached=0;
+   for(unsigned i=1;i<8;i++)if(id<MTLTexture> c=d.colorAttachments[i].texture)if(c.storageMode!=MTLStorageModeMemoryless)_dfAttached|=1u<<i;
+   _daDead=0;if(deadattOn()&&cull3On())for(unsigned i=1;i<8;i++){MTLRenderPassColorAttachmentDescriptor *a=d.colorAttachments[i];   // sweet deadatt (Unknown store: kept)
+    if(a.texture&&!a.resolveTexture&&(a.texture.storageMode==MTLStorageModeMemoryless||a.storeAction==MTLStoreActionDontCare))_daDead|=1u<<i;}
+   if(cull2On()) {   // sweet cull 2: as sweet cull's setup below: all colour targets match target 0's size
+    bool single=true;_attMask=0;
+    for(unsigned i=0;i<8;i++){id<MTLTexture> x=d.colorAttachments[i].texture;if(!x)continue;_attMask|=1u<<i;if(x.width!=t.width||x.height!=t.height)single=false;}
+    _cullPass=single;
+   }
+  }
+ }
+ if(cullEnabled()) {   // sweet cull: defer only single-colour-target passes without depth/stencil or visibility results
+  id<MTLTexture> t0=d.colorAttachments[0].texture;bool single=t0!=nil;_attMask=0;   // "single": all colour targets match target 0's size
+  for(unsigned i=0;i<8;i++){id<MTLTexture> x=d.colorAttachments[i].texture;if(!x)continue;_attMask|=1u<<i;if(!t0||x.width!=t0.width||x.height!=t0.height)single=false;}
+  if(single&&!d.depthAttachment.texture&&!d.stencilAttachment.texture&&!d.visibilityResultBuffer){_defer=YES;_cullPass=YES;_tw=t0.width;_th=t0.height;}
+  static std::atomic<int> big{0};if(t0&&t0.width>=1000&&big++<2){char t[400];int o=snprintf(t,sizeof t,"SWEET CULL: big pass");   // sweet cull: one-time attachment dump
+   for(unsigned i=0;i<8&&o<350;i++){id<MTLTexture> x=d.colorAttachments[i].texture;if(x)o+=snprintf(t+o,sizeof t-o," c%u=%lux%lu/f%lu/l%lu",i,(unsigned long)x.width,(unsigned long)x.height,(unsigned long)x.pixelFormat,(unsigned long)d.colorAttachments[i].loadAction);}
+   if(d.depthAttachment.texture)o+=snprintf(t+o,sizeof t-o," depth f%lu",(unsigned long)d.depthAttachment.texture.pixelFormat);
+   if(d.stencilAttachment.texture)o+=snprintf(t+o,sizeof t-o," stencil f%lu",(unsigned long)d.stencilAttachment.texture.pixelFormat);
+   if(d.visibilityResultBuffer)o+=snprintf(t+o,sizeof t-o," vis");
+   sm2_logs(t);}
+  static std::atomic<bool> said{false};if(!said.exchange(true)){char t[160];snprintf(t,sizeof t,"SWEET CULL: first pass %lux%lu single=%d defer=%d",(unsigned long)(t0?t0.width:0),(unsigned long)(t0?t0.height:0),(int)single,(int)_defer);sm2_logs(t);}   // sweet cull: one-time check
+ }
+ if(!drawLogPath() || gDrawLogBlocks>=drawLogCount())return;
+ id<MTLTexture> t=d.colorAttachments[0].texture;
+ if(!t || !drawLogBig(t.width,t.height))return;
+ _dl.reset(new DrawLog());_dl->w=t.width;_dl->h=t.height;_dl->format=t.pixelFormat;
+ _dl->load=d.colorAttachments[0].loadAction;_dl->store=d.colorAttachments[0].storeAction;
+ _dl->depth=d.depthAttachment.texture||d.stencilAttachment.texture;
+ auto att=[&](const char *name,MTLRenderPassAttachmentDescriptor *a){id<MTLTexture> x=a.texture;if(!x)return;char b[120];   // sweet drawlog: every attachment
+  snprintf(b,sizeof b," %s=%lux%lu fmt=%lu ld=%lu st=%lu mem=%lu",name,(unsigned long)x.width,(unsigned long)x.height,(unsigned long)x.pixelFormat,
+   (unsigned long)a.loadAction,(unsigned long)a.storeAction,(unsigned long)x.storageMode);_dl->atts+=b;};
+ for(unsigned i=0;i<8;i++){char n[8];snprintf(n,sizeof n,"c%u",i);att(n,d.colorAttachments[i]);}
+ att("d",d.depthAttachment);att("s",d.stencilAttachment);
+ {char b[96];IOSurfaceRef sf=nullptr;   // sweet drawlog: pass start time, c0 identity (IOSurface ID, else the NBTexture pointer) and pid
+  if([(id)t isKindOfClass:[NBTexture class]]){NBTexture *x=(NBTexture *)t;id p=x.parent;sf=x.surface?x.surface:([p isKindOfClass:[NBTexture class]]?((NBTexture *)p).surface:nullptr);}
+  if(sf)snprintf(b,sizeof b," t=%llu tex=ios=%u pid=%d",(unsigned long long)mach_absolute_time(),(unsigned)IOSurfaceGetID(sf),(int)getpid());
+  else snprintf(b,sizeof b," t=%llu tex=%p pid=%d",(unsigned long long)mach_absolute_time(),(__bridge void *)t,(int)getpid());
+  _dl->tail=b;}
+}
+- (void)endEncoding {
+ if(_defer)[self cullReplay];   // sweet cull
+ if(_dl){_dl->finish();_dl.reset();}
+ [super endEncoding];
+}
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- if(encStatOn() || fnStatOn())memcpy(encPipeline,((NBRenderPipeline *)state)->encNames,sizeof encPipeline);
- dbPipe=(NBRenderPipeline *)state;   // ovd
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_PIPELINE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)state;c.flags=ECF_RETAIN_A;encPush(c);return;
- }
+ if(_m0Pass)_m0Pipe=(NBRenderPipeline *)state;   // sweet mask0
+ if(_dl){NBRenderPipeline *p=(NBRenderPipeline *)state;   // sweet drawlog
+  _dl->pipeline=(p.label.length?p.label.UTF8String:"-");_dl->pipeline+=" v="+p.vertexName+" f="+p.fragmentName+p.dlState;_dl->blend=p.blend;_dl->mask=p.writeMask;}
+ if(_defer){NBRenderPipeline *pp=(NBRenderPipeline *)state;_pipe=pp;[self rec:^{[self check:nmb_render_set_pipeline(self.handle,[pp handle]) what:"setRenderPipelineState"];}];return;}   // sweet cull
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
-- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
+- (void)dlVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i {   // sweet drawlog
+ if(_dl && i<31 && (!b || [(id)b isKindOfClass:[NBBuffer class]])){_dl->vbs[i].b=(NBBuffer *)b;_dl->vbs[i].offset=o;}
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self dlVertexBuffer:b offset:o index:i];[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
-- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:1];}
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {if(_dl && i<31)_dl->vbs[i].offset=o;[self offset:o index:i stage:1];}
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:2];}
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
- for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:1];
+ for(NSUInteger k=0;k<r.length;k++){[self dlVertexBuffer:b[k] offset:o[k] index:r.location+k];[self buffer:b[k] offset:o[k] index:r.location+k stage:1];}
 }
 - (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
  for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:2];
 }
-- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:1];}
-- (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
+- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {if(_dl)_dl->bytes(_dl->vbytes,p,n,i,16);[self bytes:p length:n index:i stage:1];}
+- (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {if(_dl)_dl->bytes(_dl->fbytes,p,n,i,8);[self bytes:p length:n index:i stage:2];}
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:2];}
+- (void)dlFragmentTexture:(id<MTLTexture>)t index:(NSUInteger)i {   // sweet drawlog
+ if(_dl && i<16 && (!t || [(id)t isKindOfClass:[NBTexture class]]))_dl->fts[i].t=(NBTexture *)t;
+}
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self dlFragmentTexture:t index:i];[self texture:t index:i stage:2];}
 - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
- for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:2];
+ for(NSUInteger k=0;k<r.length;k++){[self dlFragmentTexture:t[k] index:r.location+k];[self texture:t[k] index:r.location+k stage:2];}
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
-- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
-- (void)setDepthStencilState:(id<MTLDepthStencilState>)state {ENC_SCOPE(EC_BIND,"setDepthStencilState");
- if(state)dfDss=true;   // g9
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {if(_dl && i<16)_dl->fts[i].sampler=s!=nil;[self sampler:s index:i stage:2];}
+// ANGLE (WebGL) binds every sampler with LOD clamps (webgl wg3: MISSING -setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex:,
+// then SIGABRT in the GPU process). The clamps apply through a sampler kept per clamp pair (NBSampler withLodMin:max:, SWEET_LODCLAMP=0 drops them).
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
+ id<MTLSamplerState> c=[self sampler:s lodMin:lo max:hi];if(s && !c)return;
+ [self setVertexSamplerState:c atIndex:i];
+}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
+ id<MTLSamplerState> c=[self sampler:s lodMin:lo max:hi];if(s && !c)return;
+ [self setFragmentSamplerState:c atIndex:i];
+}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {for(NSUInteger k=0;k<r.length;k++)[self setVertexSamplerState:s[k] atIndex:r.location+k];}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {for(NSUInteger k=0;k<r.length;k++)[self setFragmentSamplerState:s[k] atIndex:r.location+k];}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setVertexSamplerState:s[k] lodMinClamp:lo[k] lodMaxClamp:hi[k] atIndex:r.location+k];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setFragmentSamplerState:s[k] lodMinClamp:lo[k] lodMaxClamp:hi[k] atIndex:r.location+k];
+}
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_DSS;c.target=(__bridge void *)self;if(state){c.a=(__bridge_retained void *)state;c.flags=ECF_RETAIN_A;}encPush(c);return;
- }
+ if(state)_dfDss=YES;   // sweet deadfill
+ if(_defer){[self rec:^{[self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];}];return;}   // sweet cull
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
-- (void)setViewport:(MTLViewport)v {ENC_SCOPE(EC_BIND,"setViewport");
- if(dbFrame || dfTrack){dbVp[0]=v.originX;dbVp[1]=v.originY;dbVp[2]=v.width;dbVp[3]=v.height;dbHaveVp=true;}   // ovd
+- (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
- // u-cpu 0x2: the same bits as the viewport set last (bitwise: a NaN or -0 is sent again unless it is the very value)
- const bool fast=cpuFast()&CPUFAST_VIEWPORT;
- if(fast && haveViewport && !memcmp(values,lastViewport,sizeof values)){gCfViewportSkips.fetch_add(1,std::memory_order_relaxed);return;}
- haveViewport=false;
- if(encDeferred) {   // u-encthread: taken as accepted (a refusal at replay fails the command buffer anyway)
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_VIEWPORT;c.target=(__bridge void *)self;memcpy(c.u,values,sizeof values);encPush(c);
-  if(fast){memcpy(lastViewport,values,sizeof values);haveViewport=true;}
-  gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
-  return;
- }
- if([self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"] && fast){memcpy(lastViewport,values,sizeof values);haveViewport=true;}
- gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
+ if(_dl){_dl->viewport=true;memcpy(_dl->vp,values,sizeof values);}   // sweet drawlog
+ if(_defer){_vpSet=YES;memcpy(_cvp,values,sizeof values);   // sweet cull
+  [self rec:^{const double vv[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};[self check:nmb_render_set_viewport(self.handle,vv) what:"setViewport"];}];return;}
+ [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
-- (void)setScissorRect:(MTLScissorRect)r {ENC_SCOPE(EC_BIND,"setScissorRect");
- if(dbFrame || dfTrack){dbSc[0]=r.x;dbSc[1]=r.y;dbSc[2]=r.width;dbSc[3]=r.height;dbHaveSc=true;}   // ovd
+- (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
- const bool fast=cpuFast()&CPUFAST_VIEWPORT;
- if(fast && haveScissor && !memcmp(values,lastScissor,sizeof values)){gCfScissorSkips.fetch_add(1,std::memory_order_relaxed);return;}
- haveScissor=false;
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_SCISSOR;c.target=(__bridge void *)self;memcpy(c.u,values,sizeof values);encPush(c);
-  if(fast){memcpy(lastScissor,values,sizeof values);haveScissor=true;}
-  gCfScissorSent.fetch_add(1,std::memory_order_relaxed);
-  return;
- }
- if([self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"] && fast){memcpy(lastScissor,values,sizeof values);haveScissor=true;}
- gCfScissorSent.fetch_add(1,std::memory_order_relaxed);
+ if(_dl){_dl->scissor=true;for(int k=0;k<4;k++)_dl->sc[k]=values[k];}   // sweet drawlog
+ if(_defer){_scSet=YES;for(int k=0;k<4;k++)_csc[k]=values[k];   // sweet cull
+  [self rec:^{const uint64_t sv[4]={r.x,r.y,r.width,r.height};[self check:nmb_render_set_scissor(self.handle,sv) what:"setScissorRect"];}];return;}
+ [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
-- (void)raster {ENC_SCOPE(EC_BIND,"raster state");
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_RASTER;c.target=(__bridge void *)self;c.u[0]=rasterCull;c.u[1]=rasterWinding;c.u[2]=rasterFill;encPush(c);return;
- }
- [self check:nmb_render_set_raster(self.handle,rasterCull,rasterWinding,rasterFill) what:"raster state"];
+- (void)raster {
+ NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
+ const unsigned long long cv=cull.unsignedLongLongValue,wv=winding.unsignedLongLongValue,fv=fill.unsignedLongLongValue;
+ if(_defer){[self rec:^{[self check:nmb_render_set_raster(self.handle,cv,wv,fv) what:"raster state"];}];return;}   // sweet cull
+ [self check:nmb_render_set_raster(self.handle,cv,wv,fv) what:"raster state"];
 }
-- (void)setCullMode:(MTLCullMode)m {rasterCull=(uint64_t)m;[self raster];}
-- (void)setFrontFacingWinding:(MTLWinding)w {rasterWinding=(uint64_t)w;[self raster];}
-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {rasterFill=(uint64_t)f;[self raster];}
+- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_DEPTH_BIAS;c.target=(__bridge void *)self;memcpy(&c.u[0],&bias,4);memcpy(&c.u[1],&slope,4);memcpy(&c.u[2],&clamp,4);
-  encPush(c);return;
- }
+ if(_defer){[self rec:^{[self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];}];return;}   // sweet cull
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
 }
-- (void)setLineWidth:(float)width {
- if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_LINE_WIDTH;c.target=(__bridge void *)self;memcpy(&c.u[0],&width,4);encPush(c);return;}
- [self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];
+// 0109 (B24): Maps aborts on the missing selector. Clip (0) is Vulkan's default; the runtime has no depth clamp, so
+// Clamp is stored and logged once. Log off: M2V_B24_LOG=0.
+- (void)setDepthClipMode:(MTLDepthClipMode)mode {
+ objc_setAssociatedObject(self,"depthClip",@(mode),OBJC_ASSOCIATION_RETAIN);
+ static BOOL warned=NO;
+ const char *off=getenv("M2V_B24_LOG");
+ if(mode==MTLDepthClipModeClamp&&!warned&&!(off&&!strcmp(off,"0"))){warned=YES;NBLOG(@"native-metal: setDepthClipMode: Clamp not supported, ignored");}
 }
+- (void)setLineWidth:(float)width {
+ if(_defer){[self rec:^{[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}];return;}   // sweet cull
+ [self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
- if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_VISIBILITY;c.target=(__bridge void *)self;c.u[0]=(uint64_t)mode;c.u[1]=offset;encPush(c);return;}
+ if(_defer){_cvis=mode;[self rec:^{[self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];}];return;}   // sweet cull
  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
@@ -2251,32 +1531,29 @@ static void waitForResource(id resource) {
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)setStencilReferenceValue:(uint32_t)v {
- if(encDeferred){[self setStencilFrontReferenceValue:v backReferenceValue:v];return;}
- [self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];
-}
+ if(_defer){[self rec:^{[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}];return;}   // sweet cull
+ [self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
- if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_STENCIL_REF;c.target=(__bridge void *)self;c.u[0]=f;c.u[1]=b;encPush(c);return;}
+ if(_defer){[self rec:^{[self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];}];return;}   // sweet cull
  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_BLEND_COLOR;c.target=(__bridge void *)self;const float v[4]={r,g,b,a};memcpy(c.u,v,sizeof v);encPush(c);return;
- }
- const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ const float c[4]={r,g,b,a};
+ if(_defer){[self rec:^{const float c2[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c2) what:"setBlendColor"];}];return;}   // sweet cull
+ [self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
 }
-- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {ENC_SCOPE(EC_DRAW,"drawPrimitives");
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
- if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
- if(dbFrame)[self dbDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // ovd
- if(dfTrack)[self dfDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // g9
- if(encDeferred) {
-  ET_REC;ENC_LIVE();
-  EncCmd c={};c.op=EO_DRAW;c.target=(__bridge void *)self;c.u[0]=(uint64_t)t;c.u[1]=(uint32_t)s;c.u[2]=(uint32_t)n;c.u[3]=(uint32_t)i;c.u[4]=(uint32_t)b;
-  encPush(c);return;
+ if(_dl)_dl->draw(t,s,n,i,false);   // sweet drawlog
+ if([self m0Skip])return;   // sweet mask0: writes nothing
+ if(_defer){   // sweet cull
+  const bool cv=[self coversPrim:t start:s count:n inst:i indexed:false indexType:MTLIndexTypeUInt16 indexBuffer:nil indexOffset:0 baseVertex:0];
+  [self recDraw:^{[self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];} covering:cv];
+  if(_dfOn)[self dfNote:t start:s count:n inst:i indexBuffer:nil type:MTLIndexTypeUInt16 offset:0 base:0];   // sweet deadfill
+  if(_dfOn&&cull3On())[self c3Note:t start:s count:n inst:i indexBuffer:nil type:MTLIndexTypeUInt16 offset:0 base:0];   // sweet cull 3
+  return;
  }
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
- if(encScope_.slow())[self encDescribeSlowDraw];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
@@ -2285,22 +1562,20 @@ static void waitForResource(id resource) {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:1 baseInstance:0];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
-                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {ENC_SCOPE(EC_DRAW,"drawIndexedPrimitives");
+                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
- if(encDeferred)ENC_LIVE();
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
- if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
- if(dbFrame)[self dbDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // ovd
- if(dfTrack)[self dfDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // g9
- if(encDeferred) {
-  ET_REC;
-  EncCmd c={};c.op=EO_DRAW_INDEXED;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=(uint64_t)t;c.u[1]=(uint64_t)(uint32_t)n<<32|(uint32_t)i;
-  c.u[2]=(uint64_t)k;c.u[3]=o;c.u[4]=(uint64_t)(uint32_t)(int32_t)v<<32|(uint32_t)bi;
-  encPush(c);return;
+ if(_dl)_dl->draw(t,o,n,i,true);   // sweet drawlog (idx=offset/count)
+ if([self m0Skip])return;   // sweet mask0: writes nothing
+ if(_defer){   // sweet cull
+  const bool cv=[self coversPrim:t start:0 count:n inst:i indexed:true indexType:k indexBuffer:(NBBuffer *)b indexOffset:o baseVertex:v];
+  [self recDraw:^{[self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];} covering:cv];
+  if(_dfOn)[self dfNote:t start:0 count:n inst:i indexBuffer:(NBBuffer *)b type:k offset:o base:v];   // sweet deadfill
+  if(_dfOn&&cull3On())[self c3Note:t start:0 count:n inst:i indexBuffer:(NBBuffer *)b type:k offset:o base:v];   // sweet cull 3
+  return;
  }
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
- if(encScope_.slow())[self encDescribeSlowDraw];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i {
@@ -2310,6 +1585,23 @@ static void waitForResource(id resource) {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
+// 0110 (B24): more selectors Maps-like apps call. Residency and barriers are no-ops like useResource; the multi
+// scissor/viewport forms keep element 0 only (logged once if more are given).
+- (void)useResources:(const id<MTLResource> __unsafe_unretained*)r count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)n;(void)u;(void)s;}
+- (void)useHeap:(id<MTLHeap>)h {(void)h;}
+- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {(void)h;(void)s;}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained*)h count:(NSUInteger)n stages:(MTLRenderStages)s {(void)h;(void)n;(void)s;}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)sc afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {(void)sc;(void)a;(void)b;}
+- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n {
+ static BOOL warned=NO;
+ if(n>1&&!warned){warned=YES;NBLOG(@"native-metal: setScissorRects: count %lu, only the first used",(unsigned long)n);}
+ if(n)[self setScissorRect:r[0]];
+}
+- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
+ static BOOL warned=NO;
+ if(n>1&&!warned){warned=YES;NBLOG(@"native-metal: setViewports: count %lu, only the first used",(unsigned long)n);}
+ if(n)[self setViewport:v[0]];
+}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
 @end
@@ -2325,53 +1617,33 @@ static void waitForResource(id resource) {
  for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
  return true;
 }
-// written: bit i set when the blit writes objects[i] (a destination). A source that is a converted YCbCr copy is filled again first
-// (C2: before, only draws refreshed it, and a blit copied the stale picture).
-- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count written:(unsigned)written {
+- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
  for(size_t i=0;i<count;i++) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  if([(NBTexture *)o surface]) {
-   [self.commandBuffer.surfaces addObject:o];
-   if(written&(1u<<i))[self.commandBuffer.writtenSurfaces addObject:o];
-  }
-  if(!(written&(1u<<i)) && !encDeferred)ycbcrRefresh((NBTexture *)o,self.commandBuffer);   // u-encthread: the replay's
+  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
  }
  return true;
 }
-- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {ENC_SCOPE(EC_BLIT,"blit copyBuffer");
- if(encDeferred)ENC_LIVE();
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
- if(encDeferred) {
-  ET_REC;EncCmd c={};c.op=EO_COPY_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.u[0]=so;c.u[1]=dO;c.u[2]=n;
-  encPush(c);return;
- }
  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
 }
-- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {ENC_SCOPE(EC_BLIT,"blit fillBuffer");
- if(encDeferred)ENC_LIVE();
+- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
  if(![self buffers:NB_OBJECTS(b) count:1])return;
- if(encDeferred) {
-  ET_REC;EncCmd c={};c.op=EO_FILL_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=r.location;c.u[1]=r.location+r.length;c.u[2]=v;
-  encPush(c);return;
- }
  [self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
-              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {ENC_SCOPE(EC_BLIT,"blit copyTexture");
- if(encDeferred)ENC_LIVE();
- if(![self textures:NB_OBJECTS(s,d) count:2 written:2])return;
+              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+ if(![self textures:NB_OBJECTS(s,d) count:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
- if(encDeferred) {
-  ET_REC;EncCmd c={};c.op=EO_COPY_TEXTURE;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.mask=1;
-  const uint64_t args[13]={ss,sl,a[0],a[1],a[2],size[0],size[1],size[2],ds,dl,b[0],b[1],b[2]};
-  encPush(c,args,sizeof args);return;
- }
+ if(b44On())b44Tex("blitTexToTex",d,0,[NSString stringWithFormat:@"src fmt %lu %lux%lu at %lu,%lu size %lux%lu dst at %lu,%lu level %lu/%lu slice %lu/%lu",(unsigned long)s.pixelFormat,(unsigned long)s.width,(unsigned long)s.height,
+  (unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height,(unsigned long)dO.x,(unsigned long)dO.y,(unsigned long)sl,(unsigned long)dl,(unsigned long)ss,(unsigned long)ds]);
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
 }
-- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {ENC_SCOPE(EC_BLIT,"blit copyTexture(whole)");
- if(![self textures:NB_OBJECTS(s,d) count:2 written:2])return;
+- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+ if(![self textures:NB_OBJECTS(s,d) count:2])return;
  const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
  for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
   MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
@@ -2381,182 +1653,32 @@ static void waitForResource(id resource) {
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
-     destinationOrigin:(MTLOrigin)dO {ENC_SCOPE(EC_BLIT,"blit bufferToTexture");
- if(encDeferred)ENC_LIVE();
- if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1 written:1])return;
+     destinationOrigin:(MTLOrigin)dO {
+ if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
- if(encDeferred) {
-  ET_REC;EncCmd c={};c.op=EO_BUFFER_TO_TEXTURE;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;
-  const uint64_t args[11]={o,row,image,size[0],size[1],size[2],slice,level,b[0],b[1],b[2]};
-  encPush(c,args,sizeof args);return;
- }
+ if(b44On())b44Tex("blitBufToTex",d,row,[NSString stringWithFormat:@"%@ offset %lu image %lu level %lu slice %lu buflen %lu",B44R(MTLRegionMake3D(dO.x,dO.y,dO.z,z.width,z.height,z.depth)),(unsigned long)o,(unsigned long)image,(unsigned long)level,(unsigned long)slice,(unsigned long)s.length]);
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
-               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {ENC_SCOPE(EC_BLIT,"blit textureToBuffer");
- if(encDeferred)ENC_LIVE();
- if(![self textures:NB_OBJECTS(s) count:1 written:0] || ![self buffers:NB_OBJECTS(d) count:1])return;
+               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
+ if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
- if(encDeferred) {
-  ET_REC;EncCmd c={};c.op=EO_TEXTURE_TO_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.mask=1;
-  const uint64_t args[11]={slice,level,a[0],a[1],a[2],size[0],size[1],size[2],o,row,image};
-  encPush(c,args,sizeof args);return;
- }
+ if(b44On())b44Tex("blitTexToBuf",s,row,[NSString stringWithFormat:@"%@ offset %lu image %lu level %lu slice %lu",B44R(MTLRegionMake3D(so.x,so.y,so.z,z.width,z.height,z.depth)),(unsigned long)o,(unsigned long)image,(unsigned long)level,(unsigned long)slice]);
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
-- (void)generateMipmapsForTexture:(id<MTLTexture>)t {ENC_SCOPE(EC_BLIT,"blit generateMipmaps");
- if(encDeferred)ENC_LIVE();
- if(![self textures:NB_OBJECTS(t) count:1 written:1])return;
- if(encDeferred){ET_REC;EncCmd c={};c.op=EO_MIPMAPS;c.target=(__bridge void *)self;c.a=(__bridge void *)t;encPush(c);return;}
+- (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+ if(![self textures:NB_OBJECTS(t) count:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
 
-// u-encthread: one recorded command, on the worker (in call order): the bridge calls the inline paths make, with the same refusals.
-static void encReplay(const EncCmd &c,const uint8_t *bytes) {
- if(c.op==EO_COMMIT) {
-  NBCommandBuffer *cb=(__bridge_transfer NBCommandBuffer *)c.target;
-  cb->encCommitStarted=true;
-  const uint64_t s0=mach_absolute_time(),f0=cb->tlFrame && cb->tlFirstEncoder?tlNow():0;
-  [cb commitSubmit];
-  const uint64_t s1=mach_absolute_time();
-  cb->encCommitDone=true;
-  if(cb->encCommitTick && s0>=cb->encCommitTick) {   // g4: the submit's lag
-   const double tick=encTickNs();
-   const int64_t lag[4]={(int64_t)((s0-cb->encCommitTick)*tick),(int64_t)((s0-std::max(cb->encCommitTick,gEqWakeTick))*tick),
-    (int64_t)((s1-s0)*tick),f0?(int64_t)f0-(int64_t)cb->tlFirstEncoder:-1};
-   std::lock_guard<std::mutex> l(gEtLatLock);
-   for(int i=0;i<4;i++)if(lag[i]>=0 && gEtLat[i].size()<4096)gEtLat[i].push_back(lag[i]);
-  }
-  gEtCommits.fetch_add(1,std::memory_order_relaxed);
-  return;
- }
- if(c.op==EO_EVENT) {
-  NBCommandBuffer *cb=(__bridge_transfer NBCommandBuffer *)c.target;NBEvent *event=(__bridge_transfer NBEvent *)c.a;
-  const bool signal=c.u[1];
-  if(!(signal?nmb_command_buffer_signal_event(cb.handle,event.handle,c.u[0]):nmb_command_buffer_wait_event(cb.handle,event.handle,c.u[0])))
-   [cb refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
-  return;
- }
- if(c.op==EO_RENDER_NEW || c.op==EO_BLIT_NEW) {   // the recorded creation keeps the encoder until its end
-  NBEncoder *e=(__bridge NBEncoder *)c.target;NBCommandBuffer *cb=e.commandBuffer;
-  NmbEncoder *h=c.op==EO_RENDER_NEW?nmb_render_encoder_new(cb.handle,(const NmbRenderPassDescriptor *)(bytes+c.off)):nmb_blit_encoder_new(cb.handle);
-  if(!h)[cb refuse:[NSString stringWithFormat:@"%@: %@",c.op==EO_RENDER_NEW?@"renderCommandEncoder":@"blitCommandEncoder",lastError()]];
-  e.handle=h;
-  return;
- }
- if(c.op==EO_END || c.op==EO_DISCARD) {
-  NBEncoder *e=(__bridge_transfer NBEncoder *)c.target;
-  NmbEncoder *h=e.handle;e.handle=nullptr;
-  if(h){if(c.op==EO_END)[e check:nmb_encoder_end(h) what:"endEncoding"];else nmb_encoder_discard(h);}
-  return;
- }
- NBEncoder *e=(__bridge NBEncoder *)c.target;
- id a;   // released at the end of the replay when the command retained it
- if(c.flags&ECF_RETAIN_A)a=(__bridge_transfer id)c.a;else a=(__bridge id)c.a;
- NmbEncoder *h=e.handle;
- if(!h)return;   // its creation was refused: the command buffer failed then
- const uint32_t stage=c.stage,index=c.index;
- switch(c.op) {
- case EO_BUFFER:[e check:nmb_encoder_set_buffer(h,stage,a?[(NBBuffer *)a handle]:nullptr,c.u[0],index) what:"setBuffer"];break;
- case EO_OFFSET:[e check:nmb_encoder_set_buffer_offset(h,stage,c.u[0],index) what:"setBufferOffset"];break;
- case EO_BYTES:
-  [e check:c.flags&ECF_NULL_BYTES?nmb_encoder_set_bytes(h,stage,(const void *)(uintptr_t)c.u[0],(size_t)c.u[1],index):
-                                  nmb_encoder_set_bytes(h,stage,bytes+c.off,c.len,index) what:"setBytes"];
-  break;
- case EO_TEXTURE: {
-  NBTexture *t=(NBTexture *)a;
-  if(t) {
-   ycbcrRefresh(t,e.commandBuffer);
-   // a replaceRegion since the bind was recorded: its bytes are not the seed's (0 = copied again)
-   if(shadowSeedOn() && t.surface && !t.ycbcrGPU)
-    nmb_texture_set_bytes_generation(t.handle,t->encReplaceEpoch.load()==(uint32_t)c.u[0]?(uint64_t)IOSurfaceGetSeed(t.surface)+1:0);
-  }
-  [e check:nmb_encoder_set_texture(h,stage,t?t.handle:nullptr,index) what:"setTexture"];
-  break;
- }
- case EO_SAMPLER:[e check:nmb_encoder_set_sampler(h,stage,a?[(NBSampler *)a handle]:nullptr,index) what:"setSamplerState"];break;
- case EO_FENCE: {
-  NmbFence *f=[(NBFence *)a handle];const bool update=c.u[1];
-  [e check:update?nmb_encoder_update_fence(h,f,c.u[0]):nmb_encoder_wait_fence(h,f,c.u[0]) what:update?"updateFence":"waitForFence"];
-  break;
- }
- case EO_PIPELINE:[e check:nmb_render_set_pipeline(h,[(NBRenderPipeline *)a handle]) what:"setRenderPipelineState"];break;
- case EO_DSS:[e check:nmb_render_set_depth_stencil(h,a?[(NBDepthStencil *)a handle]:nullptr) what:"setDepthStencilState"];break;
- case EO_VIEWPORT: {double v[6];memcpy(v,c.u,sizeof v);[e check:nmb_render_set_viewport(h,v) what:"setViewport"];break;}
- case EO_SCISSOR:[e check:nmb_render_set_scissor(h,c.u) what:"setScissorRect"];break;
- case EO_RASTER:[e check:nmb_render_set_raster(h,c.u[0],c.u[1],c.u[2]) what:"raster state"];break;
- case EO_DEPTH_BIAS: {
-  float v[3];memcpy(&v[0],&c.u[0],4);memcpy(&v[1],&c.u[1],4);memcpy(&v[2],&c.u[2],4);
-  [e check:nmb_render_set_depth_bias(h,v[0],v[1],v[2]) what:"setDepthBias"];break;
- }
- case EO_LINE_WIDTH: {float w;memcpy(&w,&c.u[0],4);[e check:nmb_render_set_line_width(h,w) what:"setLineWidth"];break;}
- case EO_VISIBILITY:[e check:nmb_render_set_visibility_mode(h,c.u[0],c.u[1]) what:"setVisibilityResultMode"];break;
- case EO_STENCIL_REF:[e check:nmb_render_set_stencil_reference(h,(uint32_t)c.u[0],(uint32_t)c.u[1]) what:"setStencilReferenceValues"];break;
- case EO_BLEND_COLOR: {float v[4];memcpy(v,c.u,sizeof v);[e check:nmb_render_set_blend_color(h,v) what:"setBlendColor"];break;}
- case EO_DRAW:
-  [e check:nmb_render_draw(h,c.u[0],(uint32_t)c.u[1],(uint32_t)c.u[2],(uint32_t)c.u[3],(uint32_t)c.u[4]) what:"drawPrimitives"];break;
- case EO_DRAW_INDEXED:
-  [e check:nmb_render_draw_indexed(h,c.u[0],(uint32_t)(c.u[1]>>32),c.u[2],[(NBBuffer *)a handle],c.u[3],(uint32_t)c.u[1],
-                                   (int32_t)(uint32_t)(c.u[4]>>32),(uint32_t)c.u[4]) what:"drawIndexedPrimitives"];
-  break;
- case EO_COPY_BUFFER:
-  [e check:nmb_blit_copy_buffer(h,[(NBBuffer *)a handle],c.u[0],[(NBBuffer *)(__bridge id)c.b handle],c.u[1],c.u[2]) what:"copyFromBuffer:toBuffer:"];
-  break;
- case EO_FILL_BUFFER:[e check:nmb_blit_fill_buffer(h,[(NBBuffer *)a handle],c.u[0],c.u[1],(uint8_t)c.u[2]) what:"fillBuffer"];break;
- case EO_COPY_TEXTURE: {
-  NBTexture *s=(NBTexture *)a,*d=(__bridge NBTexture *)c.b;
-  if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
-  const uint64_t *v=(const uint64_t *)(bytes+c.off);
-  [e check:nmb_blit_copy_texture(h,s.handle,v[0],v[1],v+2,v+5,d.handle,v[8],v[9],v+10) what:"copyFromTexture:toTexture:"];
-  break;
- }
- case EO_BUFFER_TO_TEXTURE: {
-  const uint64_t *v=(const uint64_t *)(bytes+c.off);
-  [e check:nmb_blit_buffer_to_texture(h,[(NBBuffer *)a handle],v[0],v[1],v[2],v+3,[(__bridge NBTexture *)c.b handle],v[6],v[7],v+8)
-       what:"copyFromBuffer:toTexture:"];
-  break;
- }
- case EO_TEXTURE_TO_BUFFER: {
-  NBTexture *s=(NBTexture *)a;
-  if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
-  const uint64_t *v=(const uint64_t *)(bytes+c.off);
-  [e check:nmb_blit_texture_to_buffer(h,s.handle,v[0],v[1],v+2,v+5,[(__bridge NBBuffer *)c.b handle],v[8],v[9],v[10]) what:"copyFromTexture:toBuffer:"];
-  break;
- }
- case EO_MIPMAPS:[e check:nmb_blit_generate_mipmaps(h,[(NBTexture *)a handle]) what:"generateMipmapsForTexture"];break;
- default:break;
- }
-}
-
 static void completed(void *context);
 static void scheduled(void *context);
-// SweetMetal2 (C6): a lost Vulkan device (Turnip's: the kernel reported this client's work lost in a GPU reset, or a submit/wait
-// failed) fails every later command buffer of the process: backboardd's screen froze (seen once on r18e). A refused IOSurface import
-// is not that: Turnip answers it VK_ERROR_INVALID_EXTERNAL_HANDLE / OUT_OF_DEVICE_MEMORY, and the texture over it is refused alone
-// (nil, logged), the device stays. When the device is lost all the same, backboardd exits once logged, so launchd starts it again with
-// a new device (at most 3 times a boot, /var/local/mtl2-lost.count; never with /var/local/mtl2-lost-stay). Other processes log it.
-static void noteDeviceLost(const char *why) {
- if(!why || (!strcasestr(why,"device was lost") && !strcasestr(why,"device lost") && !strcasestr(why,"DEVICE_LOST")))return;
- static std::atomic<bool> once{false};
- if(once.exchange(true))return;
- NBLOG(@"native-metal: the GPU device is lost (%s): every later command buffer fails",why);
- if(strcmp(getprogname(),"backboardd"))return;
- if(access("/var/local/mtl2-lost-stay",F_OK)==0){NBLOG(@"native-metal: backboardd stays (/var/local/mtl2-lost-stay)");return;}
- struct timeval boot={};size_t length=sizeof boot;sysctlbyname("kern.boottime",&boot,&length,nullptr,0);
- long long bootSeen=0;int restarts=0;
- if(FILE *f=fopen("/var/local/mtl2-lost.count","r")){if(fscanf(f,"%lld %d",&bootSeen,&restarts)!=2)restarts=0;fclose(f);}
- if(bootSeen!=(long long)boot.tv_sec)restarts=0;
- if(restarts>=3){NBLOG(@"native-metal: backboardd stays: 3 restarts for a lost device this boot already");return;}
- if(FILE *f=fopen("/var/local/mtl2-lost.count","w")){fprintf(f,"%lld %d\n",(long long)boot.tv_sec,restarts+1);fclose(f);}
- NBLOG(@"native-metal: backboardd exits for a new GPU device (restart %d of 3 this boot)",restarts+1);
- dispatch_after(dispatch_time(DISPATCH_TIME_NOW,500*NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{_exit(75);});
-}
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();encDeferred=encThreadOn();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if(self)createdUs=nowUs();
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -2571,18 +1693,16 @@ static void noteDeviceLost(const char *why) {
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
- if(encDeferred) {   // u-encthread: the bridge has the command buffer to itself until its commit is replayed
-  if(!encCommitStarted.load())return self.committed?MTLCommandBufferStatusCommitted:MTLCommandBufferStatusNotEnqueued;
-  const uint64_t raw=nmb_command_buffer_status(_handle);
-  return (MTLCommandBufferStatus)(raw<MTLCommandBufferStatusCommitted?MTLCommandBufferStatusCommitted:raw);
- }
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
 }
 - (NSError *)error {
  if(self.failedLocally)return nbError(self.encodeFailure);
- if(encDeferred && !encCommitStarted.load())return nil;
  if(self.status!=MTLCommandBufferStatusError)return nil;
  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
+ // 0133: a GPU restart's victim (bridge 0133) or another failure the driver relayed answers in Metal's domain with its code
+ // (MTLCommandBufferErrorInternal for a victim, as Metal's "Discarded (victim of GPU error/recovery)"); the rest as before.
+ const uint64_t code=nmb_command_buffer_execution_code(_handle);
+ if(code)return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:(NSInteger)code userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:text]}];
  return nbError([NSString stringWithUTF8String:text]);
 }
 // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
@@ -2593,30 +1713,15 @@ static void noteDeviceLost(const char *why) {
 // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
-- (BOOL)commitAndWaitUntilSubmitted {tlWaitedScheduled=true;[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
-- (CFTimeInterval)GPUStartTime {return encDeferred && !encCommitStarted.load()?0:nmb_command_buffer_gpu_time(_handle,false);}
-- (CFTimeInterval)GPUEndTime {return encDeferred && !encCommitStarted.load()?0:nmb_command_buffer_gpu_time(_handle,true);}
-// u-encthread: a recorded encoder; its bridge encoder is made by the worker (EO_RENDER_NEW/EO_BLIT_NEW: the pass copied).
-- (id)deferredEncoder:(NBEncoder *)encoder op:(uint8_t)op pass:(const NmbRenderPassDescriptor *)pass what:(NSString *)what {
- ET_REC;
- if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
- if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
- encoder.commandBuffer=self;encoder->encDeferred=true;
- encOpen=encoder;
- EncCmd c={};c.op=op;c.target=(__bridge_retained void *)encoder;   // released as its end (or discard) is replayed
- encPush(c,pass,pass?sizeof *pass:0);
- return encoder;
-}
+- (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+- (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
+- (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
- if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
- [self encBegin];ENC_SCOPE(EC_ENC,"computeCommandEncoder");
- // u-encthread: compute stays inline: the worker first replays what this command buffer (and every other) recorded
- if(encDeferred)encFlush(EF_COMPUTE);
  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
@@ -2624,13 +1729,10 @@ static void noteDeviceLost(const char *why) {
  return [self computeCommandEncoder];
 }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
- [self encBegin];ENC_SCOPE(EC_ENC,"blitCommandEncoder");
  gBlits++;encodedWork.blits++;
- if(encDeferred)return [self deferredEncoder:[NBBlitEncoder new] op:EO_BLIT_NEW pass:nullptr what:@"blitCommandEncoder"];
  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
- [self encBegin];ENC_SCOPE(EC_ENC,"renderCommandEncoder");
  NmbRenderPassDescriptor pass={};
  {
   id<MTLTexture> first=d.colorAttachments[0].texture;
@@ -2639,24 +1741,33 @@ static void noteDeviceLost(const char *why) {
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
-   if(pixels>=1500000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface){tlFrame=true;tlSurface=IOSurfaceGetID(((NBTexture *)first).surface);}
   }
  }
- auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
+ auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out,unsigned kind)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
-  if(texture.rotationValue)self.rotatedFrame=YES;
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  if(resolveFixOn()) {   // sweet resolve
+   if(a.resolveTexture) {
+    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+    NBTexture *resolve=(NBTexture *)a.resolveTexture;[_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+    out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   } else if(out.store==MTLStoreActionMultisampleResolve||out.store==MTLStoreActionStoreAndMultisampleResolve) {
+    const bool keep=out.store==MTLStoreActionStoreAndMultisampleResolve;out.store=keep?MTLStoreActionStore:MTLStoreActionDontCare;
+    resolveFixNote(kind,keep);
+   }
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
-  if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+  if(!attachment(c,pass.colors[i],i)){[self refuse:@"foreign color attachment"];return nil;}
   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
  }
- if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+ if(!attachment(d.depthAttachment,pass.depth,8) || !attachment(d.stencilAttachment,pass.stencil,9)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+ if(resolveFixOn()){pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;}   // sweet resolve
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
@@ -2664,57 +1775,24 @@ static void noteDeviceLost(const char *why) {
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- NBRenderEncoder *re=[NBRenderEncoder new];
- if(gDrawboxLeft.load(std::memory_order_relaxed)>0 && timelineOn()) {   // ovd: SWEET_DRAWBOX
-  if(!dbFrame)dbFrame=gDrawboxSeq.fetch_add(1)+1;
-  re->dbFrame=dbFrame;re->dbPass=dbPasses++;
-  id<MTLTexture> t=d.colorAttachments[0].texture;re->dbW=t?(uint32_t)t.width:0;re->dbH=t?(uint32_t)t.height:0;re->dbLoad=(uint32_t)d.colorAttachments[0].loadAction;
-  char line[200];snprintf(line,sizeof line,"native-metal: DB f%u p%u pass %ux%u fmt %lu load %u store %lu surface %u",dbFrame,re->dbPass,re->dbW,re->dbH,
-   t?(unsigned long)t.pixelFormat:0ul,re->dbLoad,(unsigned long)d.colorAttachments[0].storeAction,
-   (t && [(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface)?IOSurfaceGetID(((NBTexture *)t).surface):0u);
-  sm2_logs(line);
- }
- // g9 (SWEET_DEADFILL, backboardd): fills tracked; mode 2 holds the creation of a pass that loads colour 0. g10: the pass's colour 0 is an
- // 8-bit unorm single-sample 2D IOSurface (the composited frame; mode +4: any such texture), nothing depth/stencil/visibility; colours
- // 1..7 may be attached (CA's memoryless scratch is colour 1 of every pass: g9 demanded colour 0 alone, so the hold never happened)
- static const bool dfProc=!strcmp(getprogname(),"backboardd");
- if(const int mode=dfProc?deadfillMode():0) {
-  id<MTLTexture> t=d.colorAttachments[0].texture;
-  const MTLPixelFormat pf=t?t.pixelFormat:MTLPixelFormatInvalid;   // 8-bit unorm targets only: a clear value and a written colour store alike
-  bool target=(mode&3) && t && (pf==MTLPixelFormatBGRA8Unorm || pf==MTLPixelFormatRGBA8Unorm) && t.sampleCount<=1 && t.textureType==MTLTextureType2D &&
-   !d.depthAttachment.texture && !d.stencilAttachment.texture && !d.visibilityResultBuffer && d.colorAttachments[0].level==0 && d.colorAttachments[0].slice==0;
-  if(target && !(mode&4))target=[(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface;
-  if(target) {
-   re->dfTrack=true;re->dfMode=(int8_t)mode;re->dfHeld=-1;re->dbW=(uint32_t)t.width;re->dbH=(uint32_t)t.height;
-   // colours 1..7 whose contents outlive the pass (not memoryless): a fill that may write one keeps its draw. CA's memoryless scratch
-   // (colour 1) is written only by its "S1" pipelines (r51); the fill pipeline is exactly draw.PBGRAXm_A2Xhf, never one of them.
-   re->dfAttached=0;
-   for(unsigned i=1;i<8;i++)if(id<MTLTexture> c=d.colorAttachments[i].texture)if(c.storageMode!=MTLStorageModeMemoryless)re->dfAttached|=(uint8_t)(1u<<i);
-   const MTLLoadAction load=d.colorAttachments[0].loadAction;
-   if((mode&3)>=2 && (load==MTLLoadActionLoad || load==MTLLoadActionDontCare) && !self.committed) {
-    if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
-    re.commandBuffer=self;re->dfPass=new NmbRenderPassDescriptor(pass);re->dfPending=true;
-    if(encDeferred){re->encDeferred=true;encOpen=re;}
-    gDfHeldPasses.fetch_add(1,std::memory_order_relaxed);
-    [re dfCapture];
-    return re;
-   }
-  }
- }
- if(encDeferred)return [self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
- return [self encoder:re handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ NBRenderEncoder *encoder=[NBRenderEncoder new];
+ [encoder drawLogStart:d];   // sweet drawlog
+ if(!self.committed&&[encoder dfHold:pass load:d.colorAttachments[0].loadAction]){encoder.commandBuffer=self;return (id<MTLRenderCommandEncoder>)encoder;}   // sweet deadfill: made at endEncoding
+ return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
-- (void)addScheduledHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addScheduledHandler");if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
-- (void)addCompletedHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addCompletedHandler");if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+- (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+- (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+// A drawable (CAMetalLayer apps, games) is presented once the GPU has written it. Ported from UniXNU/AdrenoMetal 243d63c
+// NativeBridgeMetalFrontend.mm:3057-3059 (MIT); afterMinimumDuration: is ours, the same way.
+- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAfterMinimumDuration:duration];}];
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
  if(self.committed){[self refuse:@"event encoded after commit"];return;}
- if(encDeferred) {
-  ET_REC;
-  EncCmd c={};c.op=EO_EVENT;c.target=(__bridge_retained void *)self;c.a=(__bridge_retained void *)event;c.flags=ECF_RETAIN_A;c.u[0]=value;c.u[1]=signal;
-  encPush(c);return;
- }
  NmbEvent *handle=[(NBEvent *)event handle];
  if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
   [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
@@ -2743,15 +1821,12 @@ static void noteDeviceLost(const char *why) {
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
- if(!self.failedLocally && nmb_command_buffer_status(_handle)==MTLCommandBufferStatusError) {
-  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);noteDeviceLost(text);
- }
- // C3: what the GPU wrote (every surface with SWEET_FLUSH=all), invalidated for the CPU.
- flushSurfaces(flushAll()?_surfaces:_writtenSurfaces,true);
- if(shadowSeedOn())bumpWrittenSeeds(_writtenSurfaces);
+ if(ctlPath())ctlF0=mach_absolute_time();   // sweet ctl
+ flushSurfaces(_surfaces,2);
+ if(ctlPath())ctlF1=mach_absolute_time();
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
- [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  NSArray *completedHandlers;
  @synchronized(self){
@@ -2760,63 +1835,19 @@ static void noteDeviceLost(const char *why) {
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
  }
  void (^run)(void)=^{
-  if(self->tlNotice && !self.failedLocally)[self timelineRecord];
+  if(ctlPath())self->ctlQ=mach_absolute_time();   // sweet ctl
   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
+  if(ctlPath()&&self->ctlC){CtlRec r{self.commitIndex,self->ctlC,self->ctlD,self->ctlF0,self->ctlF1,self->ctlQ,mach_absolute_time()};ctlPush(r);}
   dispatch_group_leave(self->_handlers);
  };
  dispatch_queue_t queue=_queue.completionQueue;
  if(queue)dispatch_async(queue,run);else run();
 }
-// u-e: the encode window's start (the first encoder, before it is made) and end (commit): see EncScope.
-- (void)encBegin {
- if(tlFirstEncoder || !tlCreated)return;
- tlFirstEncoder=tlNow();
- if(!encStatOn())return;
- encThreadNote();
- encStart=tEnc;
- encCpuStart=clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
- pthread_threadid_np(nullptr,&encThread);
- encCpu0=(int8_t)encCPU();
- uint64_t work[10]={};
- if(gDevice && nmb_device_work_stats(gDevice,work)){encVkStart[0]=work[0];encVkStart[1]=work[1];}
-}
-- (void)encEnd {
- if(!encThread)return;
- uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
- if(tid!=encThread)return;   // committed on another thread: the thread's counts say nothing of this window
- EncFrame &f=encFrame;
- const double tick=encTickNs()/1e6;
- for(int c=0;c<EC_COUNT;c++){f.ms[c]=(float)((tEnc.ticks[c]-encStart.ticks[c])*tick);f.n[c]=(uint16_t)std::min<uint32_t>(tEnc.n[c]-encStart.n[c],65535);}
- f.scopes=(uint32_t)(tEnc.scopes-encStart.scopes);
- f.cpuMs=(float)((clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)-encCpuStart)/1e6);
- f.cpu0=encCpu0;f.cpu1=(int8_t)encCPU();f.mhz=encMHz();
- uint64_t work[10]={};
- if(gDevice && nmb_device_work_stats(gDevice,work)){f.vkN=(uint16_t)std::min<uint64_t>(work[0]-encVkStart[0],65535);f.vkMs=(float)((work[1]-encVkStart[1])/1e3);}
- f.valid=true;
-}
 - (void)commit {
- liveKnobsPoll();   // u-lab
- if(dbFrame) {   // ovd
-  if(tlFrame)gDrawboxLeft.fetch_sub(1);
-  char line[120];snprintf(line,sizeof line,"native-metal: DB f%u commit, %u passes, framebuffer %d, %d frames left",dbFrame,dbPasses,tlFrame,gDrawboxLeft.load());sm2_logs(line);
- }
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
- if(tlCreated) {
-  tlCommit=tlNow();
-  [self encEnd];
-  static std::atomic<uint64_t> nextReport{0};
-  uint64_t due=nextReport.load();
-  if(tlCommit>=due && nextReport.compare_exchange_strong(due,tlCommit+5000000000ull) && due) {
-   std::vector<TLRecord> records;
-   {std::lock_guard<std::mutex> lock(gTLLock);records.swap(gTL);}
-   static dispatch_queue_t reporter=dispatch_queue_create("sweet.timeline",DISPATCH_QUEUE_SERIAL);
-   const uint64_t span=tlCommit-(due-5000000000ull);
-   dispatch_async(reporter,^{timelineReport(records,span);});
-  }
- }
- noteShadowCopies();
+ if(ctlPath())ctlC=mach_absolute_time();   // sweet ctl
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -2826,67 +1857,28 @@ static void noteDeviceLost(const char *why) {
  }
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
- if(encDeferred) {   // u-encthread: the rest (in flight, surface cleans, handlers, the bridge's commit) is the worker's, in order
-  ET_REC;
-  if(NBEncoder *open=encOpen)if(!open->encEnded && open->dfCapturing)[open dfRelease:false clear:false];   // g9: its creation recorded first
-  if(NBEncoder *open=encOpen)if(!open->encEnded){open->encEnded=true;EncCmd d={};d.op=EO_DISCARD;d.target=(__bridge void *)open;encPush(d);}
-  encOpen=nil;
-  encCommitTick=mach_absolute_time();
-  EncCmd c={};c.op=EO_COMMIT;c.target=(__bridge_retained void *)self;encPush(c);
-  return;
- }
- [self commitSubmit];
-}
-// The commit's submission: in flight, CPU-written surfaces cleaned, the runtime's handlers registered and its commit; a refusal
-// fails it locally (completed handlers run with the error). Inline from commit, or the worker's replay of it (u-encthread).
-- (void)commitSubmit {
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
-  flushSurfaces(_surfaces,false);
+  flushSurfaces(_surfaces,1);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
-  noteDeviceLost(nmb_last_error());
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
  self.failedLocally=YES;gCommitFailures++;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
 }
-// u-encthread: a wait on a recorded command buffer: its commit replayed first (another thread's wait may come before the commit
-// is recorded: it flushes again).
-- (void)encAwaitCommit:(EncFlushWhy)why {
- for(unsigned tries=0;!encCommitDone.load();tries++) {
-  if(encOnWorker() || !gEqStarted.load())return;
-  encFlush(why);
-  if(!encCommitDone.load())usleep(tries<100?20:1000);
- }
-}
-// u-t: this command buffer's timeline record, as its completed handlers start.
-- (void)timelineRecord {
- TLRecord r={};
- r.created=tlFirstEncoder?tlFirstEncoder:tlCreated;r.commit=tlCommit;r.notice=tlNotice;r.handler=tlNow();
- auto ns=[](double seconds)->uint64_t{return seconds>0?(uint64_t)(seconds*1e9):0;};
- r.kStart=ns(nmb_command_buffer_kernel_time(_handle,false));r.kEnd=ns(nmb_command_buffer_kernel_time(_handle,true));
- r.gStart=ns(nmb_command_buffer_gpu_time(_handle,false));r.gEnd=ns(nmb_command_buffer_gpu_time(_handle,true));
- r.work=encodedWork;r.enc=encFrame;r.surface=tlSurface;r.frame=tlFrame;r.waitedCompleted=tlWaitedCompleted;r.waitedScheduled=tlWaitedScheduled;
- std::lock_guard<std::mutex> lock(gTLLock);
- if(gTL.size()<4096)gTL.push_back(r);
-}
-- (void)waitUntilCompleted {ENC_SCOPE(EC_WAIT,"waitUntilCompleted");
+- (void)waitUntilCompleted {
  if(!self.committed)return;
- if(encDeferred)[self encAwaitCommit:EF_COMPLETED];
- tlWaitedCompleted=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
  gTimeWaitCompleted.add(began);
 }
-- (void)waitUntilScheduled {ENC_SCOPE(EC_WAIT,"waitUntilScheduled");
+- (void)waitUntilScheduled {
  if(!self.committed)return;
- if(encDeferred)[self encAwaitCommit:EF_SCHEDULED];
- tlWaitedScheduled=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
@@ -2897,28 +1889,10 @@ static void noteDeviceLost(const char *why) {
 @end
 static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
 // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
-// rotfb4: once per 5 s, while landscape frames render: the command buffers with a rotated pass, their GPU ms, and the runtime's rotated
-// copies (in, skipped, back, MB, dispatches) over the same 5 s.
-static void rotatedFrameStats(NBCommandBuffer *commandBuffer) {
- static std::mutex lock;static uint64_t windowUs,frames,gpuUs,gpuMaxUs,last[5];
- const double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
- const uint64_t took=end>start && start>0?(uint64_t)((end-start)*1e6):0;
- std::lock_guard<std::mutex> l(lock);
- frames++;gpuUs+=took;gpuMaxUs=std::max(gpuMaxUs,took);
- const uint64_t now=nowUs();
- if(!windowUs){windowUs=now;nmb_rotated_copy_stats(last);return;}
- if(now-windowUs<5000000)return;
- uint64_t c[5];nmb_rotated_copy_stats(c);
- sm2_logs([NSString stringWithFormat:@"native-metal: rotated 5s: %llu cmdbufs, GPU %llu ms (mean %.1f, max %.1f) | copies in %llu skipped %llu back %llu, %llu MB, %llu dispatches",
-  (unsigned long long)frames,(unsigned long long)(gpuUs/1000),frames?gpuUs/1000.0/frames:0.0,gpuMaxUs/1000.0,(unsigned long long)(c[0]-last[0]),
-  (unsigned long long)(c[1]-last[1]),(unsigned long long)(c[2]-last[2]),(unsigned long long)((c[3]-last[3])>>20),(unsigned long long)(c[4]-last[4])].UTF8String);
- memcpy(last,c,sizeof c);windowUs=now;frames=gpuUs=gpuMaxUs=0;
-}
 static void completed(void *context) {
- gCompleted++;primeNoteCommit();   // G6: backboardd's commits, for SpringBoard's idle priming
+ gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
- if(commandBuffer->tlCreated)commandBuffer->tlNotice=tlNow();
- if(commandBuffer.rotatedFrame)rotatedFrameStats(commandBuffer);
+ if(ctlPath())commandBuffer->ctlD=mach_absolute_time();   // sweet ctl
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
@@ -2930,91 +1904,9 @@ static void completed(void *context) {
  [commandBuffer finish];
 }
 
-// G5 (SWEET_NILENC=1): never a nil encoder, after UniXNU AdrenoMetal ce5e19e. Where renderCommandEncoderWithDescriptor:, blitCommandEncoder,
-// computeCommandEncoder(WithDispatchType:) would answer nil (after commit, a foreign attachment, the runtime refused the pass), the caller
-// gets a refusing encoder: an object of the right protocol that accepts every call and does nothing (declared selectors answer 0, any other
-// selector too). RenderBox caches an encoder's IMPs with methodForSelector: and called address 0 on nil (UniXNU i568: WidgetRenderer). The
-// command buffer is refused (if not yet committed): its commit fails locally, status error, completed handlers still run. The first
-// refusal of the process is logged once with its reason ("native-metal: NILENC: ..."). Default (unset/0): nil as before; the wrappers are
-// installed at device open only with SWEET_NILENC=1, so the default path is unchanged.
-static std::atomic<uint64_t> gNilencRefusals,gNilencUndeclared;
-@interface NBRefusingEncoder : NBObject
-@property(nonatomic,strong) id commandBuffer;
-@end
-@implementation NBRefusingEncoder
-- (void)endEncoding {}
-- (void)insertDebugSignpost:(NSString *)s {(void)s;}
-- (void)pushDebugGroup:(NSString *)s {(void)s;}
-- (void)popDebugGroup {}
-- (BOOL)respondsToSelector:(SEL)selector {return [super respondsToSelector:selector] || declaredTypes(object_getClass(self),selector)!=nullptr;}
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
- if(NSMethodSignature *own=[super methodSignatureForSelector:selector])return own;
- if(!gNilencUndeclared++)sm2_logs([NSString stringWithFormat:@"native-metal: NILENC: undeclared %s %s answered nil",class_getName(object_getClass(self)),sel_getName(selector)].UTF8String);
- return [NSMethodSignature signatureWithObjCTypes:"@@:"];
-}
-- (void)forwardInvocation:(NSInvocation *)invocation {   // silently: every call is expected to land here
- const NSUInteger length=invocation.methodSignature.methodReturnLength;
- if(length){std::vector<uint8_t> zero(length,0);[invocation setReturnValue:zero.data()];}
-}
-@end
-@interface NBRefusingRenderEncoder : NBRefusingEncoder
-@end
-@implementation NBRefusingRenderEncoder
-- (NSUInteger)tileWidth {return 0;}
-- (NSUInteger)tileHeight {return 0;}
-@end
-@interface NBRefusingBlitEncoder : NBRefusingEncoder
-@end
-@implementation NBRefusingBlitEncoder
-@end
-@interface NBRefusingComputeEncoder : NBRefusingEncoder
-@end
-@implementation NBRefusingComputeEncoder
-- (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
-@end
-static id nilencRefusing(NBCommandBuffer *commandBuffer,Class cls,const char *what) {
- NSString *reason=commandBuffer.committed?@"after commit":(commandBuffer.encodeFailure?:lastError());
- if(!commandBuffer.committed && !commandBuffer.encodeFailure)[commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,reason]];
- const uint64_t n=++gNilencRefusals;
- if(n==1)NBLOG(@"native-metal: NILENC: refusing %s encoder instead of nil (%@); command buffer %s",what,reason,
-  commandBuffer.committed?"already committed":"refused (fails at commit)");
- NBRefusingEncoder *encoder=[cls new];encoder.commandBuffer=commandBuffer;
- return encoder;
-}
-static IMP gNilencRender,gNilencBlit,gNilencCompute,gNilencComputeType;
-static id nilencRender(id self,SEL cmd,MTLRenderPassDescriptor *d) {
- id e=((id(*)(id,SEL,MTLRenderPassDescriptor *))gNilencRender)(self,cmd,d);
- return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingRenderEncoder class],"render");
-}
-static id nilencBlit(id self,SEL cmd) {
- id e=((id(*)(id,SEL))gNilencBlit)(self,cmd);
- return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingBlitEncoder class],"blit");
-}
-static id nilencCompute(id self,SEL cmd) {
- id e=((id(*)(id,SEL))gNilencCompute)(self,cmd);
- return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingComputeEncoder class],"compute");
-}
-static id nilencComputeType(id self,SEL cmd,MTLDispatchType type) {
- id e=((id(*)(id,SEL,MTLDispatchType))gNilencComputeType)(self,cmd,type);
- return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingComputeEncoder class],"compute");
-}
-static void nilencInstall() {
- const char *e=getenv("SWEET_NILENC");
- if(!(e && atoi(e)==1) || gNilencRender)return;
- struct {Class cls;const char *protocol;} adopt[]={{[NBRefusingRenderEncoder class],"MTLRenderCommandEncoder"},
-  {[NBRefusingBlitEncoder class],"MTLBlitCommandEncoder"},{[NBRefusingComputeEncoder class],"MTLComputeCommandEncoder"}};
- for(auto &a:adopt)if(Protocol *p=objc_getProtocol(a.protocol))if(![a.cls conformsToProtocol:p])class_addProtocol(a.cls,p);
- Class cb=[NBCommandBuffer class];
- gNilencRender=method_setImplementation(class_getInstanceMethod(cb,@selector(renderCommandEncoderWithDescriptor:)),(IMP)nilencRender);
- gNilencBlit=method_setImplementation(class_getInstanceMethod(cb,@selector(blitCommandEncoder)),(IMP)nilencBlit);
- gNilencCompute=method_setImplementation(class_getInstanceMethod(cb,@selector(computeCommandEncoder)),(IMP)nilencCompute);
- gNilencComputeType=method_setImplementation(class_getInstanceMethod(cb,@selector(computeCommandEncoderWithDispatchType:)),(IMP)nilencComputeType);
- sm2_logs("native-metal: NILENC: refusing encoders on (SWEET_NILENC=1)");
-}
-
 @implementation NBQueue
 - (void)dealloc {nmb_queue_release(_handle);}
-- (id<MTLCommandBuffer>)commandBuffer {ENC_SCOPE(EC_CB,"commandBuffer");
+- (id<MTLCommandBuffer>)commandBuffer {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
  NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;return (id<MTLCommandBuffer>)commandBuffer;
@@ -3107,34 +1999,26 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
 }
-// SweetMetal2 (C1): render pipeline outcomes in the log (the journal is a file on the phone): every refused key (vertex | fragment |
-// first colour format) once with the reason, and a count line at the 1st, 10th, 50th, 100th, 200th, ... pipeline made.
-static void notePipeline(MTLRenderPipelineDescriptor *d,const char *refused) {
- static std::mutex lock;static std::vector<std::string> seen;static uint64_t made,failed;
- NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
- NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
- std::string key=std::string(vf?vf.name.UTF8String?:"?":"-")+" | "+(ff?ff.name.UTF8String?:"?":"-")+" | c0 "+
-     std::to_string((unsigned long)d.colorAttachments[0].pixelFormat);
- bool log=false;uint64_t m,f;
- {
-  std::lock_guard<std::mutex> l(lock);
-  if(refused){failed++;if(seen.size()<64 && std::find(seen.begin(),seen.end(),key)==seen.end()){seen.push_back(key);log=true;}}
-  else made++;
-  m=made;f=failed;
- }
- if(log)NBLOG(@"native-metal: render pipeline refused (%s): %s",key.c_str(),refused);
- if(!refused && (m==1 || m==10 || m==50 || m%100==0))sm2_logs([NSString stringWithFormat:@"native-metal: render pipelines made %llu, refused %llu",
-     (unsigned long long)m,(unsigned long long)f].UTF8String);
+// B55 (WebGL): a pipeline asked with another device's function was refused without a word (wg2, 2026-11-03: ANGLE's functions came from
+// Apple's _MTLLibrary, every WebGL draw was GL_INVALID_OPERATION and the boot log said nothing; research/notes/webgl/context-lost-2026-11-03.md).
+// One line per (path, function class), at most 16 kinds per process.
+static void noteForeignFunction(const char *path,id function) {
+ static std::mutex lock;static std::vector<std::string> seen;
+ const char *cls=function?object_getClassName(function):"nil";const std::string kind=std::string(path)+" "+cls;
+ {std::lock_guard<std::mutex> hold(lock);if(seen.size()>=16||std::find(seen.begin(),seen.end(),kind)!=seen.end())return;seen.push_back(kind);}
+ NBLOG(@"SWEET MTL: foreign function %s refused (%s, %s)",cls,path,getprogname());
 }
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
+  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]])noteForeignFunction("render vertex",(id)d.vertexFunction);
+  else noteForeignFunction("render fragment",(id)d.fragmentFunction);
   if(error)*error=nbError(@"foreign function");return false;
  }
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
-  p->colors[i]={sweetFormat((uint64_t)a.pixelFormat),(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
+  p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
@@ -3174,7 +2058,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
  if(!answer)NBLOG(@"native-metal: heap setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
 }
-- (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {ENC_SCOPE(EC_BUF,"heap newBuffer");
+- (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
@@ -3184,8 +2068,9 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
  return [self bufferWithLength:length options:options offset:offset];
 }
-- (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {ENC_SCOPE(EC_TEX,"heap newTexture");
+- (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ if(b44On())b44Desc("heapTexture",d,0,nil);
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -3203,7 +2088,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 
 // Creation and archive population must use the same complete supported descriptor.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,NSError **error) {
- if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
+ if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){noteForeignFunction("compute descriptor",d?(id)d.computeFunction:nil);if(error)*error=nbError(@"foreign compute function");return false;}
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
  MTLStageInputOutputDescriptor *stage=d.stageInputDescriptor;
@@ -3261,6 +2146,24 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 
 @interface NBDeviceMethods : NSObject
 @end
+// B55 (WebGL, route A of research/notes/webgl/context-lost-2026-11-03.md): ANGLE compiles every WebGL program from MSL source with
+// newLibraryWithSource:options:error: (its only call site, mtl::CreateShaderLibrary 0x1ce411f34). The base class's version compiles it
+// through MTLCompilerService (it needs no Apple GPU; the backend runs only at pipeline creation) and gives an Apple _MTLLibrary, whose
+// functions renderDescriptor refuses. So: Apple's compile (its IMP, saved at open), its metallib (-[_MTLLibrary serializeToURL:error:],
+// Metal.s 255528: writes _libraryData's metallib, else "MTLLibrary is not formatted as a MetalLib file."; no in-memory form is proven:
+// -libraryDataContents is an unread vtable slot) to a temp file, then the same load as newLibraryWithData:. Any step failing returns
+// Apple's library, as before. SWEET_SRCLIB=0: neither selector is installed, the base class's runs exactly as before.
+static bool srcLibOn() {static const bool on=[]{const char *p=getenv("SWEET_SRCLIB");return !(p&&*p&&atoi(p)==0);}();return on;}
+typedef void *(*NBSourceLibraryIMP)(id,SEL,NSString *,MTLCompileOptions *,NSError *__autoreleasing *);   // +1 result, taken with __bridge_transfer
+static NBSourceLibraryIMP gAppleSourceLibrary;
+@protocol NBSerializableLibrary
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error;
+@end
+// One "SWEET SRC:" line per call: the first 32 of a process, then every 64th.
+static void srcLibLog(uint64_t n,NSString *line,bool failed) {
+ if(failed)noteProblem(line);
+ if(n<=32||n%64==0)sm2_logs([NSString stringWithFormat:@"SWEET SRC: %s #%llu %@",getprogname(),(unsigned long long)n,line].UTF8String);
+}
 // Bytes of one texel of the uncompressed formats Core Animation and RenderBox use (4 for the rest).
 static uint64_t sweetTexelBytes(MTLPixelFormat f) {
  switch((NSUInteger)f) {
@@ -3322,7 +2225,9 @@ static char sweetMemoryOwnerKey;
 - (void)finalizeTextureMemory:(void *)memory {(void)memory;}
 - (void)copyFromLinearBytes:(const void *)src linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)srcRow linearBytesPerImage:(NSUInteger)image
             toTextureMemory:(void *)dst textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level textureRegion:(MTLRegion)r {
- (void)image;if(slice || level)return;
+ (void)image;
+ if(b44On())b44Log("layoutUpload",0,0,_row/(_texel?_texel:1)*_bw,_height*_bh,1,1,0,0,srcRow,[NSString stringWithFormat:@"%@ offset %lu level %lu slice %lu texel %llu block %ux%u",B44R(r),(unsigned long)offset,(unsigned long)level,(unsigned long)slice,(unsigned long long)_texel,_bw,_bh]);
+ if(slice || level)return;
  const NSUInteger x0=r.origin.x/_bw,y0=r.origin.y/_bh,w=(r.size.width+_bw-1)/_bw,h=(r.size.height+_bh-1)/_bh;
  for(NSUInteger y=0;y<h && y0+y<_height;y++)
   memcpy((uint8_t *)dst+(y0+y)*_row+x0*_texel,(const uint8_t *)src+offset+y*srcRow,w*_texel);
@@ -3335,6 +2240,7 @@ static char sweetMemoryOwnerKey;
   memcpy((uint8_t *)dst+offset+y*dstRow,(const uint8_t *)src+(y0+y)*_row+x0*_texel,w*_texel);
 }
 @end
+static void fillBaseLimits(id device);   // 0132
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
@@ -3344,14 +2250,21 @@ static char sweetMemoryOwnerKey;
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
 // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
-// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
-// base implementation reads Apple tables this device does not have.
-- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
+// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). The base implementation reads Apple tables
+// this device does not have, so it never runs: the legacy iOS feature sets of the families supportsFamily: already claims (Apple1-3:
+// iOS_GPUFamily1-3, values 0-10 and 12-14; 11 and 15 up are Family4/5) answer YES. ANGLE's IsMetalRendererAvailable asks for 4
+// (iOS_GPUFamily3_v1) and without it WebGL contexts are lost at creation (B55, research/notes/webgl). SWEET_FEATURESET=0: all NO, as before.
+- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {
+ static const bool on=[]{const char *p=getenv("SWEET_FEATURESET");return !(p&&*p&&atoi(p)==0);}();
+ return on&&(NSUInteger)set<=14&&set!=11;
+}
 // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
 // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
 // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
 // by this file's own answers (installAnswers) and any other stays the base class's neutral 0/NO. Nothing is claimed that nothing measured.
-- (void)initLimits {}
+// 0132 (G10): the limits are the exception to "empty": system code reads the base class's limits structure itself instead of asking the
+// getters (fillBaseLimits below), so the device's answers are written into it.
+- (void)initLimits {fillBaseLimits(self);}
 - (void)initFeatureQueries {}
 - (void)initGPUFamilySupport {}
 - (void)initWorkarounds {}
@@ -3361,6 +2274,11 @@ static char sweetMemoryOwnerKey;
  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
  return MTLSizeMake(s[0],s[1],s[2]);
 }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {   // the missing-selector fallback above, for the device
+ NSMethodSignature *signature=[super methodSignatureForSelector:selector];
+ return signature||missingAbort()?signature:missingSignature("NativeBridgeMetalDevice",selector);
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {answerMissing(invocation);}
 - (void)doesNotRecognizeSelector:(SEL)selector {
  if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
  noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
@@ -3399,7 +2317,7 @@ static char sweetMemoryOwnerKey;
 // memory (it is imported, not copied). Clients ask the layout for size and alignment, allocate, then wrap the memory
 // (RenderBox's drawables; without these: "RBDisplayList: no drawable" and blank widgets). A caller that never asked
 // gets the pitch its length implies where the required one does not fit.
-- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {ENC_SCOPE(EC_TEX,"newTextureNoCopy");
+- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
  const size_t page=(size_t)getpagesize();
  if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
   NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
@@ -3419,9 +2337,9 @@ static char sweetMemoryOwnerKey;
   objc_setAssociatedObject(texture,&sweetMemoryOwnerKey,owner,OBJC_ASSOCIATION_RETAIN);
   return texture;
  }
- uint64_t row=sweetLinearRow(d.pixelFormat,d.width);
- if(row && row*d.height>length)row=nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);   // memory laid out before C4
+ uint64_t row=nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);
  if(row && row*d.height>length && length%d.height==0)row=length/d.height;
+ if(sweetTexelBytes(d.pixelFormat)==1)B29LOG(@"B29 bytesNoCopy %lux%lu fmt %lu length %lu pitch %llu",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)length,(unsigned long long)row);
  if(!row || row*d.height>length){NBLOG(@"native-metal: newTextureWithBytesNoCopy: %lux%lu fmt %lu does not fit %lu bytes",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)length);return nil;}
  id<MTLBuffer> buffer=[(id<MTLDevice>)self newBufferWithBytesNoCopy:bytes length:(length+page-1)&~(page-1) options:MTLResourceStorageModeShared deallocator:deallocator];
  if(!buffer)return nil;
@@ -3436,406 +2354,245 @@ static char sweetMemoryOwnerKey;
  uint32_t bw=0,bh=0,bb=0;
  if(sweetBlock(d.pixelFormat,&bw,&bh,&bb))
   return [[SweetTextureLayout alloc] initWithBlocks:bw by:bh bytes:bb width:d.width height:d.height];
- const uint64_t row=sweetLinearRow(d.pixelFormat,d.width);
+ const uint64_t row=nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);
  if(!row){NBLOG(@"native-metal: newTextureLayoutWithDescriptor: no linear pitch for fmt %lu: %@",(unsigned long)d.pixelFormat,lastError());return nil;}
  return [[SweetTextureLayout alloc] initWithRow:row height:d.height texel:sweetTexelBytes(d.pixelFormat)];
 }
-// C4: the offset/row alignment of a texture over a buffer (Metal's: 16; the base class answers it from Apple's tables). CA's
-// 194-wide BGRA linear texture still came at 784-byte rows on r19a with every other alignment answer at 64; the first call is logged.
-- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format {
- static std::atomic<bool> logged{false};
- if(!logged.exchange(true))sm2_logs([NSString stringWithFormat:@"native-metal: minimumTextureBufferAlignmentForPixelFormat:%lu asked: %llu",
-     (unsigned long)format,(unsigned long long)linearAlignment()].UTF8String);
- return (NSUInteger)linearAlignment();
-}
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {ENC_SCOPE(EC_BUF,"newBuffer");
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
-- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {ENC_SCOPE(EC_BUF,"newBufferWithBytes");
+- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
  if(!bytes)return nil;
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
-- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {ENC_SCOPE(EC_BUF,"newBufferNoCopy");
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
  if(!handle){NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
  buffer.wrapped=pointer;buffer.deallocator=deallocator;
  return (id<MTLBuffer>)buffer;
 }
-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {ENC_SCOPE(EC_TEX,"newTexture");
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ if(b44On())b44Desc("texture",d,0,nil);
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
 }
+// 0112 (camera preview): textures over planar IOSurfaces, after ios-redfin (MIT). YCBCR8_420_2P(_sRGB) (500/501) over a 420v/420f surface
+// becomes an RGBA8(_sRGB) copy converted on the CPU (BT.601, video or full range by the fourcc); RGB10A8_2P_XR10(_sRGB) (550/551) a
+// BGRA8(_sRGB) copy (XR10 colour from plane 0, alpha from plane 1). Filled again when the surface's seed moved on (checked at every bind).
+// Since 0127 the fallback of the GPU path below. Off: M2V_PLANAR=0 (all planar surfaces refused, as before).
+static bool planarOn() {static const bool on=[]{const char *p=getenv("M2V_PLANAR");return !p||strcmp(p,"0");}();return on;}
+// 0127 (G7): one line per new kind (OSType, format, plane, outcome; at most 128 kinds a process), as SWEET YCBCR: <fourcc> fmt N plane P WxH
+// -> gpu|cpu|refused (why). It replaces 0112's "planar iosurface refused" line.
+static void ycbcrNote(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,unsigned outcome,NSString *why) {
+ static const char *const names[]={"gpu","cpu","refused"};
+ static std::mutex lock;static std::vector<uint64_t> seen;
+ const OSType fourcc=IOSurfaceGetPixelFormat(surface);const NSUInteger format=d.pixelFormat;
+ const uint64_t key=((uint64_t)fourcc<<32)|((uint64_t)(format&0xffffff)<<8)|((plane&15)<<4)|(outcome&3);
+ {std::lock_guard<std::mutex> hold(lock);if(seen.size()>=128 || std::find(seen.begin(),seen.end(),key)!=seen.end())return;seen.push_back(key);}
+ NBLOG(@"SWEET YCBCR: %c%c%c%c fmt %lu plane %lu %lux%lu -> %s%@",(char)(fourcc>>24),(char)(fourcc>>16),(char)(fourcc>>8),(char)fourcc,(unsigned long)format,
+  (unsigned long)plane,(unsigned long)d.width,(unsigned long)d.height,names[outcome<3?outcome:2],why.length?[NSString stringWithFormat:@" (%@)",why]:@"");
+}
+static inline uint8_t clamp8(int v) {return (uint8_t)(v<0?0:v>255?255:v);}
+// 0129 (G7, vd4d): 0112's 420v/420f -> RGBA8 conversion through Apple's Accelerate (vImageConvert_420Yp8_CbCr8ToARGB8888, NEON, tiled
+// across threads) instead of the per-pixel loop (backboardd ~95 % of a core at 1080p30). Same BT.601 as the loop (the surface's
+// kIOSurfaceYCbCrMatrix is still ignored); input not clipped (YpMin/Max 0/255), as the loop. 420f uses vImage's usual full range (Cb/Cr
+// over 127, the loop over 128: under 1 % saturation). Odd sizes, a short chroma plane and XR10 (550/551) keep the loop. Off: SWEET_VIMAGE=0.
+static bool vimageOn() {static const bool on=[]{const char *p=getenv("SWEET_VIMAGE");return !p||strcmp(p,"0");}();return on;}
+static const vImage_YpCbCrToARGB *vimageInfo(bool video) {
+ static const auto make=[](const vImage_YpCbCrPixelRange range)->vImage_YpCbCrToARGB *{
+  vImage_YpCbCrToARGB *info=new vImage_YpCbCrToARGB();
+  if(vImageConvert_YpCbCrToARGB_GenerateConversion(kvImage_YpCbCrToARGBMatrix_ITU_R_601_4,&range,info,kvImage420Yp8_CbCr8,kvImageARGB8888,kvImageNoFlags)!=kvImageNoError){delete info;return nullptr;}
+  return info;};
+ static const vImage_YpCbCrToARGB *const videoInfo=make({16,128,235,240,255,0,255,0}),*const fullInfo=make({0,128,255,255,255,0,255,0});
+ return video?videoInfo:fullInfo;
+}
+static bool planarVimage(const uint8_t *p0,size_t r0,const uint8_t *p1,size_t r1,size_t w1,size_t h1,NSUInteger w,NSUInteger h,bool video,NSUInteger format,uint8_t *out,size_t pitch) {
+ if(!vimageOn() || (w&1) || (h&1) || w1*2<w || h1*2<h)return false;
+ const vImage_YpCbCrToARGB *info=vimageInfo(video);if(!info)return false;
+ const vImage_Buffer y={(void *)p0,h,w,r0},c={(void *)p1,h/2,w/2,r1},d={out,h,w,pitch};
+ static const uint8_t rgba[4]={1,2,3,0}; // ARGB -> RGBA
+ if(vImageConvert_420Yp8_CbCr8ToARGB8888(&y,&c,&d,info,rgba,255,kvImageNoFlags)!=kvImageNoError)return false;
+ static std::atomic<unsigned> logged{0};const unsigned bit=video?1:2;
+ if(!(logged.fetch_or(bit)&bit))NBLOG(@"SWEET YCBCR: cpu conversion via vImage (fmt %lu, matrix BT.601, range %s)",(unsigned long)format,video?"video":"full");
+ return true;
+}
+// 0130 (G7, video CPU): the converted copy is a texture over a Shared buffer of its own (linear rows of the device's pitch; the runtime
+// aliases a linear image over them for a texture that only reads, linear_plan.rs ReadsPastRows), and the conversion writes straight into
+// the buffer's bytes at that pitch: no 8 MB temporary per 1080p frame, no replaceRegion (its packed copy and Turnip's host image copy).
+// Same ordering as replaceRegion's host copy (host_copy.rs: waits for no GPU work, "a race is the program's"): the CPU writes at the bind
+// of a new command buffer, and the commit makes them visible to it. Off: SWEET_PLANAR_DIRECT=0 (an image filled by replaceRegion, as 0112).
+static bool planarDirectOn() {static const bool on=[]{const char *p=getenv("SWEET_PLANAR_DIRECT");return !p||strcmp(p,"0");}();return on;}
+static void planarDirectNote(NSString *how) {
+ static std::atomic<bool> logged{false};
+ if(!logged.exchange(true))NBLOG(@"SWEET YCBCR: cpu conversion %@",how);
+}
+// 0130: a texture of `own` over a new Shared buffer, rows at the device's linear pitch and 4 spare rows (Turnip's linear image reaches up to
+// 3 rows past the last, linear_plan.rs Holds::ReadsPastRows); nil (and why) where it cannot be made.
+static NBTexture *planarDirectTexture(id<MTLDevice> device,MTLTextureDescriptor *own,NSString **why) {
+ const uint64_t row=nmb_device_linear_bytes_per_row(gDevice,own.pixelFormat,own.width);
+ if(!row){*why=[NSString stringWithFormat:@"no linear pitch: %@",lastError()];return nil;}
+ const size_t page=(size_t)getpagesize(),length=((size_t)row*(own.height+4)+page-1)&~(page-1);
+ NBBuffer *buffer=(NBBuffer *)[device newBufferWithLength:length options:MTLResourceStorageModeShared];
+ if(!buffer || !buffer.contents){*why=@"no buffer";return nil;}
+ NBTexture *texture=textureOnBuffer(buffer,own,0,row,false);
+ if(!texture){*why=@"no texture over the buffer";return nil;}
+ return texture;
+}
+static void planarFill(NBTexture *t) {
+ IOSurfaceRef s=t.planarSurface;if(!s)return;
+ const uint32_t seed=IOSurfaceGetSeed(s);if(seed==t.planarSeed)return;
+ const NSUInteger w=t.width,h=t.height;
+ if(IOSurfaceLock(s,kIOSurfaceLockReadOnly,nullptr))return;
+ const uint8_t *p0=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s,0),*p1=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s,1);
+ const size_t r0=IOSurfaceGetBytesPerRowOfPlane(s,0),r1=IOSurfaceGetBytesPerRowOfPlane(s,1);
+ const size_t w0=IOSurfaceGetWidthOfPlane(s,0),h0=IOSurfaceGetHeightOfPlane(s,0),w1=IOSurfaceGetWidthOfPlane(s,1),h1=IOSurfaceGetHeightOfPlane(s,1);
+ if(!p0 || !p1 || w>w0 || h>h0 || !w1 || !h1){IOSurfaceUnlock(s,kIOSurfaceLockReadOnly,nullptr);t.planarSeed=seed;return;}
+ // 0130: over its own buffer, the texels themselves (t.rowBytes apart); else a temporary for replaceRegion.
+ std::unique_ptr<uint8_t[]> out;uint8_t *dst=t.buffer?(uint8_t *)t.buffer.contents+t.offset:nullptr;size_t pitch=t.rowBytes;
+ if(!dst){out.reset(new uint8_t[w*h*4]);dst=out.get();pitch=w*4;} // 0129: not zeroed, every byte is written
+ const NSUInteger format=t.pixelFormat;
+ if(format==MTLPixelFormatRGBA8Unorm || format==MTLPixelFormatRGBA8Unorm_sRGB){
+  // BT.601, 16.16 fixed point. 420v: Y 16-235, C 16-240; 420f: full range.
+  const bool video=IOSurfaceGetPixelFormat(s)=='420v';
+  if(!planarVimage(p0,r0,p1,r1,w1,h1,w,h,video,format,dst,pitch)){
+  const int ky=video?76309:65536,krv=video?104597:91881,kgu=video?25675:22554,kgv=video?53279:46802,kbu=video?132201:116130,yo=video?16:0;
+  for(NSUInteger y=0;y<h;y++){
+   const uint8_t *ly=p0+y*r0,*lc=p1+std::min((size_t)(y/2),h1-1)*r1;uint8_t *o=dst+y*pitch;
+   for(NSUInteger x=0;x<w;x++,o+=4){
+    const size_t cx=std::min((size_t)(x/2),w1-1)*2;
+    const int Y=(ly[x]-yo)*ky,U=lc[cx]-128,V=lc[cx+1]-128;
+    o[0]=clamp8((Y+krv*V+32768)>>16);o[1]=clamp8((Y-kgu*U-kgv*V+32768)>>16);o[2]=clamp8((Y+kbu*U+32768)>>16);o[3]=255;
+   }
+  }
+  }
+ } else {
+  // XR10: 10-bit channels in a 32-bit word (B low), 384 = 0.0, 894 = 1.0; alpha 8-bit from plane 1.
+  for(NSUInteger y=0;y<h;y++){
+   const uint32_t *l=(const uint32_t *)(p0+y*r0);const uint8_t *la=p1+std::min((size_t)y,h1-1)*r1;uint8_t *o=dst+y*pitch;
+   for(NSUInteger x=0;x<w;x++,o+=4){
+    const uint32_t v=l[x];
+    o[0]=clamp8(((int)(v&1023)-384)*255/510);o[1]=clamp8(((int)((v>>10)&1023)-384)*255/510);o[2]=clamp8(((int)((v>>20)&1023)-384)*255/510);
+    o[3]=la[std::min((size_t)x,w1-1)];
+   }
+  }
+ }
+ IOSurfaceUnlock(s,kIOSurfaceLockReadOnly,nullptr);
+ if(out)[t replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0 withBytes:out.get() bytesPerRow:w*4];
+ t.planarSeed=seed;
+}
+// 0127 (G7): textures over planar IOSurfaces on the runtime's own GPU path (ycbcr.rs, texture/surface_two_planes.rs). The whole surface is
+// imported once without a copy and the texture starts at the asked plane's address and rows. Over a two-plane surface the runtime also gets
+// the surface's OSType, size, plane 1 and kIOSurfaceYCbCrMatrix: a two-plane YCbCr format (500-510, 520-530, 540-545) or XR10 (550/551) is
+// converted on the GPU at each use, and a plane read alone (CVMetalTextureCache and decoders: R8Unorm plane 0, RG8Unorm plane 1) is a plain
+// texture over that plane. Ported from UniXNU/AdrenoMetal 243d63c NativeBridgeMetalFrontend.mm:1290-1302 (textureOnSurface) and :4174-4196
+// (newTextureWithDescriptor:iosurface:plane:) (MIT); the matrix is ours. A refusal falls back to 0112's CPU copy where it has one.
+// Default OFF since vd4d (2026-11-03): with the GPU path Safari 1080p30 dropped 1187-1212 of 1800 frames (backboardd
+// at 15 %, the presenter stalls) against 63-82 with 0112's CPU conversion. SWEET_YCBCR_GPU=1 turns it on.
+static bool ycbcrGpuOn() {static const bool on=[]{const char *p=getenv("SWEET_YCBCR_GPU");return p&&strcmp(p,"0");}();return on;}
+extern "C" const CFStringRef kIOSurfaceYCbCrMatrix __attribute__((weak_import));   // exported by IOSurface.framework, not in the SDK's headers
+// The surface's matrix as nmb_texture_new_on_surface takes it: 0 none (or not a string), 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, 5 another.
+static uint32_t surfaceMatrix(IOSurfaceRef surface) {
+ if(!&kIOSurfaceYCbCrMatrix || !kIOSurfaceYCbCrMatrix)return 0;
+ CFTypeRef value=IOSurfaceCopyValue(surface,kIOSurfaceYCbCrMatrix);if(!value)return 0;
+ uint32_t matrix=0;
+ if(CFGetTypeID(value)==CFStringGetTypeID()){
+  NSString *name=(__bridge NSString *)value;
+  matrix=[name isEqualToString:@"ITU_R_601_4"]?1:[name isEqualToString:@"ITU_R_709_2"]?2:[name isEqualToString:@"ITU_R_2020"]?3:[name isEqualToString:@"SMPTE_240M_1995"]?4:5;
+ }
+ CFRelease(value);return matrix;
+}
+static NBTexture *planeTexture(MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,NSString **why) {
+ const size_t planes=IOSurfaceGetPlaneCount(surface);
+ if(plane>=planes){*why=[NSString stringWithFormat:@"the surface has %zu planes",planes];return nil;}
+ void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){*why=@"base or allocation not page-sized";return nil;}
+ const uintptr_t start=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane);const size_t row=IOSurfaceGetBytesPerRowOfPlane(surface,plane);
+ if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){*why=@"plane outside the allocation or without rows";return nil;}
+ NBBuffer *buffer=surfaceBuffer(surface,base,(allocation+page-1)&~(page-1));if(!buffer){*why=@"surface import";return nil;}
+ NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor)){*why=@"descriptor";return nil;}
+ const uint64_t offset=start-(uintptr_t)base;
+ const uintptr_t chroma=planes>=2?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1):0;
+ const uint64_t chromaOffset=chroma>=(uintptr_t)base?chroma-(uintptr_t)base:0,chromaRow=planes>=2?IOSurfaceGetBytesPerRowOfPlane(surface,1):0;
+ const uint32_t matrix=surfaceMatrix(surface);
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,IOSurfaceGetWidth(surface),
+  IOSurfaceGetHeight(surface),chromaOffset,chromaRow,matrix);
+ noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ if(!handle){*why=lastError();return nil;}
+ // 0128 (G7): a converted two-plane texture reads the surface's seed at each use and converts only when it moved (or a command wrote the
+ // planes), as 0112's planarFill. The runtime holds the retained surface (released with the texture; at once for a plane-alone texture).
+ // Off: SWEET_YCBCR_SEED=0 (in the runtime).
+ if(planes>=2)nmb_texture_watch_seed(handle,(uint32_t (*)(const void *))IOSurfaceGetSeed,CFRetain(surface),(void (*)(const void *))CFRelease);
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ *why=[NSString stringWithFormat:@"offset %llu row %zu matrix %u",(unsigned long long)offset,row,matrix];
+ return texture;
+}
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
-// A plane of a planar surface (the camera's 420f/420v pictures: an R8 texture over the luma plane, an RG8 one over the
-// chroma plane, as Core Animation asks for them) is a texture at that plane's offset with that plane's rows.
-// (Redfin: before this every planar surface was refused, and Camera.app's preview stayed black.)
-static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,size_t planes,NSUInteger offset,
-                               NSUInteger row,const char *what) {
- // Once per distinct (surface format, texture format, plane, planes, outcome with its whole reason): the old key took the reason's
- // first letter only, so a second reason of the same outcome ("refused (...)") was never logged.
- static std::mutex lock;static std::vector<std::string> seen;
- const uint32_t f=IOSurfaceGetPixelFormat(surface);
- char head[96];snprintf(head,sizeof head,"%08x/%lu/%lu/%zu/",f,(unsigned long)d.pixelFormat,(unsigned long)plane,planes);
- const std::string key=head+std::string(what);
- {std::lock_guard<std::mutex> l(lock);if(std::find(seen.begin(),seen.end(),key)!=seen.end() || seen.size()>=96)return;seen.push_back(key);}
- NBLOG(@"native-metal: IOSurface texture %s: surface %c%c%c%c %zux%zu, %zu planes; plane %lu as format %lu %lux%lu, offset %lu, %lu bytes a row",
-       what,(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),planes,
-       (unsigned long)plane,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row);
-}
-// The surface's YCbCr matrix attachment, as NmbSurfaceFacts names it: 0 none, 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, 5 another.
-// CoreVideo propagates a pixel buffer's kCVImageBufferYCbCrMatrixKey (camera_device.c attaches ITU_R_601_4) to its IOSurface's values;
-// the key is looked for by name among the values and one level of dictionaries inside them, so the exact key spelling does not matter.
-// The first surface's value keys are logged once (phase 2: which key carries it).
-static uint32_t matrixOfValue(CFTypeRef value) {
- if(!value || CFGetTypeID(value)!=CFStringGetTypeID())return 5;
- NSString *text=(__bridge NSString *)value;
- if([text containsString:@"709"])return 2;
- if([text containsString:@"601"])return 1;
- if([text containsString:@"2020"])return 3;
- if([text containsString:@"240"])return 4;
- return 5;
-}
-static uint32_t surfaceMatrix(IOSurfaceRef surface) {
- // (r19: SweetSurface accepts and drops IOSurface values, so this answers 0, read as BT.601 like Metal's "no matrix", until the
- // kernel keeps them.)
- // Without an attachment, an HD video-range picture (a decoder's 420v, 1280x720 and up) is taken as BT.709, as CoreVideo tags those;
- // everything else (the camera's 420f, SD video) as BT.601, Metal's reading of no matrix.
- const uint32_t guess=(IOSurfaceGetPixelFormat(surface)&0xff)=='v' && IOSurfaceGetWidth(surface)>=1280 && IOSurfaceGetHeight(surface)>=720?2:0;
- CFDictionaryRef values=IOSurfaceCopyAllValues(surface);
- if(!values)return guess;
- NSDictionary *all=(__bridge_transfer NSDictionary *)values;
- static std::atomic<bool> logged{false};
- if(!logged.exchange(true)) {
-  NSString *keys=[all.allKeys componentsJoinedByString:@" "];
-  NBLOG(@"native-metal: YCbCr surface values: %@",keys.length>300?[keys substringToIndex:300]:keys);
- }
- uint32_t matrix=guess;
- for(id key in all) {
-  id value=all[key];
-  if([key isKindOfClass:[NSString class]] && [(NSString *)key containsString:@"YCbCrMatrix"])return matrixOfValue((__bridge CFTypeRef)value);
-  if([value isKindOfClass:[NSDictionary class]])for(id inner in (NSDictionary *)value)
-   if([inner isKindOfClass:[NSString class]] && [(NSString *)inner containsString:@"YCbCrMatrix"])matrix=matrixOfValue((__bridge CFTypeRef)((NSDictionary *)value)[inner]);
- }
- return matrix;
-}
-// MTLPixelFormatYCBCR8_420_2P (500) and its sRGB twin (501): Core Animation asks for one texture over both planes of a 420f/420v surface
-// (photographs in Photos, videos, the camera preview). Turnip has no such format. Two ways:
-// - the CPU copy (default since r19a): an RGBA8 picture in RGB, converted on the CPU into a linear texture over a buffer of its own
-//   (64-byte rows: no Turnip shadow, no upload), filled again when the texture is used after its surface was written (seed). Two
-//   buffers take turns, and the one written is never one a committed command buffer still uses, so a frame is never sampled half
-//   filled (r19a's tiles out of step came from 71 strip uploads per picture landing while the texture was sampled).
-// - SWEET_YCBCR=gpu (/var/local/mtl2-env): the runtime's two-plane texture (metal2vulkan ycbcr.rs), converted on the GPU into an
-//   RGBA16F image of its own, now only when the surface's seed moved (bridge patch 0103: r19a converted at every encoder, 82 ms
-//   submits at 99 % busy), one texture per surface while Core Animation holds it (r19a made one image of 13.6 MB per frame: the
-//   pool climbed 163 -> 352 MB).
-static bool ycbcrOnGPU() {
- static int gpu=-1;
- if(gpu<0){const char *e=getenv("SWEET_YCBCR");gpu=e && !strcmp(e,"gpu");}
- return gpu>0;
-}
-static NBTexture *ycbcrSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,std::string &why,uint64_t *lumaRowOut) {
- if(IOSurfaceGetPlaneCount(surface)!=2){why="not two planes";return nil;}
- void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){why="base or size";return nil;}
- const size_t bytes=(allocation+page-1)&~(page-1);
- const uint64_t luma=(uint64_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,0)-(uintptr_t)base);
- const uint64_t chroma=(uint64_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1)-(uintptr_t)base);
- const uint64_t lumaRow=IOSurfaceGetBytesPerRowOfPlane(surface,0),chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
- *lumaRowOut=lumaRow;
- if(!lumaRow || !chromaRow || luma>=bytes || chroma>=bytes){why="plane geometry";return nil;}
- // One texture per surface and request while the caller holds it (weak): CA asks again for every frame of a pool surface.
- struct Key {uint64_t id,base,format,width,height,usage;};
- const Key value={IOSurfaceGetID(surface),(uintptr_t)base,(uint64_t)d.pixelFormat,d.width,d.height,(uint64_t)d.usage};
- NSValue *key=[NSValue valueWithBytes:&value objCType:@encode(Key)];
- static NSMapTable<NSValue *,NBTexture *> *made;static std::mutex lock;
- {std::lock_guard<std::mutex> l(lock);
-  if(!made)made=[NSMapTable strongToWeakObjectsMapTable];
-  if(NBTexture *known=[made objectForKey:key]){why="";return known;}}
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
- if(!buffer){why="import";return nil;}
- NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor)){why="descriptor";return nil;}
- const NmbSurfaceFacts facts={IOSurfaceGetPixelFormat(surface),surfaceMatrix(surface),0,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma,chromaRow};
- NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,luma,lumaRow,true,&facts);
- if(!handle){why=lastError().UTF8String?:"?";return nil;}
- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- texture.buffer=buffer;texture.offset=(NSUInteger)luma;texture.rowBytes=(NSUInteger)lumaRow;texture.plane=0;[texture holdSurface:surface];
- texture.ycbcrGPU=true;
- {std::lock_guard<std::mutex> l(lock);
-  if(made.count>=64)for(NSValue *old in made.keyEnumerator.allObjects)if(![made objectForKey:old])[made removeObjectForKey:old];
-  [made setObject:texture forKey:key];}
- return texture;
-}
-// The CPU copy's picture: BT.601 or BT.709 by the surface's matrix, full range for 420f and the like, video range for 420v; 16.16
-// fixed point; nearest chroma; written straight into the buffer under the texture (`row` bytes a row), then cleaned to memory.
-static bool ycbcrFill(NBBuffer *into,uint64_t row,IOSurfaceRef surface,size_t w,size_t h,bool bt709) {
- const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
- const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
- uint8_t *out=into?(uint8_t *)nmb_buffer_contents(into.handle):nullptr;
- if(!y || !c || !ys || !cs || !out || row<w*4 || nmb_buffer_length(into.handle)<row*h)return false;
- const bool video=(IOSurfaceGetPixelFormat(surface)&0xff)=='v';
- // {luma, Cr->R, Cb->G, Cr->G, Cb->B}: BT.601 / BT.709, full / video range (chroma 255/224 and luma 255/219 for video)
- static const int32_t k[2][2][5]={{{65536,91881,22554,46802,116130},{76309,104597,25674,53279,132201}},
-                                  {{65536,103206,12275,30677,121607},{76309,117489,13973,34923,138438}}};
- const int32_t *m=k[bt709][video];
- const int32_t ky=m[0],kr=m[1],kgb=m[2],kgr=m[3],kb=m[4],y0=video?16:0;
- for(size_t j=0;j<h;j++) {
-  const uint8_t *yl=y+j*ys,*cl=c+(j/2)*cs;uint32_t *o=(uint32_t *)(out+j*row);
-  size_t x=0;
-#if defined(__aarch64__)
-  // 16 pixels a step: the same matrix in 10.6 fixed point, saturating (r19a: 17-21 ms a picture scalar).
-  {
-   const int16_t qy=(int16_t)((ky+512)>>10),qr=(int16_t)((kr+512)>>10),qgb=(int16_t)((kgb+512)>>10),qgr=(int16_t)((kgr+512)>>10),
-                 qb=(int16_t)((kb+512)>>10);
-   const int16x8_t vy0=vdupq_n_s16((int16_t)y0),v128=vdupq_n_s16(128),vround=vdupq_n_s16(32);
-   const uint8x16_t alpha=vdupq_n_u8(255);
-   for(;x+16<=w;x+=16) {
-    const uint8x16_t yv=vld1q_u8(yl+x);
-    const uint8x8x2_t cc=vld2_u8(cl+x);   // 8 (Cb, Cr) pairs
-    const int16x8_t cb=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cc.val[0])),v128),cr=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cc.val[1])),v128);
-    const int16x8_t dr=vmulq_n_s16(cr,qr),dg=vnegq_s16(vaddq_s16(vmulq_n_s16(cb,qgb),vmulq_n_s16(cr,qgr))),db=vmulq_n_s16(cb,qb);
-    const int16x8_t drl=vzip1q_s16(dr,dr),drh=vzip2q_s16(dr,dr),dgl=vzip1q_s16(dg,dg),dgh=vzip2q_s16(dg,dg),dbl=vzip1q_s16(db,db),dbh=vzip2q_s16(db,db);
-    const int16x8_t ll=vaddq_s16(vmulq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(yv))),vy0),qy),vround);
-    const int16x8_t lh=vaddq_s16(vmulq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(yv))),vy0),qy),vround);
-    uint8x16x4_t px;
-    px.val[0]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,drl),6),vqshrun_n_s16(vqaddq_s16(lh,drh),6));
-    px.val[1]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,dgl),6),vqshrun_n_s16(vqaddq_s16(lh,dgh),6));
-    px.val[2]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,dbl),6),vqshrun_n_s16(vqaddq_s16(lh,dbh),6));
-    px.val[3]=alpha;
-    vst4q_u8((uint8_t *)(o+x),px);
-   }
-  }
-#endif
-  for(;x<w;x+=2) {
-   const int32_t cb=(int32_t)cl[x]-128,cr=(int32_t)cl[x+1]-128;
-   const int32_t dr=kr*cr,dg=-kgb*cb-kgr*cr,db=kb*cb;
-   for(size_t i=x;i<x+2 && i<w;i++) {
-    const int32_t l=((int32_t)yl[i]-y0)*ky+32768;
-    int32_t r=(l+dr)>>16,g=(l+dg)>>16,b=(l+db)>>16;
-    r=r<0?0:r>255?255:r;g=g<0?0:g>255?255:g;b=b<0?0:b>255?255:b;
-    o[i]=0xff000000u|((uint32_t)b<<16)|((uint32_t)g<<8)|(uint32_t)r;
-   }
-  }
- }
- sys_dcache_flush(out,(size_t)(row*h));   // the GPU does not snoop: the picture in memory before any command buffer reads it
- return true;
-}
-// A buffer of `row` x `h` bytes and an RGBA8 linear texture over it (64-byte rows: Turnip aliases it, no copy).
-static NBTexture *copyTexture(MTLPixelFormat format,size_t w,size_t h,uint64_t row) {
- const size_t page=(size_t)getpagesize(),length=((size_t)(row*h)+page-1)&~(page-1);
- NmbBuffer *handle=nmb_buffer_new(gDevice,length,MTLResourceStorageModeShared,nullptr);
- if(!handle){NBLOG(@"native-metal: YCbCr copy buffer %zux%zu refused: %@",w,h,lastError());return nil;}
- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
- MTLTextureDescriptor *rgba=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
- rgba.usage=MTLTextureUsageShaderRead;rgba.storageMode=MTLStorageModeShared;
- return textureOnBuffer(buffer,rgba,0,(NSUInteger)row,false);
-}
-static std::atomic<uint64_t> gYCbCrFills,gYCbCrSkips,gYCbCrFillUs,gYCbCrFillMaxUs;
-// A picture into `turn`, timed; every 300th fill a J line in the log (/dev/console, so the klog has it).
-static bool ycbcrFillTurn(NBTexture *turn,IOSurfaceRef surface,size_t w,size_t h,bool bt709) {
- const uint64_t began=nowUs();
- if(!ycbcrFill(turn.buffer,turn.rowBytes,surface,w,h,bt709))return false;
- const uint64_t took=nowUs()-began;gYCbCrFillUs+=took;
- uint64_t seen=gYCbCrFillMaxUs.load();while(took>seen && !gYCbCrFillMaxUs.compare_exchange_weak(seen,took)){}
- const uint64_t n=++gYCbCrFills;
- if(n<=2 || n%300==0)sm2_logs([NSString stringWithFormat:@"native-metal: J ycbcr cpu fills=%llu skips=%llu fill mean %llu us max %llu us",
-     (unsigned long long)n,(unsigned long long)gYCbCrSkips.load(),(unsigned long long)(gYCbCrFillUs.load()/n),
-     (unsigned long long)gYCbCrFillMaxUs.load()].UTF8String);
- return true;
-}
-static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
- if(IOSurfaceGetPlaneCount(surface)!=2)return nil;
- const size_t w=d.width,h=d.height;
- if(!w || !h || IOSurfaceGetWidthOfPlane(surface,0)<w || IOSurfaceGetHeightOfPlane(surface,0)<h ||
-    IOSurfaceGetWidthOfPlane(surface,1)*2<w || IOSurfaceGetHeightOfPlane(surface,1)*2<h)return nil;
- const uint64_t row=((uint64_t)w*4+63)&~63ull;
- NBTexture *turn=copyTexture(d.pixelFormat==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm,w,h,row);
- if(!turn)return nil;
- const uint32_t seed=IOSurfaceGetSeed(surface);
- const bool bt709=surfaceMatrix(surface)==2;
- if(!ycbcrFillTurn(turn,surface,w,h,bt709))return nil;
- NBTexture *texture=[NBTexture new];
- texture.handle=turn.handle;texture.borrowedHandle=true;texture.descriptor=turn.descriptor;texture.buffer=turn.buffer;
- texture.rowBytes=turn.rowBytes;texture.turns=[NSMutableArray arrayWithObject:turn];
- texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surfaceSeed=seed;texture.ycbcrSource=(IOSurfaceRef)CFRetain(surface);
- texture.ycbcr709=bt709;
- return texture;
-}
-// Whether a committed command buffer that has not completed uses `buffer` (an unknown answer counts as yes).
-static bool bufferInFlight(NBBuffer *buffer) {
- NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
- for(NBCommandBuffer *commandBuffer in pending)
-  if(nmb_command_buffer_uses_buffer(commandBuffer.handle,buffer.handle)!=0)return true;
- return false;
-}
-// At each use of a YCbCr texture (a draw's or a blit's): the GPU texture is told its surface's seed (converted again only when it
-// moved). The CPU copy (r19a + 5a0c8ed: refilled at the binds of CA's encode thread, 17-21 ms each, and a fresher picture for the
-// later draws of the same frame: "draws in chunks", the UI flickering):
-// - its picture changes only at the first use in a command buffer: every draw of that command buffer samples the same picture;
-// - there it takes the newest completed fill (never waits), and when the surface's seed moved on past it a fill is started on the
-//   worker queue into a turn neither bound nor holding that newest fill nor used by a committed command buffer (up to 3 turns;
-//   none free: started at a later use, counted as a skip);
-// - the first picture is filled at creation, synchronously (a surface drawn once, Photos' and the thumbnails', has it).
-static dispatch_queue_t ycbcrWorker() {
- static dispatch_queue_t queue;static dispatch_once_t once;
- dispatch_once(&once,^{queue=dispatch_queue_create("org.iosonpixel.sweetmetal2.ycbcr",
-                     dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INITIATED,0));});
- return queue;
-}
-static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
- if(texture.ycbcrGPU) {
-  if(texture.surface)nmb_texture_set_converted_generation(texture.handle,(uint64_t)IOSurfaceGetSeed(texture.surface)+1);
-  return;
- }
- if(!texture.reportedFormat || !texture.ycbcrSource)return;
- @synchronized(texture) {
-  const void *cb=(__bridge const void *)commandBuffer;
-  if(cb && texture.lastCommandBuffer==cb)return;   // this command buffer already chose its picture
-  const bool firstUse=!texture.lastCommandBuffer;
-  texture.lastCommandBuffer=cb;
-  // The first use of a copy whose surface was written after it was made (a picture decoded into a surface CA already made the
-  // texture for, drawn once: thumbnails, Photos) is filled here, synchronously, into the bound turn (nothing has sampled it yet).
-  if(firstUse && !texture.filling && IOSurfaceGetSeed(texture.ycbcrSource)!=texture.surfaceSeed) {
-   const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
-   for(NBTexture *turn in texture.turns)if(turn.handle==texture.handle) {
-    if(ycbcrFillTurn(turn,texture.ycbcrSource,texture.descriptor.width,texture.descriptor.height,texture.ycbcr709))texture.surfaceSeed=seed;
-    break;
-   }
-  }
-  if(NBTexture *ready=texture.readyTurn) {
-   texture.previousHandle=texture.handle;
-   texture.handle=ready.handle;texture.buffer=ready.buffer;texture.surfaceSeed=texture.readySeed;texture.readyTurn=nil;
-  }
-  const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
-  if(texture.filling || seed==texture.surfaceSeed)return;
-  const NmbTextureDescriptor current=texture.descriptor;
-  NBTexture *next=nil;
-  for(NBTexture *turn in texture.turns)
-   if(turn.handle!=texture.handle && turn.handle!=texture.previousHandle && !bufferInFlight(turn.buffer)){next=turn;break;}
-  if(!next && texture.turns.count<3) {
-   next=copyTexture((MTLPixelFormat)current.format,current.width,current.height,texture.rowBytes);
-   if(next)[texture.turns addObject:next];
-  }
-  if(!next){gYCbCrSkips++;return;}
-  texture.filling=true;texture.fillSeed=seed;
-  IOSurfaceRef surface=(IOSurfaceRef)CFRetain(texture.ycbcrSource);
-  const bool bt709=texture.ycbcr709;const size_t w=current.width,h=current.height;
-  dispatch_async(ycbcrWorker(),^{
-   const bool ok=ycbcrFillTurn(next,surface,w,h,bt709);
-   CFRelease(surface);
-   @synchronized(texture) {
-    texture.filling=false;
-    if(ok){texture.readyTurn=next;texture.readySeed=texture.fillSeed;}
-   }
-  });
- }
-}
-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {ENC_SCOPE(EC_TEX,"newTexture(iosurface)");if(surface && d && encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"surface %u %zux%zu fmt %lu plane %lu",IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.pixelFormat,(unsigned long)plane);
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d)return nil;
- const size_t planes=IOSurfaceGetPlaneCount(surface);
- if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
- if((d.pixelFormat==500 || d.pixelFormat==501) && plane==0) {
-  const NSUInteger lumaAt=(NSUInteger)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,0)-(uintptr_t)IOSurfaceGetBaseAddress(surface));
-  static std::atomic<unsigned> asked{0};
-  const unsigned askedNow=++asked;
-  if(askedNow<=3)sm2_logs([NSString stringWithFormat:@"native-metal: YCbCr texture %lu asked (#%u, %s): surface id %u %zux%zu, rows %zu/%zu",
-      (unsigned long)d.pixelFormat,askedNow,ycbcrOnGPU()?"gpu":"cpu copy",IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),
-      IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRowOfPlane(surface,0),IOSurfaceGetBytesPerRowOfPlane(surface,1)].UTF8String);
-  if(ycbcrOnGPU()) {
-   std::string why;uint64_t lumaRow=0;
-   if(NBTexture *texture=ycbcrSurfaceTexture(surface,d,why,&lumaRow)){
-    noteSurfaceTexture(surface,d,plane,planes,lumaAt,(NSUInteger)lumaRow,"made (YCbCr on the GPU)");return (id<MTLTexture>)texture;}
-   noteSurfaceTexture(surface,d,plane,planes,lumaAt,(NSUInteger)lumaRow,("YCbCr on the GPU refused, CPU copy instead: "+why).c_str());
+ if(IOSurfaceGetPlaneCount(surface)){
+  const OSType fourcc=IOSurfaceGetPixelFormat(surface);const NSUInteger f=d.pixelFormat;
+  NSString *gpuWhy=planarOn()?@"SWEET_YCBCR_GPU off":@"M2V_PLANAR=0";
+  if(planarOn() && ycbcrGpuOn()){   // 0127: the GPU path first
+   NBTexture *texture=planeTexture(d,surface,plane,&gpuWhy);
+   if(texture){ycbcrNote(surface,d,plane,0,gpuWhy);return (id<MTLTexture>)texture;}
+   gpuWhy=[@"gpu: " stringByAppendingString:gpuWhy?:@"?"];
   }
-  NBTexture *copy=ycbcrCopy(surface,d);
-  noteSurfaceTexture(surface,d,plane,planes,lumaAt,IOSurfaceGetBytesPerRowOfPlane(surface,0),copy?"made (YCbCr copy)":"refused (YCbCr copy)");
-  return (id<MTLTexture>)copy;
+  const bool yuv=(f==500 || f==501) && (fourcc=='420v' || fourcc=='420f'),xr=(f==550 || f==551);
+  if(!planarOn() || plane || (!yuv && !xr) || IOSurfaceGetPlaneCount(surface)<2 || d.textureType!=MTLTextureType2D){ycbcrNote(surface,d,plane,2,gpuWhy);return nil;}
+  if(b44On())b44Desc("iosurfacePlanar",d,IOSurfaceGetBytesPerRowOfPlane(surface,0),[NSString stringWithFormat:@"surface %c%c%c%c %zux%zu planes %zu",
+   (char)(fourcc>>24),(char)(fourcc>>16),(char)(fourcc>>8),(char)fourcc,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetPlaneCount(surface)]);
+  MTLTextureDescriptor *own=[d copy];
+  own.pixelFormat=yuv?(f==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm):(f==551?MTLPixelFormatBGRA8Unorm_sRGB:MTLPixelFormatBGRA8Unorm);
+  own.storageMode=MTLStorageModeShared;own.usage=MTLTextureUsageShaderRead;own.mipmapLevelCount=1;
+  NBTexture *texture=nil;
+  if(planarDirectOn()){   // 0130
+   NSString *why=nil;texture=planarDirectTexture((id<MTLDevice>)self,own,&why);
+   planarDirectNote(texture?[NSString stringWithFormat:@"direct into the texture (rowBytes %lu)",(unsigned long)texture.rowBytes]:
+    [NSString stringWithFormat:@"through replaceRegion (direct: %@)",why]);
+  } else planarDirectNote(@"through replaceRegion (SWEET_PLANAR_DIRECT=0)");
+  if(!texture)texture=(NBTexture *)[(id<MTLDevice>)self newTextureWithDescriptor:own];
+  if(!texture){ycbcrNote(surface,d,plane,2,gpuWhy);return nil;}
+  texture.planarSurface=(IOSurfaceRef)CFRetain(surface);texture.planarSeed=IOSurfaceGetSeed(surface)-1;planarFill(texture);
+  ycbcrNote(surface,d,plane,1,gpuWhy);return (id<MTLTexture>)texture;
  }
+ if(plane)return nil;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)) {
-  noteSurfaceTexture(surface,d,plane,planes,(NSUInteger)((uintptr_t)base&(page-1)),allocation,"refused (base or size)");return nil;
- }
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);
- const NSUInteger offset=planes?(NSUInteger)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane)-(uintptr_t)base):0;
- const NSUInteger row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
- if(planes && (!row || offset>=bytes)){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (plane geometry)");return nil;}
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
- if(!buffer){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (import)");return nil;}
- // SweetMetal2: Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1/3 (SPI -[MTLTextureDescriptor rotation],
- // framebufferOnly) over the panel's portrait 1125x2436 surface. NmbTextureDescriptor carries neither, so the runtime checked a 2436-texel
- // row against the surface's 4608 bytes and refused it (RowPitch) every frame: rotating to landscape froze the screen (r61b 2026-10-29).
- const uint64_t rotation=descriptorRotation(d);
- NBTexture *texture=nil;
- if(rotation) {
-  // SweetMetal2 (rotfb3): a rotated texture is a shadow image plus a tight buffer, a staging buffer and the rotation kernel's sets
-  // (metal2vulkan rotated.rs): ~2 x the surface's bytes of GPU pool and ~20 small allocations each. r62b: Core Animation asked for
-  // them again and again in landscape and backboardd's pool grew 194 -> 451 MB in 30 s (live <256K 2654 -> 4453) until it crashed.
-  // The last few are kept and handed out again for the same surface memory, rotation and descriptor.
-  struct RotKey {uint64_t id,base,bytes,offset,row,rotation,fbo,type,format,width,height,usage,options;};
-  const RotKey key={(uint64_t)IOSurfaceGetID(surface),(uint64_t)(uintptr_t)base,(uint64_t)bytes,(uint64_t)offset,(uint64_t)row,rotation,
-                    descriptorFramebufferOnly(d)?1u:0u,(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),(uint64_t)d.width,
-                    (uint64_t)d.height,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
-  static std::mutex rotLock;static std::vector<std::pair<RotKey,NBTexture *>> rotCache;static uint64_t rotMade,rotHits;
-  {
-   std::lock_guard<std::mutex> l(rotLock);
-   for(size_t i=0;i<rotCache.size();i++) if(!memcmp(&rotCache[i].first,&key,sizeof key)) {
-    NBTexture *hit=rotCache[i].second;auto entry=rotCache[i];rotCache.erase(rotCache.begin()+(long)i);rotCache.insert(rotCache.begin(),entry);
-    if(++rotHits==1 || rotHits%500==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface textures: %llu made, %llu reused",
-                                                (unsigned long long)rotMade,(unsigned long long)rotHits].UTF8String);
-    return (id<MTLTexture>)hit;
-   }
-  }
-  NmbTextureDescriptor descriptor;
-  if(textureDescriptor(d,&descriptor)) {
-   const NmbTextureExtras extras={rotation,descriptorFramebufferOnly(d)?1u:0u};
-   NmbTexture *handle=nmb_texture_new_on_surface_rotated(buffer.handle,&descriptor,offset,row,planes!=0,&extras);
-   if(!handle)NBLOG(@"native-metal: rotated surface texture refused (rotation %llu, %lux%lu): %@",(unsigned long long)rotation,
-                    (unsigned long)d.width,(unsigned long)d.height,lastError());
-   else {
-    texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
-    texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;
-    NmbTextureExtras made={0,0};nmb_texture_extras(handle,&made);texture.rotationValue=made.rotation;texture.framebufferOnlyValue=made.framebuffer_only!=0;
-    texture.plane=plane;[texture holdSurface:surface];
-    std::lock_guard<std::mutex> l(rotLock);
-    rotCache.insert(rotCache.begin(),{key,texture});
-    if(rotCache.size()>3)rotCache.pop_back();      // CA's landscape chain is 2-3 surfaces; the oldest goes when its last user lets it go
-    if(++rotMade<=24 || rotMade%200==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface texture #%llu (rotation %llu): surface %zux%zu id %u, texture %lux%lu fmt %lu usage %#lx (%llu reused so far)",
-      (unsigned long long)rotMade,(unsigned long long)rotation,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetID(surface),
-      (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long long)rotHits].UTF8String);
-   }
-  }
-  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?(rotation==1?"made (rotation 1)":rotation==2?"made (rotation 2)":rotation==3?"made (rotation 3)":"made (rotation 4)")
-                                                             :"refused (rotated texture over the surface)");
- } else {
-  texture=textureOnBuffer(buffer,d,offset,row,true);
-  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
- }
- if(!texture)return nil;
- texture.plane=plane;[texture holdSurface:surface];return (id<MTLTexture>)texture;
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
+ const OSType fourcc=IOSurfaceGetPixelFormat(surface);
+ if(sweetTexelBytes(d.pixelFormat)==1 || IOSurfaceGetBytesPerElement(surface)==1)
+  B29LOG(@"B29 iosurface %lux%lu fmt %lu surface %c%c%c%c %zux%zu bpe %zu bpr %zu plane %lu pitch %zu",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,
+   (char)(fourcc>>24),(char)(fourcc>>16),(char)(fourcc>>8),(char)fourcc,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerElement(surface),
+   IOSurfaceGetBytesPerRow(surface),(unsigned long)plane,IOSurfaceGetBytesPerRow(surface));
+ if(b44On())b44Desc("iosurface",d,IOSurfaceGetBytesPerRow(surface),[NSString stringWithFormat:@"surface %c%c%c%c %zux%zu bpe %zu plane %lu alloc %zu",
+  (char)(fourcc>>24),(char)(fourcc>>16),(char)(fourcc>>8),(char)fourcc,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerElement(surface),(unsigned long)plane,allocation]);
+ NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
+ texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
-- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newLibrary(data)");
+- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  const uint64_t libraryBegan=nowUs();
- NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
+ NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.prewarmDigest=prewarmLibrary(bytes,size);(void)mapped;
- if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
 }
-- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newLibrary(file)");
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.prewarmDigest=prewarmLibrary(bytes.bytes,bytes.length);
- if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -3847,13 +2604,60 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
 }
 - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
+// B55: Apple's source compile, re-loaded as this device's library (srcLibOn above). Installed only when on and the base class has it.
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+ static std::atomic<uint64_t> calls;const uint64_t n=++calls,began=nowUs();
+ const unsigned long sourceBytes=(unsigned long)[source lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+ NSError *appleError=nil;id apple=(__bridge_transfer id)gAppleSourceLibrary(self,_cmd,source,options,&appleError);
+ const uint64_t compiled=nowUs();unsigned long metallibBytes=0;
+ auto keepApple=[&](NSString *why)->id<MTLLibrary> {
+  srcLibLog(n,[NSString stringWithFormat:@"lib %lu bytes source -> %lu bytes metallib -> NBLibrary fail (%@; %s returned) compile %llu us",sourceBytes,metallibBytes,why,
+   apple?object_getClassName(apple):"nil",(unsigned long long)(compiled-began)],true);
+  if(error)*error=appleError;return (id<MTLLibrary>)apple;
+ };
+ if(!apple)return keepApple([NSString stringWithFormat:@"compile: %@",appleError.localizedDescription?:@"no library, no error"]);
+ if(![apple respondsToSelector:@selector(serializeToURL:error:)])return keepApple(@"no serializeToURL:error:");
+ NSURL *url=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"sweet-src-%d-%llu.metallib",getpid(),(unsigned long long)n]]];
+ NSError *why=nil;
+ if(![(id<NBSerializableLibrary>)apple serializeToURL:url error:&why])return keepApple([NSString stringWithFormat:@"serialize: %@",why.localizedDescription?:@"?"]);
+ NSData *bytes=[NSData dataWithContentsOfURL:url options:0 error:&why];unlink(url.fileSystemRepresentation);
+ if(!bytes.length)return keepApple([NSString stringWithFormat:@"read back: %@",why.localizedDescription?:@"empty"]);
+ metallibBytes=(unsigned long)bytes.length;
+ const uint64_t libraryBegan=nowUs();
+ NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+ if(!handle)return keepApple([NSString stringWithFormat:@"load: %@",lastError()]);
+ NBLibrary *library=[NBLibrary new];library.handle=handle;
+ srcLibLog(n,[NSString stringWithFormat:@"lib %lu bytes source -> %lu bytes metallib -> NBLibrary ok (%u functions) compile %llu us load %llu us",sourceBytes,metallibBytes,
+  nmb_library_function_count(handle),(unsigned long long)(compiled-began),(unsigned long long)(nowUs()-libraryBegan)],false);
+ if(error)*error=nil;return (id<MTLLibrary>)library;
+}
+// Answered synchronously, as this file's other async forms (ANGLE uses only the form above).
+- (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(void (^)(id<MTLLibrary>,NSError *))handler {
+ NSError *error=nil;id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];handler(library,error);
+}
+// Function stitching (CoreImage's Metal DAG: CI::VisibleFunctionStitchingDescriptor::compile -> newLibraryWithDescriptorSPI:) runs
+// _MTLDevice's newLibraryWithStitchedDescriptor:destinationBinaryArchive:error:, which asks each function for -libraryData, a C++
+// MTLLibraryData*, and calls through its vtable: with our NBFunction that is nil -> SIGSEGV in Maps (g7a, research/notes/maps-libdata-
+// 2026-11-03.md). Stitching is refused with an error instead; CoreImage then logs "Metal library creation failed" and uses its
+// non-stitched path. SWEET_STITCH=1 leaves the base class's methods in place (the crash comes back).
+static bool stitchBaseOn(void) {static const bool on=[]{const char *p=getenv("SWEET_STITCH");return p&&atoi(p)!=0;}();return on;}
+static NSError *stitchRefused(void) {
+ static std::atomic<bool> said{false};
+ if(!said.exchange(true))NBLOG(@"SWEET MTL: function stitching refused (CoreImage falls back to unstitched kernels)");
+ return [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:1 userInfo:@{NSLocalizedDescriptionKey:@"SweetMetal2: function stitching is not supported"}];
+}
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(id)d error:(NSError **)error {(void)d;if(error)*error=stitchRefused();else stitchRefused();return nil;}
+- (void)newLibraryWithStitchedDescriptor:(id)d completionHandler:(void (^)(id<MTLLibrary>,NSError *))handler {(void)d;handler(nil,stitchRefused());}
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(id)d destinationBinaryArchive:(id)a error:(NSError **)error {(void)d;(void)a;if(error)*error=stitchRefused();else stitchRefused();return nil;}
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptorSPI:(id)d error:(NSError **)error {(void)d;if(error)*error=stitchRefused();else stitchRefused();return nil;}
+- (id<MTLLibrary>)newLibraryWithDescriptorSPI:(id)d error:(NSError **)error {(void)d;if(error)*error=stitchRefused();else stitchRefused();return nil;}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
-                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newComputePipelineState");
+                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
+ if(![(id)function isKindOfClass:[NBFunction class]]){noteForeignFunction("compute function",(id)function);if(error)*error=nbError(@"foreign function");return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
@@ -3861,7 +2665,7 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
-                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newComputePipelineState(descriptor)");
+                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
  NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
  std::vector<NmbBinaryArchive *> archives;
@@ -3873,54 +2677,90 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
+// 0111 (B24): the async pipeline forms, answered synchronously.
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(void (^)(id<MTLRenderPipelineState>,NSError *))handler {
+ NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];handler(state,error);
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(void (^)(id<MTLComputePipelineState>,NSError *))handler {
+ NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];handler(state,error);
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
  return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
-                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newRenderPipelineState");if(encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"%s + %s fmt %lu",d.vertexFunction.name.UTF8String?:"-",d.fragmentFunction.name.UTF8String?:"-",(unsigned long)d.colorAttachments[0].pixelFormat);
+                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
  auto *p=new NmbRenderPipelineDescriptor();
- if(!renderDescriptor(d,p,error)){delete p;notePipeline(d,"a function of another device");return nil;}
+ if(!renderDescriptor(d,p,error)){delete p;return nil;}
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- // u-e (r34): what the caches did for this creation, for its "E slow" line
- NmbShaderCacheStats cacheBefore={};uint64_t workBefore[10]={};
- const bool counted=encStatOn() && nmb_device_shader_cache_stats(gDevice,&cacheBefore) && nmb_device_work_stats(gDevice,workBefore);
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
- if(handle) {
-  NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
-  NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
-  if(vf)prewarmRecord(vf.prewarmKey,d.fragmentFunction?(ff?ff.prewarmKey:std::string()):std::string("-"),*p,(uint64_t)options);
- }
- delete p;
- NmbShaderCacheStats cacheAfter={};uint64_t workAfter[10]={};
- if(counted && encScope_.slow() && nmb_device_shader_cache_stats(gDevice,&cacheAfter) && nmb_device_work_stats(gDevice,workAfter)) {
-  const size_t at=strlen(tEncDetail);
-  snprintf(tEncDetail+at,sizeof tEncDetail-at," | spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu rejected %llu, VkPipelines %llu %.1f ms%s",
-   (unsigned long long)(cacheAfter.hits-cacheBefore.hits),(unsigned long long)(cacheAfter.misses-cacheBefore.misses),
-   (unsigned long long)(cacheAfter.driver_loads-cacheBefore.driver_loads),(unsigned long long)(cacheAfter.driver_saves-cacheBefore.driver_saves),
-   (unsigned long long)(cacheAfter.driver_unchanged-cacheBefore.driver_unchanged),(unsigned long long)(cacheAfter.rejected-cacheBefore.rejected),
-   (unsigned long long)(workAfter[0]-workBefore[0]),(workAfter[1]-workBefore[1])/1e3,gPrewarmRunning?" (prewarm running)":"");
- }
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
- notePipeline(d,handle?nullptr:nmb_last_error());
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
- snprintf(state->encNames,sizeof state->encNames,"%s + %s",d.vertexFunction.name.UTF8String?:"-",d.fragmentFunction.name.UTF8String?:"-");
- {   // ovd
-  const char *l=d.label.UTF8String?:"-";if(!strncmp(l,"com.apple.coreanimation.",24))l+=24;snprintf(state->dbLabel,sizeof state->dbLabel,"%s",l);
-  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
-  state->dbBlend=a.blendingEnabled;state->dbMask=(uint8_t)a.writeMask;state->dbSrc=(uint8_t)a.sourceRGBBlendFactor;state->dbDst=(uint8_t)a.destinationRGBBlendFactor;
-  state->dbSrcA=(uint8_t)a.sourceAlphaBlendFactor;state->dbDstA=(uint8_t)a.destinationAlphaBlendFactor;
-  state->dbFmt=0;state->dbCFmt=0;
-  for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[i];state->dfMasks[i]=c.pixelFormat==MTLPixelFormatInvalid?0:(uint8_t)c.writeMask;}
-  state->dfSamples=(uint8_t)std::min<NSUInteger>(d.rasterSampleCount,255);state->dfA2C=d.alphaToCoverageEnabled;   // g10
-  if(MTLVertexDescriptor *v=d.vertexDescriptor){MTLVertexAttributeDescriptor *at=v.attributes[0];
-   if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;
-    for(unsigned k=1;k<31;k++){MTLVertexAttributeDescriptor *c=v.attributes[k];
-     if(c.bufferIndex==at.bufferIndex && (c.format==MTLVertexFormatHalf4 || c.format==MTLVertexFormatFloat4 || c.format==MTLVertexFormatUChar4Normalized)){state->dbCFmt=(uint32_t)c.format;state->dbCOff=(uint32_t)c.offset;break;}}}}
+ if(drawLogPath()||cullEnabled()||deadfillMode()||mask0On()) {   // sweet drawlog / sweet cull / sweet deadfill / sweet mask0
+  state.label=d.label;
+  if([(id)d.vertexFunction isKindOfClass:[NBFunction class]])state.vertexName=((NBFunction *)d.vertexFunction).name.UTF8String?:"";
+  if([(id)d.fragmentFunction isKindOfClass:[NBFunction class]])state.fragmentName=((NBFunction *)d.fragmentFunction).name.UTF8String?:"";
+  state.blend=d.colorAttachments[0].blendingEnabled;state.writeMask=d.colorAttachments[0].writeMask;
+  {unsigned m=0;for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat!=MTLPixelFormatInvalid&&!a.blendingEnabled&&a.writeMask==MTLColorWriteMaskAll)m|=1u<<i;}state.opaqueMask=m;
+   unsigned w=0;for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat!=MTLPixelFormatInvalid&&a.writeMask!=MTLColorWriteMaskNone)w|=1u<<i;}state.writtenMask=w;}
+  if(MTLVertexDescriptor *vd=d.vertexDescriptor) {   // sweet cull: the position layout of vertex buffer 1
+   state.vstride=vd.layouts[1].stride;
+   for(unsigned i=0;i<31;i++){MTLVertexAttributeDescriptor *a=vd.attributes[i];if(a.bufferIndex==1&&a.offset==0&&a.format==MTLVertexFormatFloat4)state.vpos0=YES;}
+   MTLVertexAttributeDescriptor *a0=vd.attributes[0];   // sweet deadfill
+   if(a0.format!=MTLVertexFormatInvalid&&a0.bufferIndex<8) {
+    state.dfPosFmt=(unsigned)a0.format;state.dfPosOff=(unsigned)a0.offset;state.dfPosBuf=(unsigned)a0.bufferIndex;state.dfStride=(unsigned)vd.layouts[a0.bufferIndex].stride;
+    for(unsigned k=1;k<31;k++){MTLVertexAttributeDescriptor *c=vd.attributes[k];
+     if(c.bufferIndex==a0.bufferIndex&&(c.format==MTLVertexFormatHalf4||c.format==MTLVertexFormatFloat4||c.format==MTLVertexFormatUChar4Normalized)){state.dfColFmt=(unsigned)c.format;state.dfColOff=(unsigned)c.offset;break;}}
+   }
+  }
+  state.dfSamples=(unsigned)d.rasterSampleCount;state.dfA2C=d.alphaToCoverageEnabled;   // sweet deadfill
+  if(mask0On()&&!state.writtenMask&&d.rasterizationEnabled&&[d.label hasPrefix:@"com.apple.coreanimation."]) {   // sweet mask0: CA's own shaders (cc dl1-3) store nothing
+   const std::string &v=state.vertexName,&f=state.fragmentName;
+   state.m0=(v=="fixed_vert_lph_spc"&&f=="fixed_frag_lph_cph")||(v=="path_blit_vert_lph"&&f=="attachment_clear_frag_lph");
+  }
+  state.daRead=0xff;
+  if(deadattOn()) {   // sweet deadatt: what a draw may read, and may it go
+   unsigned all=0,rd=0;
+   for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;all|=1u<<i;
+    if(a.blendingEnabled||(a.writeMask!=MTLColorWriteMaskAll&&a.writeMask!=MTLColorWriteMaskNone))rd|=1u<<i;}   // blending, a partial mask: conservative
+   const std::string &v=state.vertexName,&f=state.fragmentName;
+   const bool ca=[d.label hasPrefix:@"com.apple.coreanimation.draw."]&&d.rasterizationEnabled&&[(id)d.fragmentFunction isKindOfClass:[NBFunction class]];
+   const bool clr=ca&&v=="path_blit_vert_lph"&&f=="attachment_clear_frag_lph",fix=ca&&v=="fixed_vert_lph_spc"&&f=="fixed_frag_lph_cph";
+   bool mem=false;   // a memoryless input: "M<digit>" in the label (IsrcM1 reads c1), or a memoryless index set
+   if(ca)for(const char *l=d.label.UTF8String+29;*l;l++)if(l[0]=='M'&&l[1]>='0'&&l[1]<='9')mem=true;   // 29: past "com.apple.coreanimation.draw."
+   if(clr||fix){const std::string fc=((NBFunction *)d.fragmentFunction).constantsText;
+    for(const char *k:{"fc_memoryless_index0","fc_memoryless_index1"}){const std::string x=dlConst(fc,k);if(!x.empty()&&x.find_first_not_of('0')!=std::string::npos)mem=true;}
+    const bool nodest=clr||(dfConstIs(fc,"fc_dest_count:49:00")&&dfConstIs(fc,"fc_destination_function:49:00")&&dfConstIs(fc,"fc_blend_function:49:36")&&
+     dfConstIs(fc,"fc_framebuffer_sample:53:00")&&![d.label containsString:@"Bvcm"]&&![d.label containsString:@"Bdso"]);
+    if(nodest&&!mem){state.daRead=rd;state.daKnown=YES;}
+    else state.daRead=all;   // a destination read or memoryless input: not pinned to a target
+   }
+  }
+  if(drawLogPath()) {   // sweet drawlog: blend factors (rgb src:dst:op/alpha src:dst:op) and the destination-read constants (see sweet cull 2 below)
+   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];char t[96];
+   snprintf(t,sizeof t," bf=%lu:%lu:%lu/%lu:%lu:%lu",(unsigned long)a.sourceRGBBlendFactor,(unsigned long)a.destinationRGBBlendFactor,(unsigned long)a.rgbBlendOperation,
+    (unsigned long)a.sourceAlphaBlendFactor,(unsigned long)a.destinationAlphaBlendFactor,(unsigned long)a.alphaBlendOperation);
+   std::string st=t;
+   if([(id)d.fragmentFunction isKindOfClass:[NBFunction class]]) {
+    const std::string fc=((NBFunction *)d.fragmentFunction).constantsText;
+    const std::string dc=dlConst(fc,"fc_dest_count"),df=dlConst(fc,"fc_destination_function"),bfn=dlConst(fc,"fc_blend_function"),fs=dlConst(fc,"fc_framebuffer_sample");
+    if(!dc.empty()||!fs.empty()) {   // fbread: 0 only for the known non-reading combination (sweet cull 2's rtj/rtj2 census), else 1
+     const bool none=dc=="00"&&df=="00"&&bfn=="36"&&fs=="00";
+     st+=" fc=dc"+dc+",df"+df+",bf"+bfn+",fs"+fs+" fbread="+(none?"0":"1");
+    }
+   }
+   state.dlState=st;
+  }
+  // sweet cull 2: journal rtj/rtj2, 254 labels: every label reading the destination (Bvcm, Bdso, Bpld, Tbds, Idst, ...) has a non-zero dest count or another blend function. Anything else, unknown: a reader.
+  if(cull2On()&&[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]&&state.fragmentName=="fixed_frag_lph_cph") {
+   const std::string fc=((NBFunction *)d.fragmentFunction).constantsText;
+   state.dfNoDest=dfConstIs(fc,"fc_dest_count:49:00")&&dfConstIs(fc,"fc_destination_function:49:00")&&dfConstIs(fc,"fc_blend_function:49:36")&&dfConstIs(fc,"fc_framebuffer_sample:53:00")&&
+    d.label&&![d.label containsString:@"Bvcm"]&&![d.label containsString:@"Bdso"];
+  }
  }
  return (id<MTLRenderPipelineState>)state;
 }
@@ -3931,20 +2771,18 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  NBBinaryArchive *archive=[NBBinaryArchive new];archive.handle=handle;if(error)*error=nil;return (id<MTLBinaryArchive>)archive;
 }
 - (NSUInteger)requiredLinearTextureBytesPerRowForDescriptor:(MTLTextureDescriptor *)d {
- // r19a: CA's linear textures (newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:) still came with 16-byte-aligned
- // rows (32/112/224/608/720) after the alignment answers said 64: this is the pitch it asks for.
- const uint64_t row=sweetLinearRow(d.pixelFormat,d.width);
+ const uint64_t row=nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);
  if(!row)NBLOG(@"native-metal: requiredLinearTextureBytesPerRow: %@",lastError());
  return row;
 }
-- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {ENC_SCOPE(EC_PIPE,"newSamplerState");
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {
  NmbSamplerDescriptor s={(uint64_t)d.minFilter,(uint64_t)d.magFilter,(uint64_t)d.mipFilter,(uint64_t)d.sAddressMode,(uint64_t)d.tAddressMode,(uint64_t)d.rAddressMode,
      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: sampler refused: %@",lastError());return nil;}
- NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;
+ NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=s;return (id<MTLSamplerState>)sampler;
 }
-- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {ENC_SCOPE(EC_PIPE,"newDepthStencilState");
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
  auto face=[](MTLStencilDescriptor *s)->NmbStencil {
   return {(uint64_t)s.stencilCompareFunction,(uint64_t)s.stencilFailureOperation,(uint64_t)s.depthFailureOperation,(uint64_t)s.depthStencilPassOperation,s.readMask,s.writeMask};
  };
@@ -3961,56 +2799,117 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
-struct AnswerKey {
- SEL sel;NSUInteger arg;
- bool operator==(const AnswerKey &o) const {return sel==o.sel && arg==o.arg;}
-};
-struct AnswerKeyHash {size_t operator()(const AnswerKey &k) const {return std::hash<uintptr_t>()((uintptr_t)k.sel)*31u ^ std::hash<NSUInteger>()(k.arg);}};
-static os_unfair_lock gArgAnswersLock=OS_UNFAIR_LOCK_INIT;
-static std::unordered_map<AnswerKey,uint64_t,AnswerKeyHash> gArgAnswers;   // u-cpu 0x1: (selector, argument) -> answer (0 = refused)
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
- const bool memo=cpuFast()&CPUFAST_ANSWERS;
- const AnswerKey key{cmd,arg};
- if(memo) {
-  os_unfair_lock_lock(&gArgAnswersLock);
-  const auto found=gArgAnswers.find(key);
-  const bool have=found!=gArgAnswers.end();const uint64_t kept=have?found->second:0;
-  os_unfair_lock_unlock(&gArgAnswersLock);
-  if(have){gCfAnswerHits.fetch_add(1,std::memory_order_relaxed);return kept;}
- }
- gCfAnswerAsks.fetch_add(1,std::memory_order_relaxed);
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
- if(memo) {
-  os_unfair_lock_lock(&gArgAnswersLock);
-  if(gArgAnswers.size()<4096)gArgAnswers.emplace(key,value);
-  os_unfair_lock_unlock(&gArgAnswersLock);
- }
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
-// SweetMetal2 (C4): the row alignment the device asks of linear textures. Metal's (and the runtime's) answer is 16 bytes, but Turnip
-// lays a linear image over memory it did not allocate only at 64-byte pitches (pitchalign 6): Core Animation's small A8/RG8/BGRA layers
-// over its own buffers came with 32-byte pitches (96, 160, 224 ...), each refused as an explicit layout and shadow-copied every frame
-// (r18g: ~100 "TU: warning: sweet: explicit layout refused"). Clients that ask lay their rows out at 64 now. /var/local/mtl2-env
-// SWEET_LINEAR_ALIGN=N sets another power of two (16 = Metal's).
-static uint64_t linearAlignment() {
- static uint64_t align=0;
- if(!align){const char *e=getenv("SWEET_LINEAR_ALIGN");const uint64_t v=e?strtoull(e,nullptr,0):64;align=v && !(v&(v-1))?v:64;}
- return align;
-}
-static uint64_t sweetLinearRow(uint64_t format,uint64_t width) {
- const uint64_t row=nmb_device_linear_bytes_per_row(gDevice,format,width),align=linearAlignment();
- return row?(row+align-1)&~(align-1):0;
-}
-static NSUInteger linearAlignmentAnswer(id,SEL cmd,NSUInteger arg) {
- const uint64_t value=askAnswer(cmd,arg);
- static std::atomic<bool> logged{false};
- if(!logged.exchange(true))sm2_logs([NSString stringWithFormat:@"native-metal: %s%lu asked: %llu",sel_getName(cmd),(unsigned long)arg,
-     (unsigned long long)(value?std::max(value,linearAlignment()):0)].UTF8String);
- return (NSUInteger)(value?std::max(value,linearAlignment()):0);
-}
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
+// 0132 (G10): the base class keeps its limits in one plain structure inside the device object ([device limits] returns its address:
+// self+8 in our Metal.framework, research/re/Metal.s:4565) and its own getters read their fields from it. This device answers most
+// getters itself, but PhotosUICore reads the 2D texture bounds from the structure (ldp at +0x84/+0x88 after [device limits], 6 sites)
+// and saw 0 x 0; the getters the device does not answer (3D/cube/1D sizes, line width...) read 0 from it as well. Ported from UniXNU/AdrenoMetal a38e12a fillBaseLimits
+// (NativeBridgeMetalFrontend.mm, MIT): each field is found by writing a marker into the structure and calling the base class's getter,
+// so no offset of an OS version is assumed. Ours also writes the runtime's alignment answers (*AlignmentBytes), float getters, and,
+// for limits the runtime has no answer for, Turnip's VkPhysicalDeviceLimits on the A618 (kTurnipLimits). SWEET_DEVICE_LIMITS=0: the
+// structure stays empty, as before.
+static bool deviceLimitsOn() {static const bool on=[]{const char *p=getenv("SWEET_DEVICE_LIMITS");return !(p&&*p&&atoi(p)==0);}();return on;}
+// Turnip a6xx gen1 (A615-A619): tu_device.cc tu_get_physical_device_properties_1_0, freedreno_devices.py. Used only where the runtime
+// gives no answer of its own (gAnswers) for the selector.
+static const struct {const char *selector;double value;} kTurnipLimits[]={
+ {"maxTextureWidth1D",16384},{"maxTextureWidth2D",16384},{"maxTextureHeight2D",16384},   // maxImageDimension1D/2D
+ {"maxTextureWidth3D",2048},{"maxTextureHeight3D",2048},{"maxTextureDepth3D",2048},       // maxImageDimension3D
+ {"maxTextureDimensionCube",16384},{"maxTextureLayers",2048},                            // maxImageDimensionCube, maxImageArrayLayers
+ {"maxTextureBufferWidth",1<<27},                                                         // maxTexelBufferElements (max_texel_buffer_range_elements)
+ {"maxComputeThreadgroupMemory",32768},                                                   // maxComputeSharedMemorySize (cs_shared_mem_size)
+ {"maxVertexAttributes",31},                                                              // maxVertexInputAttributes 32, Metal's attribute indices end at 30
+ {"maxInterpolatedComponents",124},                                                       // maxFragmentInputComponents
+ {"maxColorAttachments",8},                                                               // maxColorAttachments (MAX_RTS)
+ {"maxLineWidth",1.0},{"maxPointSize",4092},                                              // lineWidthRange[1] (line_width_max), pointSizeRange[1]
+};
+static void fillBaseLimits(id device) {
+ static bool done=false;if(done || !deviceLimitsOn())return;
+ Class base=objc_getClass("_MTLDevice");
+ SEL limitsSel=sel_registerName("limits");
+ if(!base || !device || ![device isKindOfClass:base] || !class_getInstanceMethod(base,limitsSel)){NBLOG(@"native-metal: base limits: no _MTLDevice limits");return;}
+ uint8_t *limits=((uint8_t *(*)(id,SEL))method_getImplementation(class_getInstanceMethod(base,limitsSel)))(device,limitsSel);
+ const ptrdiff_t at=limits-(uint8_t *)(__bridge void *)device;
+ const ptrdiff_t instance=(ptrdiff_t)class_getInstanceSize(base);
+ if(!limits || at<=0 || at>=instance){NBLOG(@"native-metal: base limits: structure at %td outside the %td-byte object",at,instance);return;}
+ // The structure ends where the next instance variable of the base class begins.
+ ptrdiff_t end=instance;bool found=false;
+ unsigned count=0;Ivar *ivars=class_copyIvarList(base,&count);
+ for(unsigned i=0;i<count;i++) {
+  const ptrdiff_t offset=ivar_getOffset(ivars[i]);
+  if(offset==at)found=true;
+  else if(offset>at && offset<end)end=offset;
+ }
+ free(ivars);
+ if(!found || end-at<8){NBLOG(@"native-metal: base limits: no structure ivar at %td",at);return;}
+ done=true;
+ const size_t size=(size_t)(end-at);
+ // The selectors to write: the runtime's limit and alignment answers (as a38e12a: max*/min*; ours: also *AlignmentBytes), then Turnip's
+ // for the selectors the runtime does not answer. A base getter that does not return the marker reads no field of the structure.
+ std::vector<std::pair<SEL,double>> wanted;
+ for(const auto &answer:gAnswers) {
+  const char *name=sel_getName(answer.first);
+  if(strncmp(name,"max",3) && strncmp(name,"min",3) && !strstr(name,"AlignmentBytes"))continue;
+  Method own=class_getInstanceMethod(object_getClass(device),answer.first);
+  if(!own || method_getTypeEncoding(own)[0]!='Q' || !answer.second)continue;
+  wanted.emplace_back(answer.first,(double)answer.second);
+ }
+ for(const auto &t:kTurnipLimits) {
+  SEL sel=sel_registerName(t.selector);
+  auto it=gAnswers.find(sel);if(it!=gAnswers.end() && it->second)continue;
+  // maxComputeThreadgroupMemory has no private answer; the public maxThreadgroupMemoryLength is the same limit, measured.
+  double value=t.value;
+  if(!strcmp(t.selector,"maxComputeThreadgroupMemory")){auto m=gAnswers.find(sel_registerName("maxThreadgroupMemoryLength"));if(m!=gAnswers.end() && m->second)value=(double)m->second;}
+  wanted.emplace_back(sel,value);
+ }
+ unsigned filled=0,tried=0;
+ for(const auto &want:wanted) {
+  Method original=class_getInstanceMethod(base,want.first);
+  if(!original || method_getNumberOfArguments(original)!=2)continue;
+  const char type=method_getTypeEncoding(original)[0];
+  if(type!='Q' && type!='I' && type!='f')continue;
+  ++tried;
+  IMP imp=method_getImplementation(original);
+  // The getter's answer as raw bits: the low 32 bits of an integer, the bits of a float.
+  auto seen=[&]()->uint64_t {
+   if(type=='f'){const float f=((float (*)(id,SEL))imp)(device,want.first);uint32_t bits;memcpy(&bits,&f,4);return bits;}
+   return type=='I'?((uint32_t (*)(id,SEL))imp)(device,want.first):((uint64_t (*)(id,SEL))imp)(device,want.first);
+  };
+  for(size_t offset=0;offset+4<=size;offset+=4) {
+   uint32_t saved;memcpy(&saved,limits+offset,4);
+   const uint32_t marker=0x5a17c000u|(uint32_t)(offset&0xfff);
+   memcpy(limits+offset,&marker,4);
+   const uint64_t got=seen();
+   memcpy(limits+offset,&saved,4);
+   if(got!=marker)continue;
+   // A 64-bit field also reads the next four bytes.
+   bool wide=false;
+   if(type=='Q' && offset+8<=size) {
+    uint32_t next,one=1;memcpy(&next,limits+offset+4,4);
+    memcpy(limits+offset,&marker,4);memcpy(limits+offset+4,&one,4);
+    wide=(seen()>>32)==1;
+    memcpy(limits+offset,&saved,4);memcpy(limits+offset+4,&next,4);
+   }
+   if(type=='f'){const float f=(float)want.second;memcpy(limits+offset,&f,4);}
+   else if(wide){const uint64_t value=(uint64_t)want.second;memcpy(limits+offset,&value,8);}
+   else {const uint32_t narrow=want.second>UINT32_MAX?UINT32_MAX:(uint32_t)want.second;memcpy(limits+offset,&narrow,4);}
+   ++filled;
+   break;
+  }
+ }
+ // What a reader of the structure sees now, through the base class's own getters.
+ auto baseAnswer=[&](const char *name)->unsigned long {
+  SEL sel=sel_registerName(name);Method m=class_getInstanceMethod(base,sel);
+  return m?(unsigned long)((NSUInteger (*)(id,SEL))method_getImplementation(m))(device,sel):0;
+ };
+ NBLOG(@"native-metal: base limits: %u of %u fields of %zu bytes filled (maxTexture2D %lux%lu)",filled,tried,size,
+  baseAnswer("maxTextureWidth2D"),baseAnswer("maxTextureHeight2D"));
+}
 static void installAnswers(Class cls) {
  uint32_t kind=0;
  for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
@@ -4022,15 +2921,10 @@ static void installAnswers(Class cls) {
    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
    if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
-   // C4: linear and IOSurface texture rows 64-byte aligned (linearAlignment).
-   if(value && (!strcmp(name,"deviceLinearTextureAlignmentBytes") || !strcmp(name,"linearTextureAlignmentBytes") ||
-      !strcmp(name,"iosurfaceTextureAlignmentBytes")))value=std::max(value,linearAlignment());
    gAnswers[sel]=value;
    class_addMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
    break;
-  case NMB_ANSWER_COUNT_ARG:
-   class_addMethod(cls,sel,strcmp(name,"minimumLinearTextureAlignmentForPixelFormat:")?(IMP)countArgAnswer:(IMP)linearAlignmentAnswer,"Q24@0:8Q16");
-   break;
+  case NMB_ANSWER_COUNT_ARG: class_addMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
   case NMB_ANSWER_FLAG_ARG: class_addMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
   }
  }
@@ -4039,11 +2933,10 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
+ nmb_set_device_lost_hook(nbDeviceLostHook); // 0111
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
- prewarmStart(cache);
- nilencInstall();   // G5
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
@@ -4062,7 +2955,15 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!base)base=[NSObject class];
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
  unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
- for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
+ // B55: the source-library pair only when SWEET_SRCLIB is on and the base class compiles source (srcLibOn); else the base class's runs.
+ {Method apple=class_getInstanceMethod(base,@selector(newLibraryWithSource:options:error:));
+  gAppleSourceLibrary=srcLibOn()&&apple?(NBSourceLibraryIMP)method_getImplementation(apple):nullptr;}
+ for(unsigned i=0;i<count;i++) {
+  const SEL sel=method_getName(methods[i]);
+  if(!gAppleSourceLibrary&&(sel==@selector(newLibraryWithSource:options:error:)||sel==@selector(newLibraryWithSource:options:completionHandler:)))continue;
+  if(stitchBaseOn()&&strncmp(sel_getName(sel),"newLibraryWith",14)==0&&(strstr(sel_getName(sel),"Stitched")||strstr(sel_getName(sel),"DescriptorSPI")))continue;
+  class_addMethod(cls,sel,method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
+ }
  free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
@@ -4071,27 +2972,12 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
- // SweetMetal2 (C1): the same for functions ("vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction.", 450
- // NSLog lines a session from backboardd on r18g, one per function of each pipeline Core Animation made) and for the other objects
- // a descriptor or an encoder hands back to Metal's validation: their public protocols. One line says what was adopted, and whether
- // Metal has the private classes a subclassing fix would need (phase 2: if the messages persist, the check is a class test).
- {
-  struct {Class cls;const char *protocol;} adopt[]={{[NBFunction class],"MTLFunction"},{[NBLibrary class],"MTLLibrary"},
-   {[NBRenderPipeline class],"MTLRenderPipelineState"},{[NBComputePipeline class],"MTLComputePipelineState"},
-   {[NBSampler class],"MTLSamplerState"},{[NBDepthStencil class],"MTLDepthStencilState"}};
-  std::string done;
-  for(auto &a:adopt) {
-   Protocol *p=objc_getProtocol(a.protocol);
-   const bool was=p && [a.cls conformsToProtocol:p];
-   if(p && !was)class_addProtocol(a.cls,p);
-   done+=std::string(" ")+class_getName(a.cls)+(p?([a.cls conformsToProtocol:p]?(was?"=":"+"):"!"):"?")+a.protocol;
-  }
-  Class mf=objc_getClass("_MTLFunction");
-  NBLOG(@"native-metal: protocols (+ adopted, = already, ? no such protocol):%s; Metal's _MTLFunction %s (%zu bytes)",done.c_str(),
-        mf?"present":"absent",mf?class_getInstanceSize(mf):(size_t)0);
- }
+ // SweetMetal2: MTLRenderPipelineDescriptor's setVertexFunction:/setFragmentFunction: NSLog "... is not a MTLFunction"
+ // on every pipeline whose function doesn't conform (harmless: the function is stored anyway), so declare the protocols.
+ class_addProtocol([NBFunction class],@protocol(MTLFunction));class_addProtocol([NBLibrary class],@protocol(MTLLibrary));
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
+ fillBaseLimits(gDeviceObject);   // 0132: here as well, in case no registration calls initLimits
  return gDeviceObject;
 }
 
@@ -4202,342 +3088,6 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
  }
  return at;
 }
-// WS-U (bridge patch 0104): the runtime's shadow copies (a texture whose rows Turnip refused as a linear layout is an image of its
-// own the encoders copy into and back; rows not 64-byte multiples now go through the rotation kernel, one blit instead of one per
-// row on the A6xx; SWEET_SHADOW_REPACK=0 restores the old copies). Every 5 s, from a commit, backboardd logs the 5 s deltas:
-// "J copies: N done (B bytes) N skipped, refusals N, repacked N".
-static void noteShadowCopies() {
- static const bool on=!strcmp(getprogname(),"backboardd");
- if(!on)return;
- static std::atomic<uint64_t> nextUs{0};
- const uint64_t t=nowUs();uint64_t due=nextUs.load();
- if(t<due || !nextUs.compare_exchange_strong(due,t+5000000))return;
- uint64_t c[5]={};
- if(!nmb_sweet_shadow_counts(c))return;
- static uint64_t last[5]={};
- if(due)sm2_logs([NSString stringWithFormat:@"native-metal: J copies: %llu done (%llu bytes) %llu skipped, refusals %llu, repacked %llu",
-     (unsigned long long)(c[0]-last[0]),(unsigned long long)(c[1]-last[1]),(unsigned long long)(c[3]-last[3]),(unsigned long long)(c[4]-last[4]),
-     (unsigned long long)(c[2]-last[2])].UTF8String);
- memcpy(last,c,sizeof last);
-}
-// u-t: the frame timeline's 5 s line (see TLRecord). Medians and 95th percentiles in ms over the frames (CA's framebuffer command
-// buffers) completed in the window:
-//   frames N (every p50/p95: commit to commit) | encode (first encoder to commit) | commit->submit (to the scheduler's first
-//   vkQueueSubmit) | submit->gpu-start | gpu (the frame command buffer's GPU start to end) | gpu-done->cpu-notice (GPU end to the
-//   runtime's completion callback; +h: on to its completed handlers) | gpu idle before a frame (since the GPU last ended any work)
-//   and GPU busy % of the window | notice->next (a frame's notice to the next frame's first encoder: about 0 where CA waits for
-//   completion) | cb per frame (aux: other command buffers by content, their GPU p50) | CA's waits (waitUntilCompleted and
-//   waitUntilScheduled: count, ms) | top passes (Turnip: WxH format load/store gmem|sysmem avg ms x count) and Turnip's submit waits.
-// T2: the runtime's submissions in the window (vkQueueSubmit calls, VkCommandBuffers, commits handed off to another thread's pass,
-// internal and staging submissions, queue drains, timeline waits, re-encodes, shadow copies).
-static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
- auto pct=[](std::vector<int64_t> v,double q)->double{
-  if(v.empty())return -1;std::sort(v.begin(),v.end());size_t i=(size_t)(q*(v.size()-1)+0.5);return v[std::min(i,v.size()-1)]/1e6;};
- std::sort(records.begin(),records.end(),[](const TLRecord &a,const TLRecord &b){return a.commit<b.commit;});
- std::vector<int64_t> every,encode,c2s,s2g,gpu,notice,handler,idle,next,auxGpu;
- unsigned frames=0,aux=0,auxPasses=0,auxBlits=0,auxCompute=0,auxEmpty=0,timed=0;
- // the GPU's busy time and the idle before each frame: work in GPU start order
- std::vector<const TLRecord *> byStart;
- for(const TLRecord &r:records)if(r.gStart && r.gEnd>=r.gStart){byStart.push_back(&r);timed++;}
- std::sort(byStart.begin(),byStart.end(),[](const TLRecord *a,const TLRecord *b){return a->gStart<b->gStart;});
- uint64_t busy=0,coveredTo=0,lastEnd=0;
- for(const TLRecord *r:byStart) {
-  if(r->frame && lastEnd)idle.push_back(r->gStart>lastEnd?(int64_t)(r->gStart-lastEnd):0);
-  const uint64_t from=std::max(r->gStart,coveredTo);if(r->gEnd>from)busy+=r->gEnd-from;
-  coveredTo=std::max(coveredTo,r->gEnd);lastEnd=std::max(lastEnd,r->gEnd);
- }
- const TLRecord *previous=nullptr;
- // hitches: the worst 3 frame intervals (commit to commit), split along the earlier frame's life and the gap after it:
- //   prev frame: sub (commit->kernel end: the submission, Turnip's CPU waits included) | q (->GPU start: queued behind earlier
- //   GPU work) | gpu | ntc (GPU end->completion callback) ; gap (its notice->this frame's first encoder: outside Metal: CA
- //   waiting for vsync/swap/its own throttle) ; enc (this frame's first encoder->commit)
- struct Hitch {int64_t every,sub,q,gpu,ntc,gap,enc;};
- std::vector<Hitch> hitches;
- std::vector<uint32_t> surfaces;
- for(const TLRecord &r:records) {
-  if(!r.frame) {
-   aux++;
-   if(r.work.passes)auxPasses++;else if(r.work.blits)auxBlits++;else if(r.work.dispatches)auxCompute++;else auxEmpty++;
-   if(r.gStart && r.gEnd>=r.gStart)auxGpu.push_back((int64_t)(r.gEnd-r.gStart));
-   continue;
-  }
-  frames++;
-  if(r.surface && std::find(surfaces.begin(),surfaces.end(),r.surface)==surfaces.end())surfaces.push_back(r.surface);
-  if(previous) {
-   const TLRecord &p=*previous;
-   auto d=[](uint64_t a,uint64_t b)->int64_t{return a && b?(int64_t)b-(int64_t)a:-1;};
-   hitches.push_back({(int64_t)(r.commit-p.commit),d(p.commit,p.kEnd),d(p.kEnd,p.gStart),d(p.gStart,p.gEnd),d(p.gEnd,p.notice),
-    d(p.notice,r.created),d(r.created,r.commit)});
-   every.push_back((int64_t)(r.commit-previous->commit));
-   if(previous->notice)next.push_back((int64_t)r.created-(int64_t)previous->notice);
-  }
-  previous=&r;
-  encode.push_back((int64_t)r.commit-(int64_t)r.created);
-  if(r.kStart)c2s.push_back((int64_t)r.kStart-(int64_t)r.commit);
-  if(r.gStart && r.gEnd>=r.gStart) {
-   if(r.kStart)s2g.push_back((int64_t)r.gStart-(int64_t)r.kStart);
-   gpu.push_back((int64_t)(r.gEnd-r.gStart));
-   notice.push_back((int64_t)r.notice-(int64_t)r.gEnd);
-  }
-  handler.push_back((int64_t)r.handler-(int64_t)r.notice);
- }
- // CA's own waits in the window (the J rows' totals, as deltas)
- static uint64_t lastWaits[4];
- const uint64_t waits[4]={gTimeWaitCompleted.count.load(),gTimeWaitCompleted.total.load(),gTimeWaitScheduled.count.load(),gTimeWaitScheduled.total.load()};
- char passes[680]="n/a (Turnip has no sweet_tu_pass_report)";   // u-gpudraw: 420 before (the SEQ census)
- if(native_bridge_metal_pass_report)native_bridge_metal_pass_report(passes,sizeof passes,3);
- char line[1700];
- snprintf(line,sizeof line,"native-metal: T 5s: frames %u (every %.1f/%.1f) | encode %.1f/%.1f ms | commit->submit %.2f | submit->gpu-start %.2f"
-  " | gpu %.1f/%.1f ms | gpu-done->cpu-notice %.2f/%.2f ms (+h %.2f) | gpu idle %.1f, busy %.0f%% | notice->next %.1f"
-  " | cb per frame %.2f (aux %u: rp %u bl %u cs %u e %u, gpu %.1f) | waits cpl %llu/%llums sch %llu/%llums | %s",
-  frames,pct(every,.5),pct(every,.95),pct(encode,.5),pct(encode,.95),pct(c2s,.5),pct(s2g,.5),pct(gpu,.5),pct(gpu,.95),
-  pct(notice,.5),pct(notice,.95),pct(handler,.5),pct(idle,.5),spanNs?100.0*busy/spanNs:0,pct(next,.5),
-  frames?(double)records.size()/frames:0,aux,auxPasses,auxBlits,auxCompute,auxEmpty,pct(auxGpu,.5),
-  (unsigned long long)(waits[0]-lastWaits[0]),(unsigned long long)((waits[1]-lastWaits[1])/1000),
-  (unsigned long long)(waits[2]-lastWaits[2]),(unsigned long long)((waits[3]-lastWaits[3])/1000),passes);
- memcpy(lastWaits,waits,sizeof lastWaits);
- sm2_logs(line);
- if(native_bridge_metal_cpu_report) {
-  char cpu[1100];
-  if(native_bridge_metal_cpu_report(cpu,sizeof cpu)) {
-   snprintf(line,sizeof line,"native-metal: T tu-cpu: %s",cpu);
-   sm2_logs(line);
-  }
- }
- fnReport();
- if(native_bridge_metal_draw_report) {   // u-gpudraw: Turnip 0112's draw census (fragment shaders, draw times)
-  char draw[1600];
-  if(native_bridge_metal_draw_report(draw,sizeof draw)) {
-   snprintf(line,sizeof line,"native-metal: T tu-draw: %s",draw);
-   sm2_logs(line);
-  }
- }
- if(native_bridge_metal_perf_report) {   // u-perfctr: Turnip 0113's hardware counters (SWEET_TU_PERFCTR), after tu-draw
-  static char perf[1300];
-  for(unsigned part=0;part<3;part++) {
-   if(!native_bridge_metal_perf_report(perf,sizeof perf,part))continue;
-   char pline[1400];
-   snprintf(pline,sizeof pline,"native-metal: T tu-perf 5s%s: %s",part?" fs":"",perf);
-   sm2_logs(pline);
-  }
- }
- if(native_bridge_metal_ubwc_report) {
-  char ubwc[1100];
-  if(native_bridge_metal_ubwc_report(ubwc,sizeof ubwc)) {
-   snprintf(line,sizeof line,"native-metal: T tu-ubwc: %s",ubwc);
-   sm2_logs(line);
-  }
- }
- {  // u-cpu: SWEET_CPUFAST's savings in the window
-  static uint64_t lastCf[6];
-  const uint64_t cf[6]={gCfAnswerHits.load(),gCfAnswerAsks.load(),gCfViewportSkips.load(),gCfViewportSent.load(),gCfScissorSkips.load(),
-   gCfScissorSent.load()};
-  uint64_t d[6];for(int i=0;i<6;i++)d[i]=cf[i]-lastCf[i];
-  memcpy(lastCf,cf,sizeof lastCf);
-  {   // g9: SWEET_DEADFILL in the window
-   static uint64_t lastDf[6];const uint64_t df[6]={gDfDeferred.load(),gDfDropped.load(),gDfCleared.load(),gDfPx.load(),gDfHeldPasses.load(),gDfNoClear.load()};
-   if(deadfillMode() || memcmp(df,lastDf,sizeof df)) {
-    char dl[240];snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu held_passes %llu no_clear %llu (mode %d)",
-     (unsigned long long)(df[0]-lastDf[0]),(unsigned long long)(df[1]-lastDf[1]),(unsigned long long)(df[2]-lastDf[2]),(unsigned long long)(df[3]-lastDf[3]),
-     (unsigned long long)(df[4]-lastDf[4]),(unsigned long long)(df[5]-lastDf[5]),deadfillMode());
-    sm2_logs(dl);
-   }
-   memcpy(lastDf,df,sizeof df);
-  }
-  snprintf(line,sizeof line,"native-metal: T cpufast 5s: bits 0x%x | answers memo %llu asked %llu | viewport skipped %llu sent %llu | scissor skipped %llu sent %llu",
-   cpuFast(),(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
-   (unsigned long long)d[5]);
-  sm2_logs(line);
- }
- if(encThreadOn()) {   // u-encthread: what was recorded, replayed, and what the callers still waited for, in the window
-  enum {K_DRAW,K_BIND,K_ENC,K_BLIT,K_CB,K_N};
-  static uint64_t lastOps[EO_COUNT],lastRec,lastRep,lastBatches,lastWakes,lastCommits,lastCalls[EF_WHY_COUNT],lastWaits[EF_WHY_COUNT],
-   lastTicks[EF_WHY_COUNT],lastOnWorker;
-  uint64_t kind[K_N]={},all=0;
-  for(int o=0;o<EO_COUNT;o++) {
-   const uint64_t now=gEtOps[o].load(),d=now-lastOps[o];lastOps[o]=now;all+=d;
-   const int k=o==EO_DRAW || o==EO_DRAW_INDEXED?K_DRAW:o<=EO_DISCARD?K_ENC:o>=EO_COPY_BUFFER && o<=EO_MIPMAPS?K_BLIT:o>=EO_EVENT?K_CB:K_BIND;
-   kind[k]+=d;
-  }
-  const double tick=encTickNs()/1e6;
-  const uint64_t rec=gEtRecordTicks.load(),rep=gEtReplayTicks.load(),batches=gEtBatches.load(),wakes=gEtWakes.load(),commits=gEtCommits.load();
-  const double recMs=(rec-lastRec)*tick,repMs=(rep-lastRep)*tick;
-  const uint64_t dCommits=commits-lastCommits;
-  double flushMs=0;
-  char flushes[600]="";size_t at=0;
-  for(int w=0;w<EF_WHY_COUNT;w++) {
-   const uint64_t calls=gEtFlushCalls[w].load(),waits=gEtFlushWaits[w].load(),ticks=gEtFlushTicks[w].load();
-   const uint64_t dc=calls-lastCalls[w],dw=waits-lastWaits[w];const double ms=(ticks-lastTicks[w])*tick;
-   lastCalls[w]=calls;lastWaits[w]=waits;lastTicks[w]=ticks;flushMs+=ms;
-   if(dc && at<sizeof flushes)at+=(size_t)snprintf(flushes+at,sizeof flushes-at," %s %llu/%llu %.1fms",kEncFlushName[w],(unsigned long long)dw,
-    (unsigned long long)dc,ms);
-  }
-  const uint64_t onWorker=gEtFlushOnWorker.load();
-  snprintf(line,sizeof line,"native-metal: T enc-thread 5s: cmds %llu (draw %llu bind %llu enc %llu blit %llu cb %llu) commits %llu | caller record %.1f ms"
-   " (%.2f us/cmd) | worker replay %.1f ms (%.1f us/cmd, %llu batches, max %llu) | caller saved ~%.1f ms (%.2f ms/commit), flush waits %.1f ms"
-   " (net %.2f ms/commit) | depth max %llu, now %llu | wakes %llu | flushes waited/calls:%s%s | on-worker %llu stalls %llu",
-   (unsigned long long)all,(unsigned long long)kind[K_DRAW],(unsigned long long)kind[K_BIND],(unsigned long long)kind[K_ENC],(unsigned long long)kind[K_BLIT],
-   (unsigned long long)kind[K_CB],(unsigned long long)dCommits,recMs,all?recMs*1e3/all:0,repMs,all?repMs*1e3/all:0,
-   (unsigned long long)(batches-lastBatches),(unsigned long long)gEtBatchMax.exchange(0),repMs-recMs,dCommits?(repMs-recMs)/dCommits:0,flushMs,
-   dCommits?(repMs-recMs-flushMs)/dCommits:0,(unsigned long long)gEtDepthMax.exchange(0),(unsigned long long)(gEqAppended.load()-gEqReplayed.load()),
-   (unsigned long long)(wakes-lastWakes),at?flushes:" none",gEqBroken?" | WORKER NOT STARTED (inline)":"",(unsigned long long)(onWorker-lastOnWorker),
-   (unsigned long long)gEtStalls.load());
-  const uint64_t dWakes=wakes-lastWakes;   // g4
-  lastRec=rec;lastRep=rep;lastBatches=batches;lastWakes=wakes;lastCommits=commits;lastOnWorker=onWorker;
-  sm2_logs(line);
-  {   // g4: the submit's lag and the batches (both modes)
-   std::vector<int64_t> lat[4];
-   {std::lock_guard<std::mutex> l(gEtLatLock);for(int i=0;i<4;i++)lat[i].swap(gEtLat[i]);}
-   static uint64_t lastBig,lastCmds,lastB2;
-   const uint64_t big=gEtBatchBig.load(),cmds=gEtBatchCmds.load(),db=batches-lastB2;
-   const double secs=spanNs?spanNs/1e9:5;
-   snprintf(line,sizeof line,"native-metal: T enc-lat 5s: mode %d | commit->submit p50/p95 %.2f/%.2f ms | wake->submit %.2f/%.2f | submit call"
-    " %.2f/%.2f | frame 1st-enc->submit %.2f/%.2f (n %zu/%zu) | batches %.0f/s, %.1f cmds/batch, big-core %.0f%% | wakes %.0f/s",
-    encThreadMode(),pct(lat[0],.5),pct(lat[0],.95),pct(lat[1],.5),pct(lat[1],.95),pct(lat[2],.5),pct(lat[2],.95),pct(lat[3],.5),pct(lat[3],.95),
-    lat[0].size(),lat[3].size(),db/secs,db?(double)(cmds-lastCmds)/db:0,db?100.0*(big-lastBig)/db:0,dWakes/secs);
-   lastBig=big;lastCmds=cmds;lastB2=batches;
-   sm2_logs(line);
-  }
- }
- std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
- {
-  size_t at=(size_t)snprintf(line,sizeof line,"native-metal: T worst 5s: fb surfaces %zu |",surfaces.size());
-  auto ms=[](int64_t ns){return ns<0?-1.0:ns/1e6;};
-  for(size_t i=0;i<3 && i<hitches.size() && at<sizeof line;i++) {
-   const Hitch &h=hitches[i];
-   at+=(size_t)snprintf(line+at,sizeof line-at," %.1fms = prev[sub %.1f q %.1f gpu %.1f ntc %.1f] gap %.1f enc %.1f;",
-    ms(h.every),ms(h.sub),ms(h.q),ms(h.gpu),ms(h.ntc),ms(h.gap),ms(h.enc));
-  }
-  if(!hitches.empty())sm2_logs(line);
- }
- // u-e: T3 (per-frame encode split), T4 (top call sites), T slow frame (frames whose encode passed 50 ms)
- if(encStatOn()) {
-  gEncSlowLogged.store(0);
-  std::vector<int64_t> cat[EC_COUNT],enc,inMetal,outside,cpuT,scopes,mhzBig,mhzLittle,draws,passes;
-  double catTotal[EC_COUNT]={},callTotal[EC_COUNT]={};
-  unsigned valid=0,cpuHist[9]={},vkFrames=0,migrated=0;double vkMs=0;uint64_t vkN=0;
-  struct Slow {double enc;const TLRecord *r;};std::vector<Slow> slow;
-  for(const TLRecord &r:records) {
-   if(!r.frame || !r.enc.valid)continue;
-   valid++;
-   const double e=(r.commit-r.created)/1e6;double in=0;
-   draws.push_back((int64_t)r.work.draws*1000000);passes.push_back((int64_t)(r.work.passes+r.work.blits+r.work.dispatches)*1000000);
-   for(int c=0;c<EC_COUNT;c++){cat[c].push_back((int64_t)(r.enc.ms[c]*1e6));in+=r.enc.ms[c];
-    catTotal[c]+=r.enc.ms[c];callTotal[c]+=r.enc.n[c];}
-   enc.push_back((int64_t)(e*1e6));inMetal.push_back((int64_t)(in*1e6));outside.push_back((int64_t)((e-in)*1e6));
-   cpuT.push_back((int64_t)(r.enc.cpuMs*1e6));scopes.push_back((int64_t)r.enc.scopes*1000000);
-   cpuHist[r.enc.cpu1>=0 && r.enc.cpu1<8?r.enc.cpu1:8]++;
-   if(r.enc.cpu0!=r.enc.cpu1)migrated++;
-   (r.enc.cpu1>=6?mhzBig:mhzLittle).push_back((int64_t)(r.enc.mhz*1e6));
-   if(r.enc.vkN){vkFrames++;vkN+=r.enc.vkN;vkMs+=r.enc.vkMs;}
-   if(e>50)slow.push_back({e,&r});
-  }
-  if(valid) {
-   auto pct=[](std::vector<int64_t> v,double q)->double{
-    if(v.empty())return -1;std::sort(v.begin(),v.end());size_t i=(size_t)(q*(v.size()-1)+0.5);return v[std::min(i,v.size()-1)]/1e6;};
-   char line[1400];
-   size_t at=(size_t)snprintf(line,sizeof line,"native-metal: T3 5s: frames %u | encode %.1f/%.1f = in-metal %.1f/%.1f + unaccounted %.1f/%.1f ms"
-    " | thread cpu %.1f/%.1f ms | draws %.0f/%.0f encoders %.0f/%.0f | cpu",valid,pct(enc,.5),pct(enc,.95),pct(inMetal,.5),pct(inMetal,.95),
-    pct(outside,.5),pct(outside,.95),pct(cpuT,.5),pct(cpuT,.95),pct(draws,.5),pct(draws,.95),pct(passes,.5),pct(passes,.95));
-   for(int c=0;c<9;c++)if(cpuHist[c]){if(c<8)at+=(size_t)snprintf(line+at,sizeof line-at," %d:%u",c,cpuHist[c]);else at+=(size_t)snprintf(line+at,sizeof line-at," ?:%u",cpuHist[c]);}
-   at+=(size_t)snprintf(line+at,sizeof line-at," (moved %u) MHz-eq big %.0f little %.0f | per frame p50/p95 ms, calls, us/call:",migrated,
-    std::max(0.0,pct(mhzBig,.5)),std::max(0.0,pct(mhzLittle,.5)));
-   for(int c=0;c<EC_COUNT && at<sizeof line;c++) {
-    if(callTotal[c]==0)continue;
-    at+=(size_t)snprintf(line+at,sizeof line-at," %s %.2f/%.2f %.0f %.0f;",kEncCatName[c],pct(cat[c],.5),pct(cat[c],.95),callTotal[c]/valid,
-     1000.0*catTotal[c]/callTotal[c]);
-   }
-   if(at<sizeof line)at+=(size_t)snprintf(line+at,sizeof line-at," | VkPipelines %llu in %u frames %.1f ms | scopes %.0f/frame ~%.2f ms",
-    (unsigned long long)vkN,vkFrames,vkMs,pct(scopes,.5),pct(scopes,.5)*encScopeNs()/1e6);
-   NmbShaderCacheStats cs={};
-   static NmbShaderCacheStats lastCs;static bool haveCs;
-   if(at<sizeof line && gDevice && nmb_device_shader_cache_stats(gDevice,&cs)) {
-    if(haveCs)at+=(size_t)snprintf(line+at,sizeof line-at," | cache 5s: spirv hit %llu miss %llu wr %llu (fail %llu) drv hit %llu miss %llu save %llu"
-     " load %llu same %llu rej %llu mism %llu trunc %llu rdfail %llu evict %llu",
-     (unsigned long long)(cs.hits-lastCs.hits),(unsigned long long)(cs.misses-lastCs.misses),(unsigned long long)(cs.writes-lastCs.writes),
-     (unsigned long long)(cs.write_failures-lastCs.write_failures),(unsigned long long)(cs.driver_hits-lastCs.driver_hits),
-     (unsigned long long)(cs.driver_misses-lastCs.driver_misses),(unsigned long long)(cs.driver_saves-lastCs.driver_saves),
-     (unsigned long long)(cs.driver_loads-lastCs.driver_loads),(unsigned long long)(cs.driver_unchanged-lastCs.driver_unchanged),
-     (unsigned long long)(cs.rejected-lastCs.rejected),(unsigned long long)(cs.driver_mismatched-lastCs.driver_mismatched),
-     (unsigned long long)(cs.driver_truncated-lastCs.driver_truncated),(unsigned long long)(cs.read_failures-lastCs.read_failures),
-     (unsigned long long)(cs.evictions-lastCs.evictions));
-    lastCs=cs;haveCs=true;
-   }
-   sm2_logs(line);
-   std::sort(slow.begin(),slow.end(),[](const Slow &a,const Slow &b){return a.enc>b.enc;});
-   for(size_t i=0;i<slow.size() && i<3;i++) {
-    const TLRecord &r=*slow[i].r;
-    at=(size_t)snprintf(line,sizeof line,"native-metal: T slow frame: encode %.1f ms, thread cpu %.1f, cpu %d->%d MHz-eq %.0f, draws %u, VkPipelines %u in %.1f ms |",
-     slow[i].enc,r.enc.cpuMs,r.enc.cpu0,r.enc.cpu1,r.enc.mhz,r.work.draws,r.enc.vkN,r.enc.vkMs);
-    double in=0;
-    for(int c=0;c<EC_COUNT && at<sizeof line;c++){in+=r.enc.ms[c];if(r.enc.n[c])at+=(size_t)snprintf(line+at,sizeof line-at," %s %.1f/%u",kEncCatName[c],r.enc.ms[c],r.enc.n[c]);}
-    if(at<sizeof line)snprintf(line+at,sizeof line-at," | unaccounted %.1f",slow[i].enc-in);
-    sm2_logs(line);
-   }
-  }
-  // T4: the call sites with most time in the window (all threads)
-  struct SiteDelta {const EncSite *s;uint64_t n,ticks,max;};
-  static uint64_t lastN[kEncSites],lastTicks[kEncSites];
-  std::vector<SiteDelta> sites;
-  const unsigned count=std::min<unsigned>(gEncSiteCount.load(),kEncSites);
-  for(unsigned i=0;i<count;i++) {
-   EncSite *s=gEncSites[i].load();if(!s)continue;
-   const uint64_t n=s->n.load(),t=s->ticks.load(),m=s->max.exchange(0);
-   if(n>lastN[i])sites.push_back({s,n-lastN[i],t-lastTicks[i],m});
-   lastN[i]=n;lastTicks[i]=t;
-  }
-  std::sort(sites.begin(),sites.end(),[](const SiteDelta &a,const SiteDelta &b){return a.ticks>b.ticks;});
-  if(!sites.empty()) {
-   char line[1400];
-   const double tick=encTickNs();
-   size_t at=(size_t)snprintf(line,sizeof line,"native-metal: T4 top 5s (ms total, calls, us mean, ms max):");
-   for(size_t i=0;i<sites.size() && i<10 && at<sizeof line;i++)
-    at+=(size_t)snprintf(line+at,sizeof line-at," %s/%s %.1f %llu %.1f %.1f;",kEncCatName[sites[i].s->cat],sites[i].s->name,sites[i].ticks*tick/1e6,
-     (unsigned long long)sites[i].n,sites[i].ticks*tick/1e3/sites[i].n,sites[i].max*tick/1e6);
-   sm2_logs(line);
-  }
- }
- // u-c (r34): T5, the runtime's render encoder steps (bridge patch 0106; /var/local/mtl2-env SWEET_DRAWSTAT=1, off by default):
- // per step of a draw (DRAW = whole draws), of a render endEncoding (END) and renderCommandEncoder (OPEN) in the window: ms total,
- // count, us mean; then counts (#rp render passes made, #fb framebuffers, #set sets allocated, #set-reused sets 0 reused, #held state
- // copies kept for re-recording, #writes descriptor writes).
- if(nmb_sweet_drawstat_on()) {
-  enum {kSteps=64};
-  static uint64_t lastStep[2*kSteps];static bool haveSteps;
-  uint64_t step[2*kSteps]={};
-  const size_t steps=nmb_sweet_drawstat(step,kSteps);
-  if(haveSteps && steps) {
-   char out[1400];size_t at=0;int part=0;
-   auto flush=[&]{if(at)sm2_logs(out);at=0;};
-   for(size_t i=0;i<steps;i++) {
-    const char *name=nmb_sweet_drawstat_name(i);if(!name)break;
-    const uint64_t ns=step[2*i]-lastStep[2*i],n=step[2*i+1]-lastStep[2*i+1];
-    const int want=name[0]=='#'?2:!strncmp(name,"e.",2) || !strcmp(name,"END") || !strcmp(name,"OPEN")?1:0;
-    if(want!=part){flush();part=want;}
-    if(!at)at=(size_t)snprintf(out,sizeof out,"native-metal: T5 %s 5s:",part==0?"draw steps (ms, n, us)":part==1?"end/open steps (ms, n, us)":"counts");
-    if(!n || at>=sizeof out-64)continue;
-    if(part==2)at+=(size_t)snprintf(out+at,sizeof out-at," %s %llu;",name,(unsigned long long)n);
-    else at+=(size_t)snprintf(out+at,sizeof out-at," %s %.1f %llu %.1f;",name,ns/1e6,(unsigned long long)n,ns/1e3/n);
-   }
-   flush();
-  }
-  memcpy(lastStep,step,sizeof lastStep);haveSteps=true;
- }
- // T2: the runtime's submissions (deltas of its WorkCounts)
- static uint64_t lastSched[9];static bool haveSched;
- uint64_t sched[9]={};
- if(gDevice && nmb_device_sched_counts(gDevice,sched)) {
-  uint64_t d[9];for(int i=0;i<9;i++)d[i]=sched[i]-lastSched[i];
-  if(haveSched) {
-   snprintf(line,sizeof line,"native-metal: T2 5s: cbs %zu (gpu-timed %u) | vkQueueSubmit %llu (VkCommandBuffers %llu) handed-off %llu internal %llu"
-    " staging %llu queue-drains %llu timeline-waits %llu reencoded %llu shadow-copies %llu",
-    records.size(),timed,(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],
-    (unsigned long long)d[4],(unsigned long long)d[5],(unsigned long long)d[6],(unsigned long long)d[7],(unsigned long long)d[8]);
-   sm2_logs(line);
-  }
-  memcpy(lastSched,sched,sizeof lastSched);haveSched=true;
- }
-}
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
@@ -4550,6 +3100,21 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
+ {static uint64_t lastUs,lastDrop,lastClear;const uint64_t now=nowUs(),dr=gDfDropped.load(),cl=gDfCleared.load();   // sweet deadfill
+  const double sec=lastUs&&now>lastUs?(now-lastUs)/1e6:0;
+  row("DF mode%d dropped %llu cleared %llu held %llu | /s dropped %.1f cleared %.1f",deadfillMode(),(unsigned long long)dr,(unsigned long long)cl,
+   (unsigned long long)gDfPasses.load(),sec>0?(dr-lastDrop)/sec:0.,sec>0?(cl-lastClear)/sec:0.);
+  lastUs=now;lastDrop=dr;lastClear=cl;}
+ if(cull3On()){static uint64_t lastUs,lastD,lastP;const uint64_t now=nowUs(),cd=gC3Draws.load(),cp=gC3Px.load();   // sweet cull 3
+  const double sec=lastUs&&now>lastUs?(now-lastUs)/1e6:0;
+  static uint64_t lastA;const uint64_t da=gDeadAtt.load();   // sweet deadatt
+  row("DF3 covered %llu %lluMpx deadatt %llu | /s %.1f draws %.2f Mpx deadatt %.1f",(unsigned long long)cd,(unsigned long long)(cp>>20),(unsigned long long)da,
+   sec>0?(cd-lastD)/sec:0.,sec>0?(cp-lastP)/sec/1048576.:0.,sec>0?(da-lastA)/sec:0.);
+  lastUs=now;lastD=cd;lastP=cp;lastA=da;}
+ if(mask0On()){static uint64_t lastUs,lastN;const uint64_t now=nowUs(),k=gM0Skipped.load();   // sweet mask0
+  const double sec=lastUs&&now>lastUs?(now-lastUs)/1e6:0;
+  row("M0 skipped %llu | /s %.1f",(unsigned long long)k,sec>0?(k-lastN)/sec:0.);
+  lastUs=now;lastN=k;}
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
  row("T function n=%llu total=%llums max=%llums",
@@ -4560,16 +3125,14 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
- row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
-  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
+ row("J surface cache mode%d n=%llu bytes=%llu dup=%llu skip=%llu us=%llu max=%llu",surfFlushMode(),(unsigned long long)gTimeSurfaceFlush.count.load(),
+  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),(unsigned long long)gSurfaceFlushSkipped.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
- row("J surface cleans skipped (seed)=%llu invalidates=%llu%s",(unsigned long long)gSurfaceCleanSkips.load(),
-  (unsigned long long)gSurfaceInvalidates.load(),flushAll()?" (SWEET_FLUSH=all)":"");
- row("J ycbcr %s fills=%llu skips=%llu",ycbcrOnGPU()?"gpu":"cpu",(unsigned long long)gYCbCrFills.load(),(unsigned long long)gYCbCrSkips.load());
- {uint64_t c[5]={};if(nmb_sweet_shadow_counts(c))row("J copies: %llu done (%llu bytes) %llu skipped, refusals %llu, repacked %llu",(unsigned long long)c[0],
-   (unsigned long long)c[1],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[2]);}
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
+ {uint64_t cp[3]={};nmb_command_pool_stats(cp); // bridge 0105
+  row("cp made %llu kept %llu capped %llu",(unsigned long long)cp[0],(unsigned long long)cp[1],(unsigned long long)cp[2]);}
+ row("FM supports_family calls=%llu",(unsigned long long)nmb_family_calls()); // bridge 0114
  uint64_t work[10]={};
  if(gDevice && nmb_device_work_stats(gDevice,work)) {
   row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",

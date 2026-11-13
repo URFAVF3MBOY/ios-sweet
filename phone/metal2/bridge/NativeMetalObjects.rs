@@ -9,8 +9,8 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
-    TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureSwizzle,
+    TextureSwizzleChannels, TextureType, TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
@@ -18,10 +18,9 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
-    IoSurfaceYCbCr, SurfaceYCbCrMatrix,
+    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+    MetalLevel, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -104,6 +103,19 @@ fn e<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> String {
 
 fn options(value: u64) -> Result<ResourceOptions, String> {
     ResourceOptions::from_raw(value).map_err(e("resource options"))
+}
+
+// 0111: the frontend's callback for the first lost device (metal2vulkan_runtime::set_device_lost_hook).
+static DEVICE_LOST_CALLBACK: std::sync::OnceLock<extern "C" fn(*const c_char)> = std::sync::OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_set_device_lost_hook(callback: extern "C" fn(*const c_char)) {
+    let _ = DEVICE_LOST_CALLBACK.set(callback);
+    metal2vulkan_runtime::set_device_lost_hook(|text| {
+        if let (Some(callback), Ok(text)) = (DEVICE_LOST_CALLBACK.get(), std::ffi::CString::new(text)) {
+            callback(text.as_ptr());
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -202,8 +214,21 @@ fn log_message(message: &DebugMessage) {
     let _ = writeln!(file, "[{} {}] {:?} {}", std::process::id(), std::env::args().next().unwrap_or_default(), message.severity, key);
 }
 
+// sweet pipestats (SWEET_PIPESTATS=1): the runtime's "PIPESTAT <label> <stage> name=value ..." lines go to /var/local/mtl2.log like sm2_logs's.
+fn log_pipestat(text: &str) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| std::fs::OpenOptions::new().append(true).open("/var/local/mtl2.log").ok().map(std::sync::Mutex::new));
+    let Some(Ok(mut file)) = file.as_ref().map(|f| f.lock()) else { return };
+    let _ = writeln!(file, "MTL2[{} {}]: {}", std::process::id(), std::env::args().next().unwrap_or_default(), text);
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
+    if message.id_name == "sweet-pipestats" {
+        log_pipestat(&message.text);
+        return;
+    }
     if message.id_name == "metal2vulkan-pipeline-creation" {
         let made = millis_after(&message.text, " made in ");
         let us = made.or_else(|| millis_after(&message.text, " failed in ")).map_or(0, |ms| (ms * 1000.0) as u64);
@@ -225,6 +250,23 @@ fn observe_message(message: &DebugMessage) {
     } else {
         OTHER_MESSAGES[0].fetch_add(1, Relaxed);
     }
+}
+
+/// ios-on-pixel bridge 0114: `supports_family` calls in this process so far, whoever asked.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_family_calls() -> u64 {
+    metal2vulkan_runtime::sweet_family_calls()
+}
+
+/// ios-on-pixel bridge 0105: command pools made, spares kept now, spares destroyed by SWEET_CMDPOOL_CAP, into three words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_pool_stats(out: *mut u64) {
+    if out.is_null() {
+        return;
+    }
+    let stats = metal2vulkan_runtime::sweet_command_pool_stats();
+    // SAFETY: the header's three words.
+    unsafe { std::ptr::copy_nonoverlapping(stats.as_ptr(), out, 3) };
 }
 
 /// The sink's counts into the caller's ten words: pipeline makings (count, total us, longest us, waited us, failed), messages (info,
@@ -689,16 +731,6 @@ pub struct NmbTextureDescriptor {
 
 pub struct NmbTexture(Texture);
 
-/// SweetMetal2: a texture descriptor's `rotation` (SPI, 0-4) and `framebufferOnly`, which `NmbTextureDescriptor` does not carry.
-/// Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1 or 3 over the panel's portrait 1125x2436 surface
-/// (4608-byte rows): without its rotation the runtime checks 2436 x 4 = 9744 bytes a row against 4608 and refuses it (RowPitch),
-/// every frame, so backboardd composites nothing while the UI is in landscape.
-#[repr(C)]
-pub struct NmbTextureExtras {
-    pub rotation: u64,
-    pub framebuffer_only: u64,
-}
-
 fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
     let d = get(d)?;
     let mut out = TextureDescriptor::default();
@@ -738,151 +770,76 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
     })
 }
 
-/// The facts of a planar IOSurface a two-plane YCbCr texture reads (SweetMetal2: `NmbSurfaceFacts` in the header). `matrix` is the
-/// surface's YCbCr matrix attachment: 0 none, 1 ITU_R_601_4, 2 ITU_R_709_2, 3 ITU_R_2020, 4 SMPTE_240M_1995, 5 another value.
-#[repr(C)]
-pub struct NmbSurfaceFacts {
-    pub pixel_format: u32,
-    pub matrix: u32,
-    pub plane: u64,
-    pub width: u64,
-    pub height: u64,
-    pub chroma_offset: u64,
-    pub chroma_bytes_per_row: u64,
-}
-
-/// `newTextureWithDescriptor:iosurface:plane:` over a planar surface's buffer with the surface's facts: a two-plane YCbCr texture
-/// (`YCBCR8_420_2P` over a `420f`/`420v` surface's plane 0) is then the runtime's converted texture (`ycbcr.rs`: the GPU converts the planes,
-/// bilinear chroma, the surface's matrix and range), other formats are the plane as `nmb_texture_new_on_buffer` makes it.
+// 0127 (G7): ported from UniXNU/AdrenoMetal 243d63c bridge/NativeMetalObjects.rs:1120-1136 (MIT), plus the surface's YCbCr matrix.
+/// `newTextureWithDescriptor:iosurface:plane:` over a surface with planes: `offset` and `bytes_per_row` are the asked plane's. A
+/// two-plane surface also gives its OSType, the asked plane, its size and plane 1's offset and rows (`chroma_bytes_per_row` 0: a
+/// single-plane read such as a decoder's R8Unorm or RG8Unorm plane, no YCbCr facts), which a two-plane format reads its second plane
+/// from; `matrix` is its kIOSurfaceYCbCrMatrix (0 none, 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, 5 another).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
-                                             bytes_per_row: u64, planar: bool, facts: *const NmbSurfaceFacts) -> *mut NmbTexture {
+                                             bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
+                                             chroma_offset: u64, chroma_bytes_per_row: u64, matrix: u32) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
         let buffer = &get(buffer)?.0;
-        let f = get(facts)?;
-        let mut ycbcr = IoSurfaceYCbCr::new(f.pixel_format, f.plane, [f.width, f.height], f.chroma_offset, f.chroma_bytes_per_row);
-        let matrix = match f.matrix {
-            1 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_601_4")),
-            2 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_709_2")),
-            3 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_2020")),
-            4 => Some(SurfaceYCbCrMatrix::from_attachment("SMPTE_240M_1995")),
-            5 => Some(SurfaceYCbCrMatrix::from_attachment("")),
-            _ => None,
-        };
-        if let Some(matrix) = matrix {
-            ycbcr = ycbcr.with_matrix(matrix);
+        let mut surface = IoSurfacePlane::new(offset, bytes_per_row, true);
+        if chroma_bytes_per_row != 0 {
+            let facts = IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row);
+            surface = surface.with_ycbcr(match matrix {
+                0 => facts,
+                1 => facts.with_matrix(SurfaceYCbCrMatrix::Itu601),
+                2 => facts.with_matrix(SurfaceYCbCrMatrix::Itu709),
+                3 => facts.with_matrix(SurfaceYCbCrMatrix::Itu2020),
+                4 => facts.with_matrix(SurfaceYCbCrMatrix::Smpte240M),
+                _ => facts.with_matrix(SurfaceYCbCrMatrix::Other),
+            });
         }
-        let plane = IoSurfacePlane::new(offset, bytes_per_row, planar).with_ycbcr(ycbcr);
-        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, plane);
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surface);
         Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
     })
 }
 
-/// rotfb4: the runtime's rotated-texture copies since the process began: copies in, copies in skipped (the frame still held the
-/// plane), copies back, bytes moved, kernel dispatches.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_rotated_copy_stats(out: *mut u64) {
-    guard((), || {
-        let out = get_mut(out as *mut [u64; 5])?;
-        *out = metal2vulkan_runtime::rotated_copy_stats();
-        Ok(())
-    })
+// 0128 (G7): the surface's seed for a two-plane YCbCr texture over it, read by the runtime at each use it plans (ycbcr.rs): `seed(context)`
+// is IOSurfaceGetSeed of the surface, `release(context)` runs once the runtime drops it (also when refused). Off: SWEET_YCBCR_SEED=0.
+struct WatchedSeed {
+    seed: unsafe extern "C" fn(*const c_void) -> u32,
+    context: *const c_void,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
+}
+// SAFETY: the context is a retained IOSurfaceRef, whose seed any thread may read.
+unsafe impl Send for WatchedSeed {}
+unsafe impl Sync for WatchedSeed {}
+impl Drop for WatchedSeed {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            // SAFETY: the caller's pair (the header's contract), called once.
+            unsafe { release(self.context) }
+        }
+    }
 }
 
-/// rotfb4: the CPU wrote a rotated texture's plane (its IOSurface's seed moved): every rotated frame is copied in again.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_rotated_planes_written() {
-    metal2vulkan_runtime::rotated_planes_written();
+unsafe extern "C" fn no_seed(_: *const c_void) -> u32 {
+    0
 }
 
-/// `nmb_texture_new_on_buffer` over an IOSurface plane with the descriptor's rotation and framebufferOnly (`NmbTextureExtras`).
+/// 0128: true where the texture converts its planes and now reads its surface's seed through `seed`.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_new_on_surface_rotated(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
-                                                     bytes_per_row: u64, planar: bool, extras: *const NmbTextureExtras) -> *mut NmbTexture {
-    guard(std::ptr::null_mut(), || {
-        let mut descriptor = texture_descriptor(descriptor)?;
-        let x = get(extras)?;
-        descriptor.rotation = x.rotation;
-        descriptor.framebuffer_only = x.framebuffer_only != 0;
-        let buffer = &get(buffer)?.0;
-        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, planar));
-        Ok(boxed(NmbTexture(texture.map_err(e("texture over rotated surface"))?)))
-    })
-}
-
-/// A texture's `rotation` and `framebufferOnly` (`NmbTextureExtras`).
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_extras(texture: *const NmbTexture, out: *mut NmbTextureExtras) {
-    guard((), || {
-        let t = &get(texture)?.0;
-        let out = get_mut(out)?;
-        *out = NmbTextureExtras { rotation: t.rotation(), framebuffer_only: u64::from(t.framebuffer_only()) };
-        Ok(())
-    })
-}
-
-/// SweetMetal2: the generation of a two-plane YCbCr texture's planes (its surface's seed + 1; 0 = unknown): the runtime converts them
-/// again only when it changes (bridge patch 0103). False for any other texture.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTexture, generation: u64) -> bool {
-    guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
-}
-
-/// SweetMetal2: the surface seed + 1 (0 = the bytes changed some other way) a shadowed texture over a surface's bytes is bound at: its
-/// copy in is skipped while its image holds that seed's bytes (bridge patch 0107, env SWEET_SHADOW_SEED=1). False for any other texture
-/// or with the knob off.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_set_bytes_generation(texture: *const NmbTexture, generation: u64) -> bool {
-    guard(false, || Ok(get(texture)?.0.set_bytes_generation(generation)))
-}
-
-/// SweetMetal2: the runtime's shadow copy counts since the process started (bridge patch 0104), into the caller's five words:
-/// copies recorded, their texel bytes, of them repacked through the kernel, YCbCr copies in skipped, linear layouts refused.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
-    if out.is_null() {
+pub extern "C" fn nmb_texture_watch_seed(texture: *mut NmbTexture, seed: Option<unsafe extern "C" fn(*const c_void) -> u32>,
+                                         context: *const c_void, release: Option<unsafe extern "C" fn(*const c_void)>) -> bool {
+    let Some(seed) = seed else {
+        drop(WatchedSeed { seed: no_seed, context, release });
         return false;
-    }
-    let counts = metal2vulkan_runtime::sweet_counts::snapshot();
-    // SAFETY: the caller passes five writable words.
-    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
-    true
-}
-
-/// SweetMetal2: whether the runtime times its render encoders' steps (bridge patch 0106, env `SWEET_DRAWSTAT=1`).
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_sweet_drawstat_on() -> bool {
-    metal2vulkan_runtime::sweet_drawstat::on()
-}
-
-/// SweetMetal2 (u-combo): bridge patch 0111's scratch trim from the next pass on, from the frontend's live knobs
-/// (/var/local/mtl2-live SWEET_M2V_SCRATCH): 0 off, 1 on, negative = the env value (SWEET_M2V_SCRATCH at startup) again.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_sweet_scratch_live(value: i32) {
-    metal2vulkan_runtime::sweet_drawstat::set_scratch_live(value.clamp(-1, 1) as i8);
-}
-
-/// SweetMetal2: the runtime's render encoder step times and counts since the process started (bridge patch 0106), as
-/// (nanoseconds, count) pairs into the caller's `2 * capacity` words: the number of steps written.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_sweet_drawstat(out: *mut u64, capacity: usize) -> usize {
-    if out.is_null() || capacity == 0 {
-        return 0;
-    }
-    // SAFETY: the caller passes `2 * capacity` writable words.
-    let out = unsafe { std::slice::from_raw_parts_mut(out, 2 * capacity) };
-    metal2vulkan_runtime::sweet_drawstat::snapshot(out)
-}
-
-/// SweetMetal2: the name of render encoder step `index` (a static NUL-terminated string), or null past the last.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_sweet_drawstat_name(index: usize) -> *const c_char {
-    static NAMES: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| {
-        metal2vulkan_runtime::sweet_drawstat::NAMES.iter().map(|n| std::ffi::CString::new(*n).unwrap_or_default()).collect()
-    });
-    names.get(index).map_or(std::ptr::null(), |n| n.as_ptr())
+    };
+    let watched = WatchedSeed { seed, context, release };
+    guard(false, || {
+        // SAFETY: the caller's pair, the context live until `release` (the header's contract).
+        // The whole `watched` moves in (not its Copy fields alone), so `release` waits for the closure's drop.
+        let read = move || {
+            let watched = &watched;
+            unsafe { (watched.seed)(watched.context) }
+        };
+        Ok(get(texture)?.0.watch_surface_seed(std::sync::Arc::new(read)))
+    })
 }
 
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
@@ -914,6 +871,33 @@ pub extern "C" fn nmb_texture_new_view(texture: *mut NmbTexture, format: u64, ki
             let ranges = (l[0]..l[0].checked_add(l[1]).ok_or("levels overflow")?, s[0]..s[0].checked_add(s[1]).ok_or("slices overflow")?);
             t.new_texture_view_with_levels_slices(format, raw::<TextureType>(kind, "texture type")?, ranges.0, ranges.1)
         };
+        Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
+    })
+}
+
+// Ported from UniXNU/AdrenoMetal 243d63c bridge/NativeMetalObjects.rs:1067-1071,2912-2928 (MIT).
+// Bit 32 distinguishes an explicit all-zero swizzle from an omitted value; zero is the identity.
+fn swizzle_of(packed: u64) -> Result<TextureSwizzleChannels, String> {
+    if packed == 0 { return Ok(TextureSwizzleChannels::DEFAULT); }
+    let channel = |shift: u32| raw::<TextureSwizzle>((packed >> shift) & 0xff, "texture swizzle");
+    Ok(TextureSwizzleChannels { red: channel(0)?, green: channel(8)?, blue: channel(16)?, alpha: channel(24)? })
+}
+
+/// `newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`: levels and slices are {start, count}, swizzle packed as
+/// `swizzle_of` reads it.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_view_swizzle(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64,
+                                               swizzle: u64) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let t = &get(texture)?.0;
+        if levels.is_null() || slices.is_null() {
+            return Err("null levels or slices".into());
+        }
+        // SAFETY: the header's two words each.
+        let (l, s) = unsafe { (std::slice::from_raw_parts(levels, 2), std::slice::from_raw_parts(slices, 2)) };
+        let ranges = (l[0]..l[0].checked_add(l[1]).ok_or("levels overflow")?, s[0]..s[0].checked_add(s[1]).ok_or("slices overflow")?);
+        let view = t.new_texture_view_with_swizzle(raw::<PixelFormat>(format, "pixel format")?, raw::<TextureType>(kind, "texture type")?,
+                                                   ranges.0, ranges.1, swizzle_of(swizzle)?);
         Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
     })
 }
@@ -1610,51 +1594,23 @@ pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuff
     guard(0, || Ok(get(command_buffer)?.0.error_description().map_or(0, |text| copy_out(&text, out, size))))
 }
 
+/// 0133: the `MTLCommandBufferError` code of a failure the driver relayed or of a GPU restart's victim (bridge 0133), else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_execution_code(command_buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || {
+        Ok(match get(command_buffer)?.0.error() {
+            Some(metal2vulkan_runtime::CommandBufferError::Execution(code)) => code,
+            _ => 0,
+        })
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
     guard(0.0, || {
         let command_buffer = &get(command_buffer)?.0;
         let time = if end { command_buffer.gpu_end_time() } else { command_buffer.gpu_start_time() };
         time.map_err(e("GPU time"))
-    })
-}
-
-/// SweetMetal2 (u-t): the host times at which the scheduler began submitting the command buffer's first batch (`end` false) and
-/// finished submitting its last (Metal's `kernelStartTime`/`kernelEndTime`), in seconds of the runtime's host clock (as the GPU
-/// times). 0 where it was never submitted.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_command_buffer_kernel_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
-    guard(0.0, || {
-        let command_buffer = &get(command_buffer)?.0;
-        Ok(if end { command_buffer.kernel_end_time() } else { command_buffer.kernel_start_time() })
-    })
-}
-
-/// SweetMetal2 (u-t): the runtime's submission counts the frame timeline reports (`WorkCounts`, totals since the device was made), in
-/// this order: vkQueueSubmit calls, VkCommandBuffers submitted, commits handed to another thread's pass, internal submissions,
-/// staging submissions, queue drains (a full wait for the device's queues), timeline waits, encoders re-encoded, shadow copies:
-/// nine words.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_device_sched_counts(device: *const NmbDevice, out: *mut u64) -> bool {
-    guard(false, || {
-        if out.is_null() {
-            return Err("null counts".into());
-        }
-        let c = get(device)?.0.work_counts();
-        let words = [
-            c.queue_submissions,
-            c.command_buffers_submitted,
-            c.commits_handed_off,
-            c.internal_submissions,
-            c.staging_submissions,
-            c.queue_drains,
-            c.timeline_waits,
-            c.encoders_reencoded,
-            c.shadow_copies,
-        ];
-        // SAFETY: the header's nine words.
-        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
-        Ok(true)
     })
 }
 
@@ -1821,6 +1777,12 @@ pub struct NmbPassAttachment {
     pub load: u64,
     pub store: u64,
     pub clear: [f64; 4],
+    // sweet resolve: ported from UniXNU/AdrenoMetal 243d63c bridge/NativeMetalObjects.rs:2413-2417, 2444-2474 (MIT).
+    pub resolve_texture: *mut NmbTexture,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+    pub resolve_filter: u64,
 }
 
 #[repr(C)]
@@ -1847,6 +1809,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         let mut pass = RenderPassDescriptor::new();
         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
             slot.texture = texture_of(a)?;
+            slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
+            slot.resolve_level = a.resolve_level;
+            slot.resolve_slice = a.resolve_slice;
+            slot.resolve_depth_plane = a.resolve_depth_plane;
             slot.level = a.level;
             slot.slice = a.slice;
             slot.depth_plane = a.depth_plane;
@@ -1856,6 +1822,11 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         }
         let depth = &mut pass.depth_attachment;
         depth.texture = texture_of(&d.depth)?;
+        depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.clone());
+        depth.resolve_level = d.depth.resolve_level;
+        depth.resolve_slice = d.depth.resolve_slice;
+        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+        depth.depth_resolve_filter = MultisampleDepthResolveFilter::from_raw(d.depth.resolve_filter).map_err(e("depth resolve filter"))?;
         depth.level = d.depth.level;
         depth.slice = d.depth.slice;
         depth.depth_plane = d.depth.depth_plane;
@@ -1864,6 +1835,11 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.clear_depth = d.depth.clear[0];
         let stencil = &mut pass.stencil_attachment;
         stencil.texture = texture_of(&d.stencil)?;
+        stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.clone());
+        stencil.resolve_level = d.stencil.resolve_level;
+        stencil.resolve_slice = d.stencil.resolve_slice;
+        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+        stencil.stencil_resolve_filter = MultisampleStencilResolveFilter::from_raw(d.stencil.resolve_filter).map_err(e("stencil resolve filter"))?;
         stencil.level = d.stencil.level;
         stencil.slice = d.stencil.slice;
         stencil.depth_plane = d.stencil.depth_plane;

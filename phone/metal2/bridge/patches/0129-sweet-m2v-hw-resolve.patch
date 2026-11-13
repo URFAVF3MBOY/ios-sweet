@@ -1,0 +1,55 @@
+Bridge 0129: MSAA colour resolve by Turnip's own AVERAGE for 8-bit unorm. The runtime resolved every attachment whose
+format has Metal's closed rule by its exact shader resolve after the pass (color_resolve.rs; a fullscreen draw per MSAA
+pass, `13fc7332`, ~3.8 ms each in three.js games_fps, 2 a frame), because only MoltenVK has
+DriverFact::ColorResolveAverageIsMetals. Now color_resolve::exact answers None for RGBA8Unorm/BGRA8Unorm at 2..4
+samples, so the subpass keeps its resolve attachment (GMEM blit event, or the 2D engine in sysmem) and the image takes
+no input attachment usage for it. Rounding: Metal (sum + n/2)/n over the codes, Turnip's integer average: at most
+1 LSB apart (at a tie). sRGB stays exact unless mode 2: Turnip's GMEM blit averages sRGB codes, not linear values
+(blit_can_resolve), up to ~60 LSB off at a black-white edge. Float/int/snorm/packed formats, >4 samples and the
+sample-plane resolve (resolve_planes) unchanged. The runtime announces `device-rounded-resolve` once.
+Logs `SWEET_M2V_HW_RESOLVE mode N` once per process (at its first multisampled 8-bit candidate).
+Knob: SWEET_M2V_HW_RESOLVE (default 1 = unorm8; 0 = exact shader resolve as before; 2 = unorm8 and its sRGB formats).
+
+diff --git a/crates/metal2vulkan-runtime/src/color_resolve.rs b/crates/metal2vulkan-runtime/src/color_resolve.rs
+index 86c998d8..aa36e242 100644
+--- a/crates/metal2vulkan-runtime/src/color_resolve.rs
++++ b/crates/metal2vulkan-runtime/src/color_resolve.rs
+@@ -78,9 +78,38 @@ pub(super) const METAL_SAMPLES: u32 = 4;
+ pub(super) fn exact(device: &Device, format: Format, samples: u32) -> Option<ColorResolveFormat> {
+     // Rules that hold at that count: a half's at 2 samples only.
+     let rules = ColorResolveFormat::of(format).filter(|rules| rules.resolves(samples))?;
++    // 0129 (env `SWEET_M2V_HW_RESOLVE`): an 8-bit unorm format resolves by the device's average.
++    if (2..=METAL_SAMPLES).contains(&samples) && sweet_hw_resolve(format) {
++        return None;
++    }
+     (samples > 1 && !average_is_metals(device, samples)).then_some(rules)
+ }
+ 
++/// 0129: whether a color attachment of `format` resolves by the device's own `AVERAGE` in its
++/// pass instead of the exact resolve after it (env `SWEET_M2V_HW_RESOLVE`): `0` never (the exact
++/// resolve, as before), `1` (the default) `RGBA8Unorm` and `BGRA8Unorm`, `2` their sRGB formats
++/// too. Turnip averages an 8-bit unorm channel's codes (its GMEM blit event, or the 2D engine in
++/// sysmem), where Metal writes `(sum + n / 2) / n`: at most 1 LSB apart, at a tie. Its GMEM blit
++/// averages an sRGB channel's codes too, not their linear values (`blit_can_resolve`), up to ~60
++/// LSB from Metal's at a black-white edge, so sRGB waits for `2`.
++fn sweet_hw_resolve(format: Format) -> bool {
++    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
++    let mode = *MODE.get_or_init(|| {
++        let mode = match std::env::var("SWEET_M2V_HW_RESOLVE").as_deref().map(str::trim) {
++            Ok("0") => 0,
++            Ok("2") => 2,
++            _ => 1,
++        };
++        crate::pipestats::line(&format!("SWEET_M2V_HW_RESOLVE mode {mode}"));
++        mode
++    });
++    match format {
++        Format::R8G8B8A8_UNORM | Format::B8G8R8A8_UNORM => mode >= 1,
++        Format::R8G8B8A8_SRGB | Format::B8G8R8A8_SRGB => mode >= 2,
++        _ => false,
++    }
++}
++
+ /// Whether `device`'s own `AVERAGE` resolve of a color attachment of `samples` samples writes
+ /// Metal's resolve, whatever its format: `DriverFact::ColorResolveAverageIsMetals`, at a count
+ /// Apple's GPUs make (MoltenVK's resolve is Metal's multisample resolve store action).

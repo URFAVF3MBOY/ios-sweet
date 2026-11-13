@@ -1,0 +1,496 @@
+Bridge 0133 (U12-1b): react to a GPU restart that dropped this process's work. Turnip 0112 keeps the VkDevice after the kernel
+recovered a hung GPU; the kernel drops all work in flight and forces its fences done, so dropped work looked Completed and one-time
+uploads stayed wrong. 0112 exports tu_darwin_restarts() (status checks that found work dropped; run inside every vkWaitForFences and
+vkWaitSemaphores), found once by dlsym (global, else the loaded libvulkan_freedreno.dylib, as creation_log.rs finds MoltenVK's
+statistics).
+- Waited copies (device/submit.rs submit_internal: host copies, staged texel copies, readbacks, mipmaps; device/staging.rs, unused on
+  Adreno: one queue family) snapshot the count and the queues' use count (QueueSlot::with, counted under the queue lock) as they go.
+  If the count moved once the fence signalled, the copy's own command buffer (not one-time while the count is read) goes once more
+  while what it reads is held, never the first-work buffer (PREINITIALIZED/foreign moves, zero fills: not valid to replay), and
+  only if no queue was used since (checked under queue 0's lock for submit_internal). Within 60 s of a redo whose own flight saw
+  another restart, no redo is made.
+- Command buffers: each batch snapshots the count as it is submitted; a batch that completes with the count moved marks its command
+  buffer, which finishes with CommandBufferError::Execution(1), "Discarded (victim of GPU error/recovery)" (Metal's error for a
+  recovery victim). The frontend (in place, NativeBridgeMetalFrontend.mm + bridge/NativeMetalObjects.rs/.h,
+  nmb_command_buffer_execution_code) answers an Execution failure as MTLCommandBufferErrorDomain with its code
+  (1 = MTLCommandBufferErrorInternal). CoreAnimation's completion handler only logs a command buffer error.
+Not covered: staged byte copies and first work (in the first-work buffer, or carried by an app batch) are not redone.
+Off: SWEET_RESTART_REDO=0 (or a Turnip without 0112). Log: "MTL2[pid prog]: GPU restart: redid N staging copies, M command buffers
+marked error (restarts R)" (process totals) plus "; redo skipped: newer work on the queue", "; redo skipped: within 60 s of a redo
+that saw another restart" or "; another restart in the redo's flight: redos held 60 s".
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index 7711d68c..afb7492b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -112,6 +112,8 @@ pub(crate) struct Submitted {
+     pub(crate) fence: Option<vk::Fence>,
+     /// The events it signals, with their signal indices.
+     pub(crate) signals: Vec<(Arc<EventShared>, u64)>,
++    /// 0133: the count of GPU restarts as it was submitted (`gpu_restarts.rs`), where read.
++    pub(crate) restarts: Option<u32>,
+ }
+ 
+ impl Completion {
+@@ -266,16 +268,32 @@ fn run(watch: &Watch) {
+         // batch has one (`device/relay.rs`), signaled after the driver reported its failure.
+         let mut ending = Vec::new();
+         let mut fences = Vec::new();
++        // 0133: per command buffer ending, whether a GPU restart came while one of its batches
++        // was in flight (`gpu_restarts.rs`): it fails with Metal's error for a recovery's victim.
++        let mut dropped = Vec::new();
+         for (queue, batch) in finished {
+             let Submitted {
+                 buffer,
+                 last,
+                 fence,
++                restarts,
+                 ..
+             } = batch;
+             fences.extend(fence.map(|fence| (queue, fence)));
+-            if last {
+-                lock(&buffer.state).times.completed = seen;
++            let victim = crate::gpu_restarts::moved(restarts);
++            if victim || last {
++                let mut state = lock(&buffer.state);
++                state.times.restart_victim |= victim;
++                if !last {
++                    continue;
++                }
++                state.times.completed = seen;
++                let moved = state.times.restart_victim;
++                if moved {
++                    state.relayed_description = Some(crate::gpu_restarts::VICTIM.into());
++                }
++                drop(state);
++                dropped.push(moved);
+                 ending.push(buffer);
+             }
+         }
+@@ -296,8 +314,16 @@ fn run(watch: &Watch) {
+         drop(device);
+         match settled {
+             Settled::Signaled => {
+-                for buffer in ending {
+-                    CommandBufferShared::post_finished(buffer, Ok(()));
++                let marked = dropped.iter().filter(|&&moved| moved).count() as u64;
++                for (buffer, moved) in ending.into_iter().zip(dropped) {
++                    let result = match moved {
++                        true => Err(CommandBufferError::Execution(1)),
++                        false => Ok(()),
++                    };
++                    CommandBufferShared::post_finished(buffer, result);
++                }
++                if marked != 0 {
++                    crate::gpu_restarts::note(0, marked, "");
+                 }
+             }
+             // What is pending stays pending, as Metal's does.
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 6570f61d..142abb9d 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2548,6 +2548,7 @@ impl CommandBufferShared {
+                 buffer: self.hold(),
+                 last: true,
+                 fence,
++                restarts: None,
+                 signals: Vec::new(),
+             },
+         );
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index d90691f0..b1a9f441 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -548,6 +548,8 @@ impl CommandBufferShared {
+         // transition is of a live image of the caller's in the layout it is in (its contract,
+         // `new_texture_with_vk_image`); the fence is unsignaled and in no pending submission;
+         // the `VkQueue` is used under its lock.
++        // 0133: the count of GPU restarts as this batch goes (`gpu_restarts.rs`).
++        let restarts = crate::gpu_restarts::count();
+         let submitted = shared.submit_logged(queue, fence, &self.relayed, |vk_queue| unsafe {
+             shared.counts.queue_submitted(buffers);
+             raw.queue_submit(vk_queue, &submits, fence.unwrap_or(vk::Fence::null()))
+@@ -622,6 +624,7 @@ impl CommandBufferShared {
+                 buffer: self.hold(),
+                 last,
+                 fence,
++                restarts,
+                 signals: kept
+                     .into_iter()
+                     .map(|(event, signal, _)| (event, signal))
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 6689969a..6f1d73cc 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -574,6 +574,8 @@ impl QueueSlot {
+     /// `f` with the queue, under its lock, its loader word put back first.
+     pub(super) fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+         let queue = lock(&self.raw);
++        // 0133: counted under the lock, before the use (`gpu_restarts.rs`).
++        crate::gpu_restarts::queue_used();
+         // SAFETY: the queue lives while its slot does.
+         unsafe { self.word.restore() };
+         f(*queue)
+diff --git a/crates/metal2vulkan-runtime/src/device/staging.rs b/crates/metal2vulkan-runtime/src/device/staging.rs
+index cda67d6c..dfa7ef93 100644
+--- a/crates/metal2vulkan-runtime/src/device/staging.rs
++++ b/crates/metal2vulkan-runtime/src/device/staging.rs
+@@ -160,8 +160,12 @@ impl Device {
+         let Some(made) = objects.made.as_ref() else {
+             unreachable!("made above");
+         };
+-        let begin = vk::CommandBufferBeginInfo::default()
+-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
++        // 0133: as `submit_internal`'s, submitted again after a GPU restart in its flight.
++        let restarts = crate::gpu_restarts::count();
++        let begin = vk::CommandBufferBeginInfo::default().flags(match restarts {
++            Some(_) => vk::CommandBufferUsageFlags::empty(),
++            None => vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
++        });
+         // SAFETY: the command buffer is not pending (every submission is waited for below) and
+         // the staging lock is held; beginning it resets it (the pool resets command buffers).
+         unsafe { raw.begin_command_buffer(made.buffer, &begin) }.map_err(vulkan)?;
+@@ -190,6 +194,8 @@ impl Device {
+         // SAFETY: the queue is used under the staging lock alone; the command buffer is
+         // executable; every value waited for was signalled (the host saw it).
+         shared.counts.queue_submitted(buffers.len());
++        // 0133: the device queues' uses as it goes (this queue's are not counted).
++        let uses = crate::gpu_restarts::queue_uses();
+         let submitted = unsafe {
+             staging.word.restore();
+             raw.queue_submit(queue, &[submit], made.fence)
+@@ -197,14 +203,41 @@ impl Device {
+         exit_guard::called(Call::QueueSubmit);
+         submitted.map_err(|error| self.failed(error))?;
+         shared.counts.staging_submission();
+-        loop {
++        let wait = || loop {
+             // SAFETY: the fence was submitted just now.
+             match unsafe { raw.wait_for_fences(&[made.fence], true, WAIT_SLICE.as_nanos() as u64) }
+             {
+-                Ok(()) => return Ok(()),
+                 Err(vk::Result::TIMEOUT) => continue,
+-                Err(error) => return Err(self.failed(error)),
++                waited => break waited,
++            }
++        };
++        wait().map_err(|error| self.failed(error))?;
++        // 0133: a GPU restart in its flight may have dropped the copy: the same command buffer
++        // goes once more, its waits met, while the caller still holds what it reads, where no
++        // device queue was used since (`gpu_restarts.rs`).
++        match crate::gpu_restarts::redo(restarts) {
++            None => {}
++            Some(Err(why)) => crate::gpu_restarts::note(0, 0, why),
++            Some(Ok(())) if crate::gpu_restarts::queue_uses() != uses => {
++                crate::gpu_restarts::note(0, 0, crate::gpu_restarts::NEWER_WORK)
++            }
++            Some(Ok(())) => {
++                let again = crate::gpu_restarts::count();
++                let redo = [vk::SubmitInfo::default().command_buffers(&buffers)];
++                // SAFETY: the fence is signaled and not pending.
++                unsafe { raw.reset_fences(&[made.fence]) }.map_err(vulkan)?;
++                shared.counts.queue_submitted(buffers.len());
++                // SAFETY: as above; the command buffer completed and is not one-time.
++                let submitted = unsafe {
++                    staging.word.restore();
++                    raw.queue_submit(queue, &redo, made.fence)
++                };
++                exit_guard::called(Call::QueueSubmit);
++                submitted.map_err(|error| self.failed(error))?;
++                wait().map_err(|error| self.failed(error))?;
++                crate::gpu_restarts::redone(again);
+             }
+         }
++        Ok(())
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/device/submit.rs b/crates/metal2vulkan-runtime/src/device/submit.rs
+index ca18b57c..166754a6 100644
+--- a/crates/metal2vulkan-runtime/src/device/submit.rs
++++ b/crates/metal2vulkan-runtime/src/device/submit.rs
+@@ -130,8 +130,13 @@ impl Device {
+         let Some(objects) = internal.as_mut() else {
+             unreachable!("made above");
+         };
+-        let begin = vk::CommandBufferBeginInfo::default()
+-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
++        // 0133: the count of GPU restarts before the submission (`gpu_restarts.rs`); while it is
++        // read the command buffers may be submitted twice, so not one-time.
++        let restarts = crate::gpu_restarts::count();
++        let begin = vk::CommandBufferBeginInfo::default().flags(match restarts {
++            Some(_) => vk::CommandBufferUsageFlags::empty(),
++            None => vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
++        });
+         // The new resources' first work, given back if the submission is not made, after every
+         // batch on another `VkQueue` that did some. Its place in the submissions' order is held
+         // until it was made.
+@@ -211,11 +216,14 @@ impl Device {
+         // SAFETY: the queue is used under its lock; the command buffers are executable; every
+         // signal of the timeline is above its value. Where the queue's failures are relayed, a
+         // failure of this submission loses the device (`relay.rs`).
++        // 0133: the queues' uses as it goes, its own counted.
++        let mut uses = 0;
+         let made = shared.use_queue(0, By::Runtime, |queue| unsafe {
+             let buffers = submits
+                 .iter()
+                 .map(|info| info.command_buffer_count as usize);
+             shared.counts.queue_submitted(buffers.sum());
++            uses = crate::gpu_restarts::queue_uses();
+             raw.queue_submit(queue, &submits, objects.fence)
+         });
+         // A `vkQueueSubmit` that fails leaves what its submissions reference as it was, or loses
+@@ -227,19 +235,49 @@ impl Device {
+         shared.counts.internal_submission();
+         // What it works on, held until it completed.
+         let _held = taken.submitted_internally(objects.timeline, value);
+-        loop {
++        let wait = || loop {
+             // SAFETY: the fence was submitted just now.
+             match unsafe {
+                 raw.wait_for_fences(&[objects.fence], true, WAIT_SLICE.as_nanos() as u64)
+             } {
+-                Ok(()) => {
+-                    firsts.internal_completed(value);
+-                    return Ok(());
+-                }
+                 Err(vk::Result::TIMEOUT) => continue,
+-                Err(error) => return Err(self.failed(error)),
++                waited => break waited,
++            }
++        };
++        wait().map_err(|error| self.failed(error))?;
++        // 0133: a GPU restart in its flight may have dropped the work (a host copy, a readback,
++        // a mipmap fill): its command buffer goes once more, while what it reads is still held,
++        // without the first work, the waits (met) or the timeline's signal (made), and only where
++        // no queue was used since (`gpu_restarts.rs`).
++        match crate::gpu_restarts::redo(restarts) {
++            None => {}
++            Some(Err(why)) => crate::gpu_restarts::note(0, 0, why),
++            Some(Ok(())) => {
++                let again = crate::gpu_restarts::count();
++                let redo = [vk::SubmitInfo::default().command_buffers(&buffers)];
++                // SAFETY: the fence is signaled and not pending.
++                unsafe { raw.reset_fences(&[objects.fence]) }.map_err(vulkan)?;
++                // This use is counted too: newer work went in where the uses passed it.
++                let made = shared.use_queue(0, By::Runtime, |queue| {
++                    (crate::gpu_restarts::queue_uses() == uses + 1).then(|| {
++                        shared.counts.queue_submitted(redo.len());
++                        // SAFETY: as the first submission's; its command buffer completed and
++                        // is not one-time.
++                        unsafe { raw.queue_submit(queue, &redo, objects.fence) }
++                    })
++                });
++                match made {
++                    None => crate::gpu_restarts::note(0, 0, crate::gpu_restarts::NEWER_WORK),
++                    Some(made) => {
++                        made.map_err(|error| self.failed(error))?;
++                        wait().map_err(|error| self.failed(error))?;
++                        crate::gpu_restarts::redone(again);
++                    }
++                }
+             }
+         }
++        firsts.internal_completed(value);
++        Ok(())
+     }
+ 
+     /// Bind `binds` to `buffer`, a sparse buffer no command has used, with one
+diff --git a/crates/metal2vulkan-runtime/src/gpu_restarts.rs b/crates/metal2vulkan-runtime/src/gpu_restarts.rs
+new file mode 100644
+index 00000000..efff8c83
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/gpu_restarts.rs
+@@ -0,0 +1,167 @@
++//! Sweet 0133 (U12-1b): GPU restarts that dropped this process's work. Turnip 0112 keeps the
++//! `VkDevice` after the kernel recovered a hung GPU; the kernel drops all work in flight and
++//! forces its fences done, so dropped work looks completed. 0112 counts the status checks that
++//! found work dropped (`tu_darwin_restarts`, run inside every `vkWaitForFences` and
++//! `vkWaitSemaphores`). A submission snapshots the count before it goes; once its wait returned,
++//! a count that moved means its work may have been dropped: a waited copy is submitted once more
++//! (`device/submit.rs`, `device/staging.rs`), a command buffer fails with Metal's victim error
++//! (`command_buffer/completion.rs`). Off: `SWEET_RESTART_REDO=0`, or a driver without the count.
++//!
++//! A redo replays the copy's own command buffer alone, never the first work (moves from
++//! `PREINITIALIZED` or a foreign family, zero fills: no longer valid to replay), and only where
++//! no queue was used after the copy went ([`queue_uses`]): later work may have written what the
++//! copy writes. Within 60 s of a redo that itself saw another restart, none is made (a copy that
++//! hangs the GPU is not resubmitted in a loop).
++
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++type Restarts = unsafe extern "C" fn() -> u32;
++
++/// What a command buffer whose work a restart may have dropped reads as its error: Metal's own
++/// description of a victim of a GPU recovery (`CommandBufferError::Execution(1)`, measured).
++pub(crate) const VICTIM: &str = "Discarded (victim of GPU error/recovery)";
++
++static REDONE: AtomicU64 = AtomicU64::new(0);
++static MARKED: AtomicU64 = AtomicU64::new(0);
++
++/// 0112's count now, `None` where it is off or the driver has none.
++pub(crate) fn count() -> Option<u32> {
++    static FOUND: OnceLock<Option<usize>> = OnceLock::new();
++    let found = *FOUND.get_or_init(|| {
++        let off = std::env::var("SWEET_RESTART_REDO").is_ok_and(|v| v.trim() == "0");
++        if off {
++            None
++        } else {
++            find()
++        }
++    });
++    // SAFETY: the address is Turnip 0112's `uint32_t tu_darwin_restarts(void)`.
++    found.map(|address| unsafe { std::mem::transmute::<usize, Restarts>(address)() })
++}
++
++/// Whether the count moved since `at` (a [`count`] taken before the work was submitted).
++pub(crate) fn moved(at: Option<u32>) -> bool {
++    at.is_some_and(|at| count().is_some_and(|now| now != at))
++}
++
++/// Every use of one of the device's `VkQueue`s (`QueueSlot::with`, under the queue's lock,
++/// before the use), of any device of the process.
++static QUEUE_USES: AtomicU64 = AtomicU64::new(0);
++
++/// A `VkQueue` is being used (under its lock).
++pub(crate) fn queue_used() {
++    QUEUE_USES.fetch_add(1, Ordering::AcqRel);
++}
++
++/// The uses of `VkQueue`s so far.
++pub(crate) fn queue_uses() -> u64 {
++    QUEUE_USES.load(Ordering::Acquire)
++}
++
++/// Until when no redo is made: 60 s after a redo that saw another restart.
++static HELD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
++
++/// Whether a waited copy submitted when the count was `at` goes again: `Some(why)` where it is
++/// not although the count moved (logged by the caller), `None` where the count did not move.
++pub(crate) fn redo(at: Option<u32>) -> Option<Result<(), &'static str>> {
++    if !moved(at) {
++        return None;
++    }
++    let held = (HELD_UNTIL.lock()).map_or(true, |until| (*until).is_some_and(|u| Instant::now() < u));
++    Some(match held {
++        true => Err("; redo skipped: within 60 s of a redo that saw another restart"),
++        false => Ok(()),
++    })
++}
++
++/// A redo completed, the count `again` as it went: logged, and redos held for 60 s where the
++/// count moved again.
++pub(crate) fn redone(again: Option<u32>) {
++    let extra = match moved(again) {
++        true => {
++            if let Ok(mut until) = HELD_UNTIL.lock() {
++                *until = Some(Instant::now() + Duration::from_secs(60));
++            }
++            "; another restart in the redo's flight: redos held 60 s"
++        }
++        false => "",
++    };
++    note(1, 0, extra);
++}
++
++/// The redo's text where the queue was used after the copy.
++pub(crate) const NEWER_WORK: &str = "; redo skipped: newer work on the queue";
++
++/// One line per redo, with the process's totals, into `/dev/console` and `/var/local/mtl2.log`
++/// (as 0104's notes).
++pub(crate) fn note(redone: u64, marked: u64, extra: &str) {
++    use std::io::Write;
++    let redone = REDONE.fetch_add(redone, Ordering::Relaxed) + redone;
++    let marked = MARKED.fetch_add(marked, Ordering::Relaxed) + marked;
++    let line = format!(
++        "MTL2[{} {}]: GPU restart: redid {redone} staging copies, {marked} command buffers marked \
++         error (restarts {}){extra}\n",
++        std::process::id(),
++        std::env::args().next().unwrap_or_default(),
++        count().unwrap_or(0)
++    );
++    for path in ["/dev/console", "/var/local/mtl2.log"] {
++        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
++            let _ = file.write_all(line.as_bytes());
++        }
++    }
++}
++
++// dyld's image list (`<mach-o/dyld.h>`), as `pipeline/creation_log.rs` reads it.
++#[cfg(target_vendor = "apple")]
++unsafe extern "C" {
++    fn _dyld_image_count() -> u32;
++    fn _dyld_get_image_name(image_index: u32) -> *const std::ffi::c_char;
++}
++
++/// `tu_darwin_restarts` among the process's global symbols, else in the loaded
++/// `libvulkan_freedreno.dylib` (opened with its symbols local), as `creation_log.rs` finds
++/// MoltenVK's statistics.
++#[cfg(target_vendor = "apple")]
++fn find() -> Option<usize> {
++    use std::ffi::CStr;
++    const NAME: &CStr = c"tu_darwin_restarts";
++    // SAFETY: `dlsym` of a NUL-terminated name in the process's global symbols.
++    let global = unsafe { libc::dlsym(libc::RTLD_DEFAULT, NAME.as_ptr()) };
++    if !global.is_null() {
++        return Some(global as usize);
++    }
++    // SAFETY: dyld's image list, read by index below its count; each name is a NUL-terminated
++    // path dyld keeps while the image is loaded.
++    let images = unsafe { _dyld_image_count() };
++    for index in 0..images {
++        // SAFETY: as above.
++        let path = unsafe { _dyld_get_image_name(index) };
++        if path.is_null() {
++            continue;
++        }
++        // SAFETY: as above.
++        let path = unsafe { CStr::from_ptr(path) };
++        if !path.to_bytes().ends_with(b"/libvulkan_freedreno.dylib") {
++            continue;
++        }
++        // SAFETY: `RTLD_NOLOAD` opens only an image already loaded; the handle is kept.
++        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOLOAD | libc::RTLD_LAZY) };
++        if handle.is_null() {
++            continue;
++        }
++        // SAFETY: `dlsym` of a NUL-terminated name in an open image.
++        let symbol = unsafe { libc::dlsym(handle, NAME.as_ptr()) };
++        if !symbol.is_null() {
++            return Some(symbol as usize);
++        }
++    }
++    None
++}
++
++#[cfg(not(target_vendor = "apple"))]
++fn find() -> Option<usize> {
++    None
++}
+diff --git a/crates/metal2vulkan-runtime/src/gpu_time.rs b/crates/metal2vulkan-runtime/src/gpu_time.rs
+index f265af01..4cd3cab5 100644
+--- a/crates/metal2vulkan-runtime/src/gpu_time.rs
++++ b/crates/metal2vulkan-runtime/src/gpu_time.rs
+@@ -692,6 +692,8 @@ pub(crate) struct Times {
+     pub(crate) pair: Option<Pair>,
+     /// The scheduler began submitting its first batch.
+     pub(crate) kernel_start: u64,
++    /// 0133: a GPU restart came while one of its batches was in flight (`gpu_restarts.rs`).
++    pub(crate) restart_victim: bool,
+     /// The scheduler finished submitting its last batch.
+     pub(crate) kernel_end: u64,
+     /// The completion thread saw its last batch complete.
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index a7f07543..9c038663 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -102,6 +102,7 @@ mod function_table;
+ pub mod generated_commands;
+ mod generated_execute;
+ mod gpu_pools;
++mod gpu_restarts; // sweet 0133
+ mod gpu_time;
+ mod heap;
+ mod heap_sets;

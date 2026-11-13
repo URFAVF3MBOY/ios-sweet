@@ -1,0 +1,102 @@
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -469,6 +469,9 @@ struct tu_device
+ 
+    /* Address space and global fault count for this local_fd with DRM backend */
+    uint64_t fault_count;
++   /* SweetMetal2 0112: times of the last status checks that kept the device after a GPU restart (darwin). */
++   uint64_t sweet_kept_ns[8];
++   uint32_t sweet_kept_next;
+ 
+    /* Temporary storage for multisampled attachments backed by a
+     * single-sampled image view in sysmem mode.
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <errno.h>
+ #include <execinfo.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <string.h>
+ #include <sys/mman.h>
+@@ -1073,6 +1074,30 @@ darwin_device_get_suspend_count(struct tu_device *dev, uint64_t *suspend_count)
+    return 0;
+ }
+ 
++/* SweetMetal2 0112 (UniXNU c72a8a5): status checks that found this process's work dropped by a GPU restart and kept the
++ * device (one check can cover several restarts). */
++static uint32_t darwin_restarts;
++extern "C" __attribute__((visibility("default"))) uint32_t tu_darwin_restarts(void);
++extern "C" __attribute__((visibility("default"))) uint32_t
++tu_darwin_restarts(void)
++{
++   return p_atomic_read(&darwin_restarts);
++}
++
++/* SweetMetal2 0112: one line into /dev/console (kernel live log) and /var/local/mtl2.log, like 0108's vk_sweet_lost_note. */
++static void
++darwin_restart_note(const char *text, int n)
++{
++   const char *paths[] = { "/dev/console", "/var/local/mtl2.log" };
++   for (unsigned i = 0; i < 2; i++) {
++      int fd = open(paths[i], O_WRONLY | O_APPEND | O_NOCTTY);
++      if (fd >= 0) {
++         (void)!write(fd, text, n);
++         close(fd);
++      }
++   }
++}
++
+ static VkResult
+ darwin_device_check_status(struct tu_device *device)
+ {
+@@ -1082,11 +1107,42 @@ darwin_device_check_status(struct tu_device *device)
+       return VK_SUCCESS; /* counters not attached in this kernel */
+    if (kr != KERN_SUCCESS)
+       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
+-   if (reply.faults != device->fault_count) {
+-      device->fault_count = reply.faults;
+-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
++   /* 0112: one exchange, so two threads checking at once see a new count once. */
++   uint64_t prev = p_atomic_xchg(&device->fault_count, reply.faults);
++   if (prev == reply.faults)
++      return VK_SUCCESS;
++   uint64_t lost = reply.faults - prev;
++   /* SweetMetal2 0112: the kernel recovered the GPU (a failed recovery makes GetStatus fail, above) and forced the fences
++    * of the work in flight: that work is dropped, but memory, pipelines and the ring are as they were, so the device
++    * stays in use. More than TU_DARWIN_KEEP_DEVICE_MAX (default 3) kept checks in 60 s: a client that hangs the shared
++    * ring every frame, so lost as before. TU_DARWIN_KEEP_DEVICE=0: always lost as before. */
++   if (debug_get_bool_option("TU_DARWIN_KEEP_DEVICE", true)) {
++      int64_t max = debug_get_num_option("TU_DARWIN_KEEP_DEVICE_MAX", 3);
++      max = CLAMP(max, 0, (int64_t)ARRAY_SIZE(device->sweet_kept_ns));
++      uint64_t now = os_time_get_nano();
++      uint32_t slot = p_atomic_inc_return(&device->sweet_kept_next) - 1;
++      unsigned recent = 1; /* this check */
++      for (unsigned i = 0; i < ARRAY_SIZE(device->sweet_kept_ns); i++) {
++         uint64_t t = p_atomic_read(&device->sweet_kept_ns[i]);
++         if (t && now - t < 60000000000ull)
++            recent++;
++      }
++      p_atomic_set(&device->sweet_kept_ns[slot % ARRAY_SIZE(device->sweet_kept_ns)], now);
++      if (recent <= (unsigned)max) {
++         p_atomic_inc(&darwin_restarts);
++         char text[200];
++         int n = snprintf(text, sizeof(text), "MTL2[%d %s]: GPU restart dropped work in flight (%llu faults): "
++                          "device kept (%u in 60 s, total %u)\n", getpid(), getprogname(),
++                          (unsigned long long)lost, recent, p_atomic_read(&darwin_restarts));
++         n = CLAMP(n, 1, (int)sizeof(text) - 1);
++         mesa_logw("%.*s", n - 1, text);
++         darwin_restart_note(text, n);
++         return VK_SUCCESS;
++      }
++      return vk_device_set_lost(&device->vk, "GPU faulted or hung (%llu faults, %u kept checks in 60 s > %d)",
++                                (unsigned long long)lost, recent, (int)max);
+    }
+-   return VK_SUCCESS;
++   return vk_device_set_lost(&device->vk, "GPU faulted or hung");
+ }
+ 
+ static VkResult

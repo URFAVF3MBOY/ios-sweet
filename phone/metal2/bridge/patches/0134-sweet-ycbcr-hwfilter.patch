@@ -1,0 +1,63 @@
+Bridge 0134 (G7): a converted YCbCr texture's linear sample is the device's bilinear filter. CoreAnimation's composite sampled the
+YCBCR8_420_2P slot (0131's converted RGBA16F image) through the exact routine on Turnip: 4 RGBA16F taps plus Metal's integer sums
+(grid 2048, each 2D term truncated by 2^7) per fragment, because the format's TexelFormat class carries EXACT and only a MetalSampler
+device (MoltenVK) leaves it to the device. Now the binder's TexelFormat(slot) specialization drops EXACT for a PackedTexels::YCbCr2048
+format (the 8- and 10-bit converted two-plane formats, packed or not, every subsampling) on a device without Metal's own sampler: the
+linear sample takes the module's existing device arm (lower::sampler::linear device_when, class without a measured family). The packed
+field stays, so reads, nearest samples and gathers convert as before (half.rs/float_texel.rs ignore EXACT for a packed class). The
+slot's VkSampler is the Metal sampler's (LINEAR), checked against the view format at bind (check_filter_features); Turnip gives
+R16G16B16A16_SFLOAT SAMPLED_IMAGE_FILTER_LINEAR (tu_formats.cc tu_format_linear_filtering_supported: only a702 refuses some formats).
+Cache: the SPIR-V and the disk artifacts are unchanged (the class is a specialization value set per draw, slots.rs bound_value); the
+pipeline variant key and the driver's VkPipelineCache record name the specialization, so the exact-routine variant is a separate entry.
+Error vs the exact routine (model, 8-bit subtexel weights): at most 8/2048 per colour channel rounding the weights (16/2048 truncating)
+at a 0 <-> 1 edge, under 1.7/2048 on smooth content; alpha exact. The pipeline announces ycbcr-filter-not-exact. Not covered: heap
+(argument buffer) textures, extended-range (XR) and sRGB/12-bit formats (other fields), keep the exact routine. Reuse: none upstream
+(upstream metal2vulkan emulates the filter on every non-Metal device).
+Off: SWEET_YCBCR_HWFILTER=0. Logs "SWEET_YCBCR_HWFILTER mode N" once (with SWEET_PIPESTATS).
+
+diff --git a/crates/metal2vulkan/src/bind/plan/resources.rs b/crates/metal2vulkan/src/bind/plan/resources.rs
+index ec880e4f..f27adb06 100644
+--- a/crates/metal2vulkan/src/bind/plan/resources.rs
++++ b/crates/metal2vulkan/src/bind/plan/resources.rs
+@@ -1814,6 +1814,11 @@ impl ResourcePlanner<'_> {
+                             .0
+                     }
+                 };
++                // 0134: a converted 8- or 10-bit YCbCr texture's linear sample is the device's.
++                let class = match sweet_ycbcr_hwfilter(self.profile, shape.pixel_format()) {
++                    true => class & !BicubicTexels::EXACT,
++                    false => class,
++                };
+                 // A slot whose function applies the swizzle (a storage slot's; an extended-range
+                 // one's; a packed normalized one's) converts the texel before it swizzles it, by
+                 // its own channels' class; a swizzle that reads every texel as none does keeps the
+@@ -1885,5 +1890,29 @@ fn swizzled_packed(
+         && !reads_unswizzled(pf, swizzle)
+ }
+ 
++/// 0134: whether texture slots of `pf` hand their linear samples to the device's bilinear filter
++/// (env `SWEET_YCBCR_HWFILTER`, on unless `0`): a `PackedTexels::YCbCr2048` format (the 8- and
++/// 10-bit converted two-plane ones), whose texels the runtime converts into an
++/// `R16G16B16A16_SFLOAT` image, on a device without Metal's own sampler. Its `TexelFormat`
++/// specialization drops `EXACT`, so the function takes the device's arm (`lower::sampler::linear`,
++/// `device_when`) instead of the exact routine's four taps and integer sums; the slot's `VkSampler`
++/// keeps the Metal sampler's linear filter, checked against the view format at bind. Off, `0`:
++/// the exact routine, as before.
++fn sweet_ycbcr_hwfilter(profile: &DeviceProfile, pf: PixelFormat) -> bool {
++    use crate::metal::texel_format::PackedTexels;
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    PackedTexels::of(pf) == Some(PackedTexels::YCbCr2048)
++        && !profile.device_samples()
++        && *ON.get_or_init(|| {
++            let on = std::env::var("SWEET_YCBCR_HWFILTER").map_or(true, |v| v.trim() != "0");
++            crate::env_vars::half_relaxed_note(&format!(
++                "SWEET_YCBCR_HWFILTER mode {}",
++                u8::from(on)
++            ));
++            on
++        })
++}
++
+ #[cfg(test)]
+ mod tests;
++

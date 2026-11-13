@@ -1,0 +1,17 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -177,9 +177,10 @@ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns)
+ {
+    for (;;) {
+       uint64_t now = os_time_get_nano();
+-      uint64_t slice = 1000000; /* 1 ms */
+-      if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
+-         slice = 0;
++      /* sweet 0110 (UniXNU cd1b975): the rest of the wait, at most 100 ms a call (the kernel loop looks at the fence itself). */
++      uint64_t slice = 100000000; /* 100 ms */
++      if (abs_timeout_ns != UINT64_MAX)
++         slice = abs_timeout_ns > now ? MIN2(abs_timeout_ns - now, slice) : 0;
+       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
+       kern_return_t kr = dw_call(NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
+       if (kr == KERN_SUCCESS)

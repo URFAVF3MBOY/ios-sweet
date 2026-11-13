@@ -1,0 +1,223 @@
+Bridge 0125: keep the final render passes across frames. Every pass instance made its VkRenderPass with
+vkCreateRenderPass2 and destroyed it with the command buffer (render_target::create), though the pass depends only on
+its shape and load/store operations. Now create() looks the pass up in the device's KeptFinal map, keyed by everything
+it is made of (PassShape, color ops, depth/stencil ops, resolve ops, depth/stencil resolve ops, resolving; the device
+profile is one per device); a miss makes it and keeps it (cap 256, past it a per-frame pass as before). Kept passes
+are destroyed at device teardown like the compatible ones. made_compatible_pass bypasses it (create_now): its callers
+(shared_compatible_pass, attachmentless) keep their own. Framebuffers stay per frame.
+Logs `SWEET_M2V_PASS_CACHE PC hits H misses M full F kept N at T s` at the first pass and at most every 2 s.
+Knob: SWEET_M2V_PASS_CACHE (off unless set and not 0; off = same results and same work as before).
+
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index fba1aa90..6689969a 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -63,7 +63,7 @@ use super::memory::Memory;
+ use super::mipmap_scratch::MipmapScratch;
+ use super::owned_kernel::OwnedKernels;
+ use super::render_state::{depth_bias_command, DepthBiasCommand};
+-use super::render_target::KeptCompatible;
++use super::render_target::{KeptCompatible, KeptFinal};
+ use super::resource_ids::{ResourceIds, SamplerIdReads};
+ use super::sample_planes::PlanesObjects;
+ use super::sampler::{SamplerCount, SamplerKey, SamplerShared};
+@@ -305,6 +305,9 @@ pub(super) struct DeviceShared {
+     pub(super) attachmentless: Mutex<KeptPasses>,
+     /// The compatible passes it keeps, by shape (`render_target::shared_compatible_pass`).
+     pub(super) compatible_passes: Mutex<KeptCompatible>,
++    /// 0125: the final passes it keeps, by what made them (`render_target::create`,
++    /// env `SWEET_M2V_PASS_CACHE`).
++    pub(super) final_passes: Mutex<KeptFinal>,
+     /// The caller's images that move between layouts, and the events' timeline semaphores
+     /// (`interop.rs`).
+     pub(super) interop: Interop,
+@@ -508,6 +511,7 @@ impl Drop for DeviceShared {
+         lock(&self.depth_stencil_resolves).destroy(self.vk());
+         lock(&self.attachmentless).destroy(self.vk());
+         lock(&self.compatible_passes).destroy(self.vk());
++        lock(&self.final_passes).destroy(self.vk());
+         // What released variants left (`pipeline/kept.rs`).
+         lock(&self.kept).destroy(self);
+         // The graphics pipeline libraries, after every pipeline they linked: each linked
+@@ -1290,6 +1294,7 @@ impl Device {
+             depth_stencil_resolves: Mutex::new(DepthStencilResolveObjects::default()),
+             attachmentless: Mutex::default(),
+             compatible_passes: Mutex::default(),
++            final_passes: Mutex::default(),
+             interop: Interop::default(),
+             heap_keys: Default::default(),
+             rebinds: Default::default(),
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 0310edd4..c3ff09aa 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -299,7 +299,8 @@ pub(super) fn later_steps(layout: &PassLayout) -> impl Iterator<Item = &ResolveS
+ }
+ 
+ /// One attachment's operations: of its color or depth aspect, then of its stencil aspect.
+-#[derive(Clone, Copy)]
++// 0125: `PartialEq, Eq, Hash` for `FinalKey`.
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+ struct Ops {
+     load: vk::AttachmentLoadOp,
+     store: vk::AttachmentStoreOp,
+@@ -694,7 +695,8 @@ pub(super) fn made_compatible_pass(
+ ) -> Result<RenderPassObject, Error> {
+     let colors = vec![KEEP; shape.colors.iter().flatten().count()];
+     let resolves = vec![KEEP; shape.color_resolves.iter().flatten().count()];
+-    create(
++    // 0125: not through `create`'s kept passes; its callers keep the pass themselves.
++    create_now(
+         device,
+         shape,
+         &colors,
+@@ -1053,6 +1055,140 @@ pub(super) fn reach_pass(
+     Ok((pass, framebuffer, uses))
+ }
+ 
++/// 0125: the most final passes a device keeps (`create`); past it a pass is made per instance.
++const KEPT_FINAL: usize = 256;
++
++/// 0125: what [`create_now`] makes a pass of, but its device's profile (one per device): the
++/// shape, the color, depth/stencil, resolve and depth/stencil resolve operations, `resolving`.
++type FinalKey = (
++    PassShape,
++    Vec<Ops>,
++    Option<Ops>,
++    Vec<Ops>,
++    Option<Ops>,
++    bool,
++);
++
++/// 0125: the passes a device keeps by what made them (env `SWEET_M2V_PASS_CACHE`, `create`), so
++/// an instance of a known pass makes none. A pass depends on no image: never invalidated.
++#[derive(Default)]
++pub(super) struct KeptFinal(HashMap<FinalKey, vk::RenderPass>);
++
++impl KeptFinal {
++    /// Destroy every kept pass; the device is idle, and is destroyed next.
++    pub(super) fn destroy(&self, raw: &ash::Device) {
++        for &pass in self.0.values() {
++            // SAFETY: as for `KeptCompatible::destroy`.
++            unsafe { release::object(raw, pass) };
++        }
++    }
++}
++
++/// 0125: whether `create` keeps its passes (env `SWEET_M2V_PASS_CACHE`, off unless set and not
++/// `0`).
++fn sweet_pass_cache_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var("SWEET_M2V_PASS_CACHE").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
++    })
++}
++
++/// 0125's counts of this process: hits, misses, misses past the cap; the time of the first
++/// call, and the milliseconds after it of the last log line.
++static SWEET_PASS_CACHE_COUNTS: [std::sync::atomic::AtomicU64; 3] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++static SWEET_PASS_CACHE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++static SWEET_PASS_CACHE_LOGGED: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(u64::MAX);
++
++/// 0125: count a hit (`hit`) or a miss (past the cap where `full`), and log the counts and the
++/// kept passes (`kept`) at the first call and at most every 2 s after.
++fn sweet_pass_cache_count(hit: bool, full: bool, kept: usize) {
++    use std::sync::atomic::Ordering::Relaxed;
++    let counts = &SWEET_PASS_CACHE_COUNTS;
++    let start = *SWEET_PASS_CACHE_START.get_or_init(std::time::Instant::now);
++    counts[usize::from(!hit)].fetch_add(1, Relaxed);
++    if full {
++        counts[2].fetch_add(1, Relaxed);
++    }
++    let now = start.elapsed().as_millis() as u64;
++    let last = SWEET_PASS_CACHE_LOGGED.load(Relaxed);
++    if (last == u64::MAX || now >= last.saturating_add(2000))
++        && SWEET_PASS_CACHE_LOGGED
++            .compare_exchange(last, now, Relaxed, Relaxed)
++            .is_ok()
++    {
++        crate::pipestats::line(&format!(
++            "SWEET_M2V_PASS_CACHE PC hits {} misses {} full {} kept {kept} at {:.1} s",
++            counts[0].load(Relaxed),
++            counts[1].load(Relaxed),
++            counts[2].load(Relaxed),
++            now as f64 / 1e3
++        ));
++    }
++}
++
++/// [`create_now`], kept by the device where `SWEET_M2V_PASS_CACHE` is on (0125, [`KeptFinal`]):
++/// the kept pass where it has one, else one made now and kept from now on, while it keeps fewer
++/// than [`KEPT_FINAL`]. A kept pass is destroyed with its device, not its holders.
++fn create(
++    device: &Device,
++    shape: &PassShape,
++    colors: &[Ops],
++    depth_stencil: Option<Ops>,
++    resolves: &[Ops],
++    depth_stencil_resolve: Option<Ops>,
++    resolving: bool,
++) -> Result<RenderPassObject, Error> {
++    let make = || {
++        create_now(
++            device,
++            shape,
++            colors,
++            depth_stencil,
++            resolves,
++            depth_stencil_resolve,
++            resolving,
++        )
++    };
++    if !sweet_pass_cache_on() {
++        return make();
++    }
++    let key: FinalKey = (
++        shape.clone(),
++        colors.to_vec(),
++        depth_stencil,
++        resolves.to_vec(),
++        depth_stencil_resolve,
++        resolving,
++    );
++    let kept = &device.shared().final_passes;
++    {
++        let passes = lock(kept);
++        if let Some(&raw) = passes.0.get(&key) {
++            let size = passes.0.len();
++            drop(passes);
++            sweet_pass_cache_count(true, false, size);
++            return Ok(RenderPassObject::kept(device, raw));
++        }
++    }
++    let pass = make()?;
++    let mut passes = lock(kept);
++    // Another encoder's may have come first: this one stays its holders'.
++    let full = passes.0.len() >= KEPT_FINAL;
++    let result = if !full && !passes.0.contains_key(&key) {
++        let raw = pass.into_kept();
++        passes.0.insert(key, raw);
++        RenderPassObject::kept(device, raw)
++    } else {
++        pass
++    };
++    let size = passes.0.len();
++    drop(passes);
++    sweet_pass_cache_count(false, full, size);
++    Ok(result)
++}
++
+ /// The pass of `shape` with `colors`' operations (one per present color attachment, in index
+ /// order), `depth_stencil`'s, and the resolve attachments' (`resolves`, one per color index that
+ /// resolves, then `depth_stencil_resolve`'s), every attachment in `GENERAL`: the draws' subpass
+@@ -1061,7 +1197,7 @@ pub(super) fn reach_pass(
+ /// subpass leaves out resolves nothing there (Vulkan resolves only a referenced attachment), nor
+ /// does the sample planes' anchor (its samples are undefined there); the pass resolves nothing
+ /// unless `resolving`.
+-fn create(
++fn create_now(
+     device: &Device,
+     shape: &PassShape,
+     colors: &[Ops],

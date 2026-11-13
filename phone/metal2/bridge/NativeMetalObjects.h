@@ -39,7 +39,10 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
-bool nmb_device_sched_counts(const NmbDevice *, uint64_t out[9]);   /* u-t: scheduler WorkCounts (NativeMetalObjects.rs) */
+// ios-on-pixel bridge 0114: supports_family calls in this process so far, whoever asked.
+uint64_t nmb_family_calls(void);
+// ios-on-pixel bridge 0105: command pools made, spares kept now, spares destroyed by SWEET_CMDPOOL_CAP.
+void nmb_command_pool_stats(uint64_t out[3]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
@@ -55,6 +58,8 @@ const char *nmb_device_answer_selector(size_t index, uint32_t *kind /* NMB_ANSWE
 bool nmb_device_answer(const NmbDevice *, const char *selector, uint64_t arg, uint64_t *out); /* false: no answer, nmb_last_error says why */
 size_t nmb_device_vendor_name(const NmbDevice *, char *out, size_t size);
 size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
+/* 0111: called once, on any thread, when a device of this process is first marked lost; text: where and why. */
+void nmb_set_device_lost_hook(void (*callback)(const char *text));
 uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width); /* 0: refused */
 
 typedef struct NmbBinaryArchive NmbBinaryArchive;
@@ -86,34 +91,20 @@ NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescrip
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
-/* SweetMetal2: a texture over a planar IOSurface's buffer with the surface's facts (IOSurfaceGetPixelFormat, the plane asked, the luma
- * size, plane 1's offset in the buffer and bytes per row, the YCbCr matrix attachment: 0 none, 1 601, 2 709, 3 2020, 4 240M, 5 other).
- * A two-plane YCbCr format (MTLPixelFormatYCBCR8_420_2P over a 420f/420v surface's plane 0) is the runtime's GPU-converted texture. */
-struct NmbSurfaceFacts {uint32_t pixel_format, matrix; uint64_t plane, width, height, chroma_offset, chroma_bytes_per_row;};
-NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool planar,
-                                       const struct NmbSurfaceFacts *facts);
-/* SweetMetal2: a descriptor's rotation (SPI, 0-4) and framebufferOnly, which NmbTextureDescriptor does not carry. A texture over an
- * IOSurface plane with them (Core Animation's landscape framebuffer: rotation 1/3 over the portrait panel surface), and a texture's. */
-struct NmbTextureExtras {uint64_t rotation, framebuffer_only;};
-NmbTexture *nmb_texture_new_on_surface_rotated(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
-                                               bool planar, const struct NmbTextureExtras *extras);
-void nmb_texture_extras(const NmbTexture *, struct NmbTextureExtras *out);
-/* The surface seed + 1 a two-plane YCbCr texture's planes hold now: converted again only when it changes. False for other textures. */
-bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generation);
-/* SweetMetal2 (patch 0107, SWEET_SHADOW_SEED=1): the surface seed + 1 (0 = changed another way) a shadowed surface texture is bound at. */
-bool nmb_texture_set_bytes_generation(const NmbTexture *, uint64_t generation);
-/* SweetMetal2: shadow copy counts since start (patch 0104): copies, texel bytes, repacked, YCbCr copies skipped, layouts refused. */
-bool nmb_sweet_shadow_counts(uint64_t out[5]);
-/* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];
-   returns the steps written. nmb_sweet_drawstat_name: step index's name (static), or NULL. */
-bool nmb_sweet_drawstat_on(void);
-/* u-combo: bridge 0111's SWEET_M2V_SCRATCH from the next pass on (0 off, 1 on, -1 the env's): the live knobs */
-void nmb_sweet_scratch_live(int32_t value);
-size_t nmb_sweet_drawstat(uint64_t *out, size_t capacity);
-const char *nmb_sweet_drawstat_name(size_t index);
+/* 0127 (G7, after UniXNU/AdrenoMetal 243d63c, MIT): a texture over one plane of a planar surface (offset, bytes_per_row: that plane's).
+   chroma_bytes_per_row non-zero: a two-plane format (YCbCr 500-530, 540-545; XR10 550/551) reading plane 1 at chroma_offset, over a surface
+   of OSType pixel_format and width x height; matrix: kIOSurfaceYCbCrMatrix, 0 none, 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, 5 other. */
+NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint32_t pixel_format,
+                                       uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset, uint64_t chroma_bytes_per_row, uint32_t matrix);
+/* 0128 (G7): a two-plane YCbCr texture over a surface reads the surface's seed as seed(context) (IOSurfaceGetSeed) at each use and converts
+   its planes only when it moved; release(context) runs when the texture is gone, or at once when refused (false). Off: SWEET_YCBCR_SEED=0. */
+bool nmb_texture_watch_seed(NmbTexture *, uint32_t (*seed)(const void *), const void *context, void (*release)(const void *));
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
+/* As nmb_texture_new_view with levels and slices, swizzle replacing the texture's: RGBA bytes (Metal's MTLTextureSwizzle), bit 32 marks an
+   explicit value; zero is the identity. */
+NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], uint64_t swizzle);
 /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
@@ -208,10 +199,9 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 /* Metal's MTLCommandBufferStatus (0 not enqueued .. 4 completed, 5 error). */
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
+/* 0133: the MTLCommandBufferError code of a failure the driver relayed or a GPU restart's victim (Execution), else 0. */
+uint64_t nmb_command_buffer_execution_code(const NmbCommandBuffer *);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
-void nmb_rotated_copy_stats(uint64_t out[5]);
-void nmb_rotated_planes_written(void);
-double nmb_command_buffer_kernel_time(const NmbCommandBuffer *, bool end);   /* u-t: scheduler submit begin/end, host clock s */
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);
@@ -236,6 +226,10 @@ struct NmbPassAttachment {
     NmbTexture *texture;
     uint64_t level, slice, depth_plane, load, store;
     double clear[4]; /* color, or clear[0] depth / stencil */
+    /* sweet resolve: the attachment's resolve target (null: none), and a depth or stencil resolve filter. Ported from
+       UniXNU/AdrenoMetal 243d63c bridge/NativeMetalObjects.h:290-292 (MIT). */
+    NmbTexture *resolve_texture;
+    uint64_t resolve_level, resolve_slice, resolve_depth_plane, resolve_filter;
 };
 struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;

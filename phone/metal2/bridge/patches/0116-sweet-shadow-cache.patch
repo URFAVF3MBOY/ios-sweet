@@ -1,0 +1,504 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -38,7 +38,9 @@
+ };
+ use super::resource::{Identity, ResourceKey};
+ use super::rotated::{self, Frame, RotatedCopies};
+-use super::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowStaging, ShadowTarget};
++use super::shadow::{
++    ShadowBuffer, ShadowCache, ShadowCopies, ShadowSource, ShadowStaging, ShadowTarget,
++};
+ use super::texture::surface_two_planes;
+ use super::texture::{IdUse, Texture};
+ use super::texture_descriptor::{
+@@ -1276,6 +1278,7 @@
+                     regions,
+                     staging,
+                     texel: Some(self.texel_bytes),
++                    cache: ShadowCache::over(&self.buffer, layout, aspects), // 0116
+                 },
+                 alias: self.buffer.alias().map(|alias| alias.key),
+             },
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -703,6 +703,7 @@
+         let device = self.device().clone();
+         let aliased = self.aliased(uses);
+         let uses = aliased.as_deref().unwrap_or(uses);
++        self.shadows.replayed = self.replaying || crate::replay::is_replaying(); // 0116
+         let copies = self.shadows.before(shadows, uses, |copies| {
+             ShadowMerge::new(&device, copies).map(Arc::new)
+         })?;
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -96,6 +96,8 @@
+ 
+ use super::buffer::{Buffer, CallerMemory, WeakBuffer};
+ use super::error::{Error, RuntimeGap};
++use super::key_hash::KeyHasher;
++use super::linear_plan::BufferLayout;
+ use super::resource::ResourceKey;
+ use super::rotated::{RotatedCopies, Turn};
+ use super::shadow_merge::ShadowMerge;
+@@ -108,8 +110,11 @@
+ use ash::vk;
+ use metal2vulkan::error::{Feature, Unsupported};
+ use metal2vulkan::metal::PixelFormat;
++use std::hash::{Hash, Hasher};
+ use std::ops::Range;
+-use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, OnceLock, PoisonError};
++use std::time::Instant;
+ 
+ /// What a shadowed texture's copies need: its truth, its shadow, and the copies between them.
+ pub(super) struct ShadowCopies {
+@@ -244,6 +249,8 @@
+         /// texture ([`ShadowCopy::area`]) offsets its region; `None` where no copy of it is
+         /// bounded (a heap's depth or stencil texture, which is no color attachment).
+         texel: Option<u64>,
++        /// 0116: what the last copy in held, where `M2V_SHADOW_CACHE` is on (`ShadowCache`).
++        cache: Option<ShadowCache>,
+     },
+     /// A texture buffer's staging buffer, which its bindings view.
+     Buffer(ShadowStaging),
+@@ -730,6 +737,7 @@
+                 regions,
+                 staging,
+                 texel,
++                ..
+             } => {
+                 let regions = match (self.area, staging, regions.as_slice(), *texel) {
+                     (Some(area), None, [region], Some(texel)) if !into_shadow => {
+@@ -1043,6 +1051,221 @@
+     })
+ }
+ 
++/// 0116 (Home and Control Center repeat shadow fills): `M2V_SHADOW_CACHE`, read once. 0: every
++/// copy in, as ever. 1 or unset: a color texture's copy in over a buffer is skipped while a hash of
++/// its source texels, taken as the copy is planned, matches the last copy's. 2: skipped after the
++/// first copy whatever the bytes hold (a ceiling test, stale content expected). Both copy where
++/// the encoder's command writes through the texture, the texture was written through or its
++/// truth written by a command (`cache_written`), or the buffer's pages moved. The hash sees the
++/// CPU's writes up to the moment it runs: one between then and the GPU's read shows only at the
++/// next use, and in a texture over 256 KB one outside the rows hashed not until those change.
++fn cache_mode() -> u8 {
++    static MODE: OnceLock<u8> = OnceLock::new();
++    *MODE.get_or_init(|| {
++        let mode = match std::env::var("M2V_SHADOW_CACHE").as_deref() {
++            Err(_) | Ok("" | "1") => 1,
++            Ok("2") => 2,
++            _ => 0,
++        };
++        if mode != 0 {
++            cache_line(&format!("M2V_SHADOW_CACHE={mode}"));
++        }
++        mode
++    })
++}
++
++/// 0116: one line into /dev/console and /var/local/mtl2.log, as 0108's.
++fn cache_line(text: &str) {
++    use std::io::Write;
++    let line = format!(
++        "MTL2[{} {}]: {text}\n",
++        std::process::id(),
++        std::env::args().next().unwrap_or_default()
++    );
++    for path in ["/dev/console", "/var/local/mtl2.log"] {
++        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
++            let _ = file.write_all(line.as_bytes());
++        }
++    }
++}
++
++/// 0116: bytes from which a texture's texels are sampled: at most this much is hashed whole.
++const CACHE_WHOLE_BYTES: u64 = 256 * 1024;
++/// 0116: writes by commands, per slot a key hashes to. A shared slot costs a needless copy only.
++static CACHE_WRITES: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
++/// 0116: work recorded apart from the encoders' commands (`ShadowSync::leave`), which may write
++/// anything.
++static CACHE_LEFT: AtomicU64 = AtomicU64::new(0);
++static CACHE_COPIES: AtomicU64 = AtomicU64::new(0);
++static CACHE_SKIPPED: AtomicU64 = AtomicU64::new(0);
++static CACHE_HASHED: AtomicU64 = AtomicU64::new(0);
++static CACHE_HASH_US: AtomicU64 = AtomicU64::new(0);
++
++fn cache_slot(key: ResourceKey) -> &'static AtomicU64 {
++    let mut hasher = KeyHasher::default();
++    key.hash(&mut hasher);
++    &CACHE_WRITES[hasher.finish() as usize % CACHE_WRITES.len()]
++}
++
++/// 0116: a command wrote `key`, perhaps not yet run: what a hash of its bytes says no longer counts.
++fn cache_written(key: ResourceKey) {
++    cache_slot(key).fetch_add(1, Ordering::Relaxed);
++}
++
++/// 0116: changes whenever a command wrote the truth or the shadow of `copies`.
++fn cache_stamp(copies: &ShadowCopies) -> u64 {
++    let read = |key: ResourceKey| cache_slot(key).load(Ordering::Relaxed);
++    let alias = copies.alias().map_or(0, read);
++    CACHE_LEFT
++        .load(Ordering::Relaxed)
++        .wrapping_add(read(copies.truth().0))
++        .wrapping_add(alias)
++        .wrapping_add(read(copies.shadow_key))
++}
++
++/// 0116: the `SHADOW:` line, at most once per 5 s, with what the counters gathered since the last.
++fn cache_log() {
++    static START: OnceLock<Instant> = OnceLock::new();
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    let now = START.get_or_init(Instant::now).elapsed().as_secs();
++    let last = LAST.load(Ordering::Relaxed);
++    if now < last + 5
++        || LAST
++            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
++            .is_err()
++    {
++        return;
++    }
++    cache_line(&format!(
++        "SHADOW: 5s copies {} skipped {} hashed {} KB, hash {} us",
++        CACHE_COPIES.swap(0, Ordering::Relaxed),
++        CACHE_SKIPPED.swap(0, Ordering::Relaxed),
++        CACHE_HASHED.swap(0, Ordering::Relaxed) / 1024,
++        CACHE_HASH_US.swap(0, Ordering::Relaxed),
++    ));
++}
++
++/// 0116: a hash of the texels from `base`, laid out as `layout` from its first byte, and the bytes
++/// it read: only rows, never the bytes between them, as a copy moves. Each slice's every row at up
++/// to [`CACHE_WHOLE_BYTES`] of source, else its first and last rows and every 16th.
++///
++/// # Safety
++///
++/// Every row of `layout` from `base` lies in mapped memory. A client may be writing it: a torn
++/// read gives a hash that differs, or one that matches what the row holds next.
++pub(super) unsafe fn cache_hash(base: *const u8, layout: &BufferLayout) -> (u64, u64) {
++    let whole = layout.row_pitch * layout.rows * layout.slices <= CACHE_WHOLE_BYTES;
++    let mut hasher = KeyHasher::default();
++    let mut bytes = 0;
++    for slice in 0..layout.slices {
++        for row in 0..layout.rows {
++            if !whole && row != 0 && row != layout.rows - 1 && !row.is_multiple_of(16) {
++                continue;
++            }
++            let at = slice * layout.slice_pitch + row * layout.row_pitch;
++            // SAFETY: the caller's contract.
++            let texels = unsafe {
++                std::slice::from_raw_parts(base.add(at as usize), layout.row_bytes as usize)
++            };
++            hasher.write(texels);
++            bytes += layout.row_bytes;
++        }
++    }
++    (hasher.finish(), bytes)
++}
++
++/// 0116: what a shadow's image holds, as its last copy in saw it.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) struct CacheHeld {
++    /// The source texels' hash (mode 2: none).
++    pub(super) hash: u64,
++    /// Where they lay: a rebind gives the buffer other pages. The extent, rows and format are the
++    /// texture's for good.
++    pub(super) base: usize,
++    /// [`cache_stamp`].
++    pub(super) stamp: u64,
++}
++
++/// 0116: `M2V_SHADOW_CACHE`'s state of one shadow (`cache_mode`). The first encoder that plans a
++/// copy records it; a command buffer left uncommitted after that leaves the image behind the
++/// hash until the bytes change.
++pub(super) struct ShadowCache {
++    buffer: WeakBuffer,
++    layout: BufferLayout,
++    held: Mutex<Option<CacheHeld>>,
++}
++
++impl ShadowCache {
++    /// The state of a shadow over `layout` of `buffer`, of `aspects`; `None` where the cache is
++    /// off, or for a depth or stencil image.
++    pub(super) fn over(
++        buffer: &Buffer,
++        layout: &BufferLayout,
++        aspects: vk::ImageAspectFlags,
++    ) -> Option<ShadowCache> {
++        (cache_mode() != 0 && aspects == vk::ImageAspectFlags::COLOR).then(|| ShadowCache {
++            buffer: buffer.downgrade(),
++            layout: *layout,
++            held: Mutex::new(None),
++        })
++    }
++
++    fn forget(&self) {
++        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
++    }
++
++    /// Whether the image still holds what a copy in would bring, for `mode`; else what it will
++    /// hold is noted, for the copy the caller then plans.
++    fn unchanged(&self, mode: u8, stamp: u64) -> bool {
++        let layout = &self.layout;
++        let base = self.buffer.upgrade().and_then(|buffer| {
++            // Pages detached from the buffer may be gone; a buffer with a host copy has its bytes
++            // where the CPU reads none.
++            if buffer.detached() || layout.end() > buffer.length() {
++                return None;
++            }
++            Some((buffer.device_contents()?, buffer))
++        });
++        let Some((contents, _buffer)) = base else {
++            self.forget();
++            return false;
++        };
++        // SAFETY: the bytes lie in the buffer's length, and `_buffer` keeps them.
++        let base = unsafe { contents.as_ptr().add(layout.offset as usize) };
++        let hash = match mode {
++            1 => {
++                let began = Instant::now();
++                // SAFETY: as above.
++                let (hash, bytes) = unsafe { cache_hash(base, layout) };
++                let took = began.elapsed().as_micros() as u64;
++                CACHE_HASHED.fetch_add(bytes, Ordering::Relaxed);
++                CACHE_HASH_US.fetch_add(took, Ordering::Relaxed);
++                hash
++            }
++            _ => 0,
++        };
++        let now = CacheHeld {
++            hash,
++            base: base as usize,
++            stamp,
++        };
++        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
++        held.replace(now) == Some(now)
++    }
++}
++
++impl ShadowCopies {
++    /// 0116: the shadow's [`ShadowCache`], where it has one.
++    fn cache(&self) -> Option<&ShadowCache> {
++        match self.target() {
++            Some(ShadowTarget::Image {
++                cache: Some(cache), ..
++            }) if !self.drops_writes => Some(cache),
++            _ => None,
++        }
++    }
++}
++
+ /// The rectangle bounding `a` and `b`, each `[x0, y0, x1, y1)`; `None` (anywhere) where either is.
+ fn bounding(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
+     let ([a0, a1, a2, a3], [b0, b1, b2, b3]) = (a?, b?);
+@@ -1053,12 +1276,16 @@
+ /// the scratch of a merge.
+ pub(super) struct ShadowSync<M = Arc<ShadowMerge>> {
+     entries: Vec<Entry<M>>,
++    /// 0116: the encoder records its calls again after a rebind, its first recording dropped with
++    /// the copies it planned: it skips none.
++    pub(super) replayed: bool,
+ }
+ 
+ impl<M> Default for ShadowSync<M> {
+     fn default() -> Self {
+         ShadowSync {
+             entries: Vec::new(),
++            replayed: false,
+         }
+     }
+ }
+@@ -1110,6 +1337,13 @@
+         entry.dirty = false;
+         entry.area = None;
+         let written = Arc::clone(&entry.copies);
++        // 0116: the buffer's bytes change as this copy runs, later than a hash now could see.
++        if cache_mode() != 0 {
++            cache_written(written.truth().0);
++            if let Some(alias) = written.alias() {
++                cache_written(alias);
++            }
++        }
+         copies.push(ShadowCopy {
+             copies: Arc::clone(&written),
+             step,
+@@ -1172,6 +1406,7 @@
+             }
+         }
+         let always = refresh_always();
++        let mode = cache_mode();
+         for shadow in shadows {
+             let i = self.entry(&shadow.copies);
+             // 0108 (B29, diagnostic): copy in before every command that uses the texture, not
+@@ -1184,18 +1419,47 @@
+                 && !kept
+                     .iter()
+                     .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
++            // 0116: skip a copy in while the image holds the bytes already (`cache_mode`). Never
++            // for a texture this command changes or keeps, or one with writes yet to copy back;
++            // those forget what the image held, as the image will differ from it. Off: mode 0.
++            let cached = if mode == 0 { None } else { shadow.copies.cache() };
++            let entry = &self.entries[i];
++            let plain = !(shadow.writes
++                || shadow.overwrites
++                || shadow.kept
++                || kept
++                    .iter()
++                    .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key)
++                || entry.dirty
++                || entry.merge.is_some()
++                || self.replayed
++                || always);
++            if let Some(cache) = cached.filter(|_| !plain) {
++                cache.forget();
++            }
+             if !self.entries[i].current {
+                 if !overwrites {
+-                    copies.push(ShadowCopy {
+-                        copies: Arc::clone(&shadow.copies),
+-                        step: Step::Into,
+-                        kept: shadow.kept,
+-                        area: None,
+-                    });
++                    let skip = plain
++                        && cached.is_some_and(|c| c.unchanged(mode, cache_stamp(&shadow.copies)));
++                    if mode != 0 {
++                        let count = if skip { &CACHE_SKIPPED } else { &CACHE_COPIES };
++                        count.fetch_add(1, Ordering::Relaxed);
++                    }
++                    if !skip {
++                        copies.push(ShadowCopy {
++                            copies: Arc::clone(&shadow.copies),
++                            step: Step::Into,
++                            kept: shadow.kept,
++                            area: None,
++                        });
++                    }
+                 }
+                 self.entries[i].current = true;
+             }
+         }
++        if mode != 0 {
++            cache_log();
++        }
+         for (shadow, merge) in kept {
+             let i = self.entry(&shadow);
+             self.entries[i].merge = Some(merge.clone());
+@@ -1213,6 +1477,17 @@
+     /// leaves its image to copy back; a write of the bytes another way leaves the images over
+     /// them stale.
+     pub(super) fn after(&mut self, shadows: &[ShadowUse], uses: &[Use<ResourceKey>]) {
++        // 0116: a later hash of these bytes may run before this command does (`cache_mode`).
++        if cache_mode() != 0 {
++            for used in uses.iter().filter(|used| !used.write.is_empty()) {
++                cache_written(used.key);
++            }
++            for shadow in shadows.iter().filter(|shadow| shadow.writes) {
++                if let Some(cache) = shadow.copies.cache() {
++                    cache.forget();
++                }
++            }
++        }
+         for entry in &mut self.entries {
+             // A texture's own uses are its image's, never its bytes'.
+             let stale = uses
+@@ -1244,6 +1519,10 @@
+     /// since its last. The encoder then forgets every texture, so a later command copies in what
+     /// that work may have written.
+     pub(super) fn leave(&mut self) -> Vec<ShadowCopy<M>> {
++        // 0116: that work reaches no `after`.
++        if cache_mode() != 0 {
++            CACHE_LEFT.fetch_add(1, Ordering::Relaxed);
++        }
+         let copies = self.finish();
+         self.entries.clear();
+         copies
+diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+@@ -3,8 +3,9 @@
+ use super::super::error::{internal, Error};
+ use super::super::host_aliases::{self, Alias};
+ use super::super::resource::ResourceKey;
++use super::super::linear_plan::BufferLayout;
+ use super::super::shadow::{
+-    self, ShadowBuffer, ShadowCopies, ShadowCopy, ShadowSource, ShadowSync, ShadowTarget,
++    self, cache_hash, ShadowBuffer, ShadowCopies, ShadowCopy, ShadowSource, ShadowSync, ShadowTarget,
+     ShadowUse, Step,
+ };
+ use super::super::tracker::{Access, Use, UseRange};
+@@ -35,6 +36,7 @@
+                 regions: Vec::new(),
+                 staging: None,
+                 texel: Some(4),
++                cache: None,
+             },
+             alias,
+         },
+@@ -689,3 +691,51 @@
+         assert_eq!(named(&copies), into);
+     }
+ }
++
++/// 0116: a texture of `rows` rows of 64 bytes, 128 bytes apart.
++fn cache_layout(rows: u64) -> BufferLayout {
++    BufferLayout {
++        offset: 0,
++        row_pitch: 128,
++        slice_pitch: 128 * rows,
++        row_bytes: 64,
++        rows,
++        slices: 1,
++    }
++}
++
++#[test]
++fn cache_hash_reads_every_row_up_to_the_whole_limit() {
++    // 2048 rows of 128 bytes: 256 KB exactly.
++    let layout = cache_layout(2048);
++    let mut bytes = vec![7u8; 128 * 2048];
++    // SAFETY: the rows lie in `bytes`.
++    let (first, read) = unsafe { cache_hash(bytes.as_ptr(), &layout) };
++    assert_eq!(read, 64 * 2048);
++    bytes[128 * 1001] ^= 1;
++    // SAFETY: as above.
++    let (second, _) = unsafe { cache_hash(bytes.as_ptr(), &layout) };
++    assert_ne!(first, second);
++}
++
++#[test]
++fn cache_hash_past_the_limit_reads_the_ends_and_every_16th_row() {
++    let layout = cache_layout(2049);
++    let mut bytes = vec![7u8; 128 * 2049];
++    let hash = |bytes: &[u8]| {
++        // SAFETY: the rows lie in `bytes`.
++        unsafe { cache_hash(bytes.as_ptr(), &layout) }
++    };
++    let (first, read) = hash(&bytes);
++    // Rows 0, 16, .. 2048, the last among them.
++    assert_eq!(read, 64 * 129);
++    for (row, seen) in [(0, true), (1, false), (16, true), (2047, false), (2048, true)] {
++        let at = 128 * row;
++        bytes[at] ^= 1;
++        assert_eq!(hash(&bytes).0 != first, seen, "row {row}");
++        bytes[at] ^= 1;
++    }
++    // The bytes between rows are no texels.
++    bytes[64] ^= 1;
++    assert_eq!(hash(&bytes).0, first);
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -2535,6 +2535,7 @@
+                         regions,
+                         staging: None,
+                         texel: None,
++                        cache: None,
+                     },
+                     // A heap's bytes join no other memory (`host_aliases.rs`).
+                     alias: None,

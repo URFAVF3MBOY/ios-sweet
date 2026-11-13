@@ -12,17 +12,35 @@
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach/mach_time.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <objc/message.h>
+#include <notify.h>
 #include <unistd.h>
 #include <string.h>
 #include "NativeBridgeMetalFrontend.h"
 #include "bridge/NativeMetalObjects.h"
 
+/*
+ * /var/local/mtl2.log, opened for appending. Clients run as mobile and cannot create or rename files in
+ * /var/local, so the log is kept small by truncating it in place (it is mode 666) once it passes 8 MB.
+ */
+static int sm2_open_log(void)
+{
+	int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
+	struct stat st;
+	if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > (8 << 20) && ftruncate(fd, 0) == 0)
+		dprintf(fd, "MTL2[%d %s]: log truncated at %lld bytes\n", getpid(), getprogname(), (long long)st.st_size);
+	return fd;
+}
+
 extern "C" void sm2_logs(const char *s)
 {
-	char buf[1500];	/* u-t: the T 5s line runs to ~800 (u-perfctr: T tu-perf lines up to 1400) */
+	char buf[700];
 	int n = snprintf(buf, sizeof(buf), "MTL2[%d %s]: %s\n", getpid(), getprogname(), s);
 	if (n > (int)sizeof(buf) - 1)
 		n = (int)sizeof(buf) - 1;
@@ -30,7 +48,7 @@ extern "C" void sm2_logs(const char *s)
 	if (console == -2)
 		console = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (file == -2)
-		file = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
+		file = sm2_open_log();
 	if (console >= 0)
 		write(console, buf, (size_t)n);
 	if (file >= 0)
@@ -144,6 +162,15 @@ static bool listed(void)
 			sm2_log("not listed (/var/local/mtl2-clients): no Metal device");
 			return;
 		}
+		/* 0108: backboardd always keeps Turnip's log (a device-lost reason lands there); the census and
+		 * mtl2-tu-debug below, or MESA_LOG_FILE in /var/local/mtl2-env, take over the path */
+		if (!strcmp(getprogname(), "backboardd")) {
+			char log[128];
+			mkdir("/var/local/turnip", 0777);
+			chmod("/var/local/turnip", 0777);
+			snprintf(log, sizeof(log), "/var/local/turnip/backboardd-%d.log", getpid());
+			setenv("MESA_LOG_FILE", log, 1);
+		}
 		/* Turnip's per-name BO census (TU_DEBUG=bos, every 300 submits: phone/turnip/patches/0101) into
 		 * /var/local/tubos/NAME-PID.log while /var/local/tubos exists (mode 777) */
 		if (access("/var/local/tubos", W_OK) == 0) {
@@ -175,13 +202,6 @@ static bool listed(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		/* the runtime's VkPipeline makings count into the telemetry (V row) */
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
-		/* u-t (r31): backboardd's frame timeline ("native-metal: T 5s" lines, Turnip's pass times) on unless
-		 * /var/local/mtl2-env says SWEET_TIMELINE=0; the shadow-copy repack (bridge 0104) off unless it says
-		 * SWEET_SHADOW_REPACK=1 (it changed nothing measurable); SWEET_TU_GPU_WAIT=1 lets Turnip leave its
-		 * waits on submitted fences to the GPU (phone/turnip/patches/0105) */
-		if (!strcmp(getprogname(), "backboardd"))
-			setenv("SWEET_TIMELINE", "1", 0);
-		setenv("SWEET_SHADOW_REPACK", "0", 0);
 		/* debugging: KEY=VALUE lines of /var/local/mtl2-env into this process's environment */
 		if (FILE *ef = fopen("/var/local/mtl2-env", "r")) {
 			char line[256];
@@ -196,27 +216,29 @@ static bool listed(void)
 			}
 			fclose(ef);
 		}
-		/* r34: Mesa's shader disk cache (Turnip is built with it) in this process's m2v cache directory: compiled ir3 shaders are
-		 * found across restarts even where the runtime's per-making VkPipelineCache records miss. SWEET_MESA_CACHE=0 turns it off. */
-		{
-			const char *knob = getenv("SWEET_MESA_CACHE");
-			if (knob && !strcmp(knob, "0")) {
-				setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
-				sm2_log("Mesa shader cache off (SWEET_MESA_CACHE=0)");
+		/* debugging: a GPU trace is for one process (backboardd, or the one named by SWEET_GPU_TRACE_PROC, e.g.
+		 * com.apple.WebKit.GPU for WebGL), one file per process instance: the other clients and a respawn would
+		 * truncate it. MESA_GPU_TRACES unset: nothing happens. /var/local/turnip is pre-created by root, mode 777 */
+		if (getenv("MESA_GPU_TRACES")) {
+			const char *tp = getenv("SWEET_GPU_TRACE_PROC");
+			if (strcmp(getprogname(), tp && *tp ? tp : "backboardd") != 0) {
+				unsetenv("MESA_GPU_TRACES");
+				unsetenv("MESA_GPU_TRACEFILE");
 			} else {
-				char mesa[300];
-				snprintf(mesa, sizeof(mesa), "%s/mesa", cache);
-				mkdir(mesa, 0777);
-				setenv("MESA_SHADER_CACHE_DIR", mesa, 0);
-				setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
-				setenv("MESA_SHADER_CACHE_DISABLE", "false", 0);
-				sm2_log("Mesa shader cache %s (%s)", getenv("MESA_SHADER_CACHE_DIR"), access(mesa, W_OK) == 0 ? "writable" : "NOT writable");
+				char trace[128];
+				snprintf(trace, sizeof(trace), "/var/local/turnip/trace-%d.log", getpid());
+				setenv("MESA_GPU_TRACEFILE", trace, 1);
+				sm2_log("GPU trace %s", trace);
 			}
 		}
-		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG), its log to /var/local/turnip-<proc>.log */
+		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG), its log to /var/local/turnip-<proc>.log (or /var/local/turnip/<proc>-<pid>.log) */
 		{
-			char opts[128] = { 0 };
-			FILE *f = fopen("/var/local/mtl2-tu-debug", "r");
+			char opts[128] = { 0 }, knob[128];
+			/* /var/local/mtl2-tu-debug.<proc> (one process, e.g. backboardd; B47) wins over the global file */
+			snprintf(knob, sizeof(knob), "/var/local/mtl2-tu-debug.%s", getprogname());
+			FILE *f = fopen(knob, "r");
+			if (!f)
+				f = fopen("/var/local/mtl2-tu-debug", "r");
 			if (f) {
 				if (fgets(opts, sizeof(opts), f))
 					opts[strcspn(opts, "\r\n")] = 0;
@@ -224,7 +246,12 @@ static bool listed(void)
 			}
 			if (opts[0]) {
 				char path[128];
-				snprintf(path, sizeof(path), "/var/local/turnip-%s.log", getprogname());
+				/* one log per process instance while /var/local/turnip exists (mode 777): a respawned
+				 * client would otherwise truncate its predecessor's log */
+				if (access("/var/local/turnip", W_OK) == 0)
+					snprintf(path, sizeof(path), "/var/local/turnip/%s-%d.log", getprogname(), getpid());
+				else
+					snprintf(path, sizeof(path), "/var/local/turnip-%s.log", getprogname());
 				setenv("TU_DEBUG", opts, 1);
 				setenv("MESA_LOG_FILE", path, 1);
 				sm2_log("TU_DEBUG=%s, log %s", opts, path);
@@ -233,22 +260,11 @@ static bool listed(void)
 		uint64_t registryID = 0;
 		IORegistryEntryGetRegistryEntryID(port, &registryID);
 		double t0 = CFAbsoluteTimeGetCurrent();
-		/*
-		 * rotfb3: a relaunched backboardd opened its device while the kernel was still freeing the crashed one's GPU pool
-		 * (r62b: "device refused: device: OutOfMemory(Device)" at 3979.2 s, the old client's 438 MB freed by 3983.2 s), and
-		 * stayed on Core Animation's CPU renderer. An OutOfMemory refusal is tried again, once a second, up to 8 times.
-		 */
-		for (int attempt = 0; attempt < 9; attempt++) {
-			@try {
-				device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
-			} @catch (NSException *e) {
-				sm2_log("device: exception %s", e.reason.UTF8String);
-				device = nil;
-			}
-			if (device || !strstr(nmb_last_error(), "OutOfMemory") || attempt == 8)
-				break;
-			sm2_log("device refused (%s): again in 1 s (%d of 8)", nmb_last_error(), attempt + 1);
-			sleep(1);
+		@try {
+			device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
+		} @catch (NSException *e) {
+			sm2_log("device: exception %s", e.reason.UTF8String);
+			device = nil;
 		}
 		sm2_log("device %s in %.0f ms (cache %s)%s%s", device ? [[device name] UTF8String] : "refused",
 			(CFAbsoluteTimeGetCurrent() - t0) * 1000, cache, device ? "" : ": ", device ? "" : nmb_last_error());
@@ -259,20 +275,6 @@ static bool listed(void)
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
-		/*
-		 * Render-target rotation: _MTLDevice answers YES, so Core Animation draws its landscape framebuffer as a
-		 * rotated (rotation 1/3) texture over the portrait panel surface. metal2vulkan holds such a texture through a
-		 * shadow image and a rotation kernel copy in and out of every pass: ~220 ms of GPU a frame on the Adreno 620
-		 * (r62b: GPU 99% busy, 30-60 of 60 frames a second dropped, landscape after ~10 s with no animation). Answering
-		 * NO makes CA keep the portrait framebuffer and rotate in its own composite, as on GPUs without the feature.
-		 * /var/local/mtl2-env SWEET_RT_ROTATION=1 keeps Metal's answer.
-		 */
-		const char *rt = getenv("SWEET_RT_ROTATION");
-		if (device && !(rt && atoi(rt))) {
-			class_replaceMethod(object_getClass(device), sel_registerName("supportsRenderTargetTextureRotation"),
-					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return NO; }), "B16@0:8");
-			sm2_log("render-target rotation: answered NO (SWEET_RT_ROTATION=1 keeps Metal's)");
-		}
 		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
@@ -281,19 +283,6 @@ static bool listed(void)
 		if (vk)
 			dladdr(vk, &tu);
 		sm2_log("images: SweetMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
-		/* u-t: Turnip's pass timeline report (phone/turnip/patches/0105) for the frontend's T line */
-		if (th) {
-			native_bridge_metal_pass_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_pass_report");
-			/* u-tr: Turnip's CPU profile (phone/turnip/patches/0110, SWEET_TU_CPUPROF=1) */
-			native_bridge_metal_cpu_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_cpu_report");
-			/* u-ub: Turnip's UBWC census (phone/turnip/patches/0111; SWEET_UBWC from /var/local/mtl2-env) */
-			native_bridge_metal_ubwc_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_ubwc_report");
-			native_bridge_metal_draw_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_draw_report");
-			/* u-perfctr: Turnip 0113's hardware counters (SWEET_TU_PERFCTR=<preset>) */
-			native_bridge_metal_perf_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_perf_report");
-			if (!native_bridge_metal_pass_report && !strcmp(getprogname(), "backboardd"))
-				sm2_log("timeline: sweet_tu_pass_report not exported by Turnip: no pass times");
-		}
 		/* backboardd: the frontend's counters every 10 s, into /var/local/mtl2.log only (with /var/local/mtl2-telemetry) */
 		if (device && !strcmp(getprogname(), "backboardd"))
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -303,7 +292,7 @@ static bool listed(void)
 						continue;
 					static char text[8192];
 					native_bridge_metal_telemetry(text, sizeof(text));
-					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND | O_CREAT, 0666);	/* made if missing (r19a had none) */
+					int fd = sm2_open_log();
 					if (fd >= 0) {
 						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
 						close(fd);
@@ -314,3 +303,979 @@ static bool listed(void)
 	return device;
 }
 @end
+
+/*
+ * Control Center flashlight (switch file /var/local/sweet-flashlight, SpringBoard only): AVFlashlight's methods are
+ * replaced so they drive the kernel's kern.sweet_torch (mA, sweettorch=1) instead of the camera stack (no Fig object).
+ * Level 1.0 = 100 mA, the kernel's cap.
+ */
+static float sm2_torch_level;	/* the stored level, 0 = off */
+static float sm2_torch_last = 1.0f;
+
+static BOOL sm2_torch_set(id self, float level)
+{
+	int ma = (int)(level * 100.0f + 0.5f);
+	if (ma < 0)
+		ma = 0;
+	int err = sysctlbyname("kern.sweet_torch", NULL, NULL, &ma, sizeof(ma));
+	if (err)
+		sm2_log("flashlight: kern.sweet_torch=%d failed (%d)", ma, errno);
+	else if (ma)
+		sm2_log("flashlight: on %d mA", ma);
+	else
+		sm2_log("flashlight: off");
+	[self willChangeValueForKey:@"flashlightLevel"];
+	sm2_torch_level = err ? 0.0f : level;
+	if (!err && level > 0.0f)
+		sm2_torch_last = level;
+	[self didChangeValueForKey:@"flashlightLevel"];
+	return err == 0;
+}
+
+static void sm2_torch_swizzle(void)
+{
+	Class c = objc_getClass("AVFlashlight");
+	if (!c)
+		return;
+	Class m = object_getClass(c);
+	struct { Class cls; const char *sel; id imp; } r[] = {
+		{ m, "hasFlashlight", ^BOOL(id s) { return YES; } },
+		{ c, "init", ^id(id s) {
+			struct objc_super sup = { s, [NSObject class] };
+			return ((id (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, @selector(init));
+		} },
+		{ c, "dealloc", ^void(id s) {
+			struct objc_super sup = { s, [NSObject class] };
+			((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, NSSelectorFromString(@"dealloc"));
+		} },
+		{ c, "isAvailable", ^BOOL(id s) { return YES; } },
+		{ c, "isOverheated", ^BOOL(id s) { return NO; } },
+		{ c, "turnPowerOnWithError:", ^BOOL(id s, NSError **e) { return sm2_torch_set(s, sm2_torch_last); } },
+		{ c, "turnPowerOff", ^void(id s) { sm2_torch_set(s, 0.0f); } },
+		{ c, "setFlashlightLevel:withError:", ^BOOL(id s, float level, NSError **e) {
+			sm2_log("flashlight: level %.2f", level);
+			return sm2_torch_set(s, level);
+		} },
+		{ c, "flashlightLevel", ^float(id s) { return sm2_torch_level; } },
+	};
+	for (auto &x : r) {
+		Method mt = class_getInstanceMethod(x.cls, sel_registerName(x.sel));
+		if (!mt) {
+			sm2_log("flashlight: AVFlashlight %s missing", x.sel);
+			continue;
+		}
+		method_setImplementation(mt, imp_implementationWithBlock(x.imp));
+	}
+	sm2_log("flashlight: AVFlashlight -> kern.sweet_torch");
+}
+
+/* Control Center drops modules whose UIRequiredDeviceCapabilities MobileGestalt denies (FlashlightModule: camera-flash,
+ * k90a: no tile). Clear them for that module only; the original list is logged once. */
+static void sm2_torch_module(void)
+{
+	if (!dlopen("/System/Library/PrivateFrameworks/ControlCenterServices.framework/ControlCenterServices", RTLD_NOW))
+		sm2_log("flashlight: ControlCenterServices: %s", dlerror());
+	Class c = objc_getClass("CCSModuleMetadata");
+	SEL s = sel_registerName("requiredDeviceCapabilities");
+	Method mt = c ? class_getInstanceMethod(c, s) : NULL;
+	if (!mt) {
+		sm2_log("flashlight: CCSModuleMetadata%s missing", c ? " -requiredDeviceCapabilities" : "");
+		return;
+	}
+	IMP orig = method_getImplementation(mt);
+	method_setImplementation(mt, imp_implementationWithBlock(^id(id self) {
+		id caps = ((id (*)(id, SEL))orig)(self, s);
+		id mid = [self respondsToSelector:@selector(moduleIdentifier)] ? [self performSelector:@selector(moduleIdentifier)] : nil;
+		if (![mid isEqual:@"com.apple.control-center.FlashlightModule"])
+			return caps;
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			sm2_log("flashlight: module caps %s cleared", [[caps description] UTF8String]);
+		}
+		return [caps isKindOfClass:[NSSet class]] ? (id)[NSSet set] : (id)@[];
+	}));
+	sm2_log("flashlight: CCSModuleMetadata caps hook");
+}
+
+__attribute__((constructor)) static void sm2_torch_init(void)
+{
+	if (strcmp(getprogname(), "SpringBoard") != 0 || access("/var/local/sweet-flashlight", F_OK) != 0)
+		return;
+	/* SBUIFlashlightController makes its AVFlashlight later; loading the framework now is enough to swizzle first. */
+	if (!dlopen("/System/Library/PrivateFrameworks/AVFCapture.framework/AVFCapture", RTLD_NOW))
+		sm2_log("flashlight: AVFCapture: %s", dlerror());
+	sm2_torch_swizzle();
+	sm2_torch_module();
+}
+
+/*
+ * Orientation from a file (no sensors; /var/local/sweet-orient, SpringBoard only): a 1 s timer reads one
+ * UIDeviceOrientation (1 portrait, 2 upside down, 3 landscape left, 4 landscape right). "N" = method A, AX
+ * setDeviceOrientation:; "B N" = method B, SpringBoard's SBDeviceOrientationUpdateManager; "C N" = method C,
+ * BKSHIDServicesSetDeviceOrientationForAutomation after an orientation unlock; "D N [S]" = method D, in backboardd:
+ * BKOrientationManager updateDeviceOrientation:N changeSource:S; "P" = read-only scene/host probe in SpringBoard;
+ * "S N [f]" = write the front app scenes' settings orientation (f: also swap the frame); "R N" = D N 0 + E N + S N, kept for new apps;
+ * "T X Y" = tap, "W X1 Y1 X2 Y2 MS" = swipe (backboardd, X/Y normalized 0..1 portrait). Delete the file to turn it off.
+ */
+static void sm2_orient_b(long n)
+{
+	Class c = objc_getClass("SBDeviceOrientationUpdateManager");
+	if (!c) {
+		sm2_log("orient: SBDeviceOrientationUpdateManager missing");
+		return;
+	}
+	unsigned cnt = 0;
+	Method *ms = class_copyMethodList(object_getClass(c), &cnt);
+	for (unsigned i = 0; i < cnt; i++)
+		sm2_log("orient: B class method +%s", sel_getName(method_getName(ms[i])));
+	free(ms);
+	id mgr = nil;
+	static const char *const names[] = { "sharedInstance", "sharedManager", "defaultManager" };
+	for (const char *s : names)
+		if (class_respondsToSelector(object_getClass(c), sel_registerName(s))) {
+			mgr = ((id (*)(id, SEL))objc_msgSend)(c, sel_registerName(s));
+			break;
+		}
+	if (!mgr) {
+		id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("SpringBoard"), sel_registerName("sharedApplication"));
+		id objs[] = { app, app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("delegate")) : nil };
+		for (id o : objs) {
+			unsigned ni = 0;
+			Ivar *iv = o ? class_copyIvarList(object_getClass(o), &ni) : NULL;
+			for (unsigned i = 0; i < ni && !mgr; i++) {
+				const char *t = ivar_getTypeEncoding(iv[i]);
+				if (t && strstr(t, "SBDeviceOrientationUpdateManager"))
+					mgr = object_getIvar(o, iv[i]);
+			}
+			free(iv);
+		}
+	}
+	sm2_log("orient: B manager %p", mgr);
+	if (!mgr)
+		return;
+	SEL e = sel_registerName("_enqueueOrientationUpdateToDeviceOrientation:");
+	SEL l = sel_registerName("_legacy_enqueueOrientationUpdateToDeviceOrientation:source:");
+	if ([mgr respondsToSelector:e]) {
+		((void (*)(id, SEL, long))objc_msgSend)(mgr, e, n);
+		sm2_log("orient: B enqueue %ld", n);
+	} else if ([mgr respondsToSelector:l]) {
+		((void (*)(id, SEL, long, long))objc_msgSend)(mgr, l, n, 0);
+		sm2_log("orient: B legacy enqueue %ld", n);
+	} else
+		sm2_log("orient: B no enqueue selector");
+}
+
+static void sm2_orient_a(long n)
+{
+	Class c = objc_getClass("AXBackBoardServer");
+	SEL s = sel_registerName("setDeviceOrientation:");
+	Method m = c ? class_getInstanceMethod(c, s) : NULL;
+	if (!m) {
+		sm2_log("orient: AXBackBoardServer%s missing", c ? " -setDeviceOrientation:" : "");
+		return;
+	}
+	id srv = ((id (*)(id, SEL))objc_msgSend)(c, sel_registerName("server"));
+	sm2_log("orient: AX setDeviceOrientation %ld (types %s, server %p)", n, method_getTypeEncoding(m), srv);
+	((void (*)(id, SEL, long))objc_msgSend)(srv, s, n);
+}
+
+/* Method C: backboardd's automation entry (BackBoardServices MIG), as if the sensor reported it; unlock first. */
+static void sm2_orient_c(long n)
+{
+	static void (*set_auto)(int), (*unlock_o)(void);
+	static bool loaded;
+	if (!loaded) {
+		loaded = true;
+		void *h = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+		set_auto = h ? (void (*)(int))dlsym(h, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
+		unlock_o = h ? (void (*)(void))dlsym(h, "BKSHIDServicesUnlockOrientation") : NULL;
+		sm2_log("orient: C set %p unlock %p", (void *)set_auto, (void *)unlock_o);
+	}
+	Class lc = objc_getClass("SBOrientationLockManager");
+	id lm = [lc respondsToSelector:@selector(sharedInstance)] ? [lc performSelector:@selector(sharedInstance)] : nil;
+	SEL ul = sel_registerName("unlock"), il = sel_registerName("isUserLocked");
+	int locked = [lm respondsToSelector:il] ? ((BOOL (*)(id, SEL))objc_msgSend)(lm, il) : -1;
+	if ([lm respondsToSelector:ul])
+		((void (*)(id, SEL))objc_msgSend)(lm, ul);
+	if (unlock_o)
+		unlock_o();
+	if (set_auto)
+		set_auto((int)n);
+	sm2_log("orient: C %ld (lock mgr %p, was locked %d)", n, lm, locked);
+}
+
+/* Method D (backboardd only): BKOrientationManager holds the system orientation and is fed by CoreMotion, which never
+ * reports here. Set it directly ("D N [SOURCE]") and stop CoreMotion updates from resetting it. */
+static void sm2_cm_drop(id self, SEL _cmd, id o) {}
+
+static void sm2_orient_d(long n, long src)
+{
+	Class k = objc_getClass("BKOrientationManager");
+	SEL up = sel_registerName("updateDeviceOrientation:changeSource:"), sh = sel_registerName("sharedInstance");
+	if (!k || ![k respondsToSelector:sh]) {
+		sm2_log("orient: D BKOrientationManager missing");
+		return;
+	}
+	id m = ((id (*)(id, SEL))objc_msgSend)(k, sh);
+	static bool dropped;
+	Method cm = class_getInstanceMethod(k, sel_registerName("_queue_updateDeviceOrientationFromCoreMotion:"));
+	if (cm && !dropped) {
+		dropped = true;
+		method_setImplementation(cm, (IMP)sm2_cm_drop);
+	}
+	if (![m respondsToSelector:up]) {
+		sm2_log("orient: D -updateDeviceOrientation:changeSource: missing");
+		return;
+	}
+	((void (*)(id, SEL, long, long))objc_msgSend)(m, up, n, src);
+	SEL ef = sel_registerName("effectiveDeviceOrientation");
+	long e = [m respondsToSelector:ef] ? ((long (*)(id, SEL))objc_msgSend)(m, ef) : -1;
+	sm2_log("orient: D %ld source %ld -> effective %ld (CoreMotion hook %d)", n, src, e, cm != NULL);
+}
+
+/* Rotation probe (SpringBoard, on "D" lines): what SpringBoard sees ~1.5 s after backboardd changed the orientation. */
+static void sm2_orient_probe(long n)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		uint64_t st[3] = { 0, 0, 0 };
+		const char *k[3] = { "com.apple.backboardd.orientation", "com.apple.backboardd.rawOrientation",
+			"com.apple.backboardd.orientationlock" };
+		for (int i = 0; i < 3; i++) {
+			int t = 0;
+			if (notify_register_check(k[i], &t) == NOTIFY_STATUS_OK) {
+				notify_get_state(t, &st[i]);
+				notify_cancel(t);
+			}
+		}
+		id dev = [objc_getClass("UIDevice") respondsToSelector:@selector(currentDevice)] ?
+		    [objc_getClass("UIDevice") performSelector:@selector(currentDevice)] : nil;
+		SEL os = sel_registerName("orientation"), ai = sel_registerName("activeInterfaceOrientation");
+		long dor = [dev respondsToSelector:os] ? ((long (*)(id, SEL))objc_msgSend)(dev, os) : -1;
+		Class ac = objc_getClass("UIApplication");
+		id app = [ac respondsToSelector:@selector(sharedApplication)] ? [ac performSelector:@selector(sharedApplication)] : nil;
+		long aio = [app respondsToSelector:ai] ? ((long (*)(id, SEL))objc_msgSend)(app, ai) : -1;
+		Class lc = objc_getClass("SBOrientationLockManager");
+		id lm = [lc respondsToSelector:@selector(sharedInstance)] ? [lc performSelector:@selector(sharedInstance)] : nil;
+		SEL il = sel_registerName("isUserLocked");
+		int locked = [lm respondsToSelector:il] ? ((BOOL (*)(id, SEL))objc_msgSend)(lm, il) : -1;
+		sm2_log("orient: SB probe after D %ld: notify orientation %llu raw %llu lock %llu, UIDevice %ld, app interface %ld, locked %d",
+		    n, st[0], st[1], st[2], dor, aio, locked);
+		/* the foreground app scenes' settings as FrontBoard holds them (frame + orientation) */
+		@try {
+			Class fm = objc_getClass("FBSceneManager");
+			id mgr = [fm respondsToSelector:@selector(sharedInstance)] ? [fm performSelector:@selector(sharedInstance)] : nil;
+			id scenes = nil;
+			for (NSString *k in @[ @"allScenes", @"scenes" ]) {
+				if ([mgr respondsToSelector:NSSelectorFromString(k)]) {
+					scenes = [mgr valueForKey:k];
+					break;
+				}
+			}
+			for (id sc in scenes) {
+				NSString *ident = [[sc valueForKey:@"identifier"] description];
+				if ([ident rangeOfString:@"com.apple."].location == NSNotFound || [ident rangeOfString:@"springboard"].location != NSNotFound)
+					continue;
+				id set = [sc valueForKey:@"settings"];
+				sm2_log("orient: SB scene %s: frame %s orientation %s fg %s", [ident UTF8String],
+				    [[[set valueForKey:@"frame"] description] UTF8String],
+				    [[[set valueForKey:@"interfaceOrientation"] description] UTF8String],
+				    [[[set valueForKey:@"foreground"] description] UTF8String]);
+			}
+		} @catch (id ex) {
+			sm2_log("orient: SB scene probe exception %s", [[ex description] UTF8String]);
+		}
+	});
+}
+
+/* Method E (SpringBoard): iOS 16 rotates app scenes only from the traits pipeline's BKSAccelerometer delegate callback,
+ * which never fires without an accelerometer. Capture SBTraitsEmbeddedDisplayPipelineManager at init and call
+ * -accelerometer:didChangeDeviceOrientation: ourselves ("E N"). */
+static id sm2_traits_pm;
+
+static void sm2_orient_e_hook(void)
+{
+	Class k = objc_getClass("SBTraitsEmbeddedDisplayPipelineManager");
+	SEL in = sel_registerName("initWithArbiter:sceneDelegate:");
+	Method m = k ? class_getInstanceMethod(k, in) : NULL;
+	if (!m) {
+		sm2_log("orient: E SBTraitsEmbeddedDisplayPipelineManager %s missing", k ? "-initWithArbiter:sceneDelegate:" : "class");
+		return;
+	}
+	IMP orig = method_getImplementation(m);
+	method_setImplementation(m, imp_implementationWithBlock(^id(id self, id arb, id del) {
+		id r = ((id (*)(id, SEL, id, id))orig)(self, in, arb, del);
+		sm2_traits_pm = r;
+		sm2_log("orient: E pipeline manager %p", r);
+		return r;
+	}));
+}
+
+static void sm2_orient_e(long n)
+{
+	id pm = sm2_traits_pm;
+	SEL cb = sel_registerName("accelerometer:didChangeDeviceOrientation:");
+	if (!pm || ![pm respondsToSelector:cb]) {
+		sm2_log("orient: E no pipeline manager (%p)", pm);
+		return;
+	}
+	/* gate 2: orientation events are only enabled while SpringBoard thinks the backlight is on */
+	static bool bl;
+	SEL ib = sel_registerName("_isBacklightOn"), up = sel_registerName("_updateOrientationEventsEnabledState");
+	Method bm = class_getInstanceMethod(object_getClass(pm), ib);
+	if (bm && !bl) {
+		bl = true;
+		BOOL was = ((BOOL (*)(id, SEL))objc_msgSend)(pm, ib);
+		method_setImplementation(bm, imp_implementationWithBlock(^BOOL(id self) { return YES; }));
+		sm2_log("orient: E _isBacklightOn was %d, now forced YES", was);
+	}
+	if ([pm respondsToSelector:up])
+		((void (*)(id, SEL))objc_msgSend)(pm, up);
+	id acc = nil;
+	@try {
+		acc = [pm valueForKey:@"_accelerometer"];
+	} @catch (id ex) {
+	}
+	((void (*)(id, SEL, id, long long))objc_msgSend)(pm, cb, acc, (long long)n);
+	sm2_log("orient: E %ld (accelerometer %p)", n, acc);
+}
+
+/* B35: Settings > Privacy hides the Location Services row when CoreTelephony's getSubscriptionInfo fails (no CommCenter
+ * on this port): -[PUIPrivacyController refreshLocationServicesAvailable] then leaves the cached value nil = NO
+ * (research/notes/b35-location-row.md). In Preferences, replace that method with one that caches @YES. PrivacySettingsUI
+ * loads late, so try on every image add until the class exists. */
+static void sm2_b35_refresh(id self, SEL _cmd)
+{
+	((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("set_cachedLocationServicesAvailableValue:"), @YES);
+}
+
+static void sm2_b35_try(const struct mach_header *mh, intptr_t slide)
+{
+	static bool done;
+	if (done)
+		return;
+	Class c = objc_getClass("PUIPrivacyController");
+	if (!c)
+		return;
+	done = true;
+	Method m = class_getInstanceMethod(c, sel_registerName("refreshLocationServicesAvailable"));
+	bool setter = class_getInstanceMethod(c, sel_registerName("set_cachedLocationServicesAvailableValue:")) != NULL;
+	if (m && setter)
+		method_setImplementation(m, (IMP)sm2_b35_refresh);
+	sm2_log("b35: PUIPrivacyController refresh %p setter %d -> %s", m, setter, m && setter ? "hooked" : "not hooked");
+}
+
+__attribute__((constructor)) static void sm2_b35_init(void)
+{
+	if (strcmp(getprogname(), "Preferences") != 0)
+		return;
+	sm2_log("b35: loaded in Preferences");
+	_dyld_register_func_for_add_image(sm2_b35_try);
+}
+
+/* Rotation probe in app processes (MobileSafari etc.): after each change of /var/local/sweet-orient, log what the app's
+ * UIKit sees (scene orientation, coordinate space, key window bounds + transform). Read-only. */
+__attribute__((constructor)) static void sm2_app_orient_probe(void)
+{
+	const char *pn = getprogname();
+	if (!strcmp(pn, "SpringBoard") || !strcmp(pn, "backboardd") || strcmp(pn, "MobileSafari") != 0 ||
+	    access("/var/local/sweet-orient", F_OK) != 0)
+		return;
+	static dispatch_source_t t;
+	t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+	dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+	dispatch_source_set_event_handler(t, ^{
+		static struct timespec last;
+		static int pending;
+		struct stat st;
+		if (stat("/var/local/sweet-orient", &st) == 0 && (st.st_mtimespec.tv_sec != last.tv_sec ||
+		    st.st_mtimespec.tv_nsec != last.tv_nsec)) {
+			last = st.st_mtimespec;
+			pending = 2;	/* log on the 2nd tick after the change (~1.5 s) */
+			return;
+		}
+		if (!pending || --pending)
+			return;
+		@try {
+			id app = [objc_getClass("UIApplication") performSelector:@selector(sharedApplication)];
+			id win = [app respondsToSelector:@selector(keyWindow)] ? [app performSelector:@selector(keyWindow)] : nil;
+			id scene = [win respondsToSelector:@selector(windowScene)] ? [win performSelector:@selector(windowScene)] : nil;
+			SEL io = sel_registerName("interfaceOrientation");
+			long o = [scene respondsToSelector:io] ? ((long (*)(id, SEL))objc_msgSend)(scene, io) : -1;
+			id cs = [scene respondsToSelector:@selector(coordinateSpace)] ? [scene performSelector:@selector(coordinateSpace)] : nil;
+			NSString *csb = cs ? [[cs valueForKey:@"bounds"] description] : @"?";
+			NSString *wb = win ? [[win valueForKey:@"bounds"] description] : @"?";
+			NSString *tf = win ? [[[win valueForKey:@"layer"] valueForKey:@"transform"] description] : @"?";
+			sm2_log("orient: app probe: scene orientation %ld, scene bounds %s, key window %p bounds %s, layer transform %s",
+			    o, [csb UTF8String], win, [wb UTF8String], [tf UTF8String]);
+		} @catch (id ex) {
+			sm2_log("orient: app probe exception %s", [[ex description] UTF8String]);
+		}
+	});
+	dispatch_resume(t);
+	sm2_log("orient: app probe in %s", pn);
+}
+
+/* Probe "P" (SpringBoard, read-only): the front app's scene settings and SpringBoard's scene host views (frame,
+ * layer transforms, window orientation), to see where the rotation stops on the compositing side. */
+static id sm2_get(id o, const char *sel)
+{
+	SEL s = sel_registerName(sel);
+	if (!o)
+		return nil;
+	if (![o respondsToSelector:s]) {
+		sm2_log("orient: P %s missing %s", class_getName(object_getClass(o)), sel);
+		return nil;
+	}
+	return [o valueForKey:@(sel)];
+}
+
+static const char *sm2_desc(id o)
+{
+	return o ? [[o description] UTF8String] : "nil";
+}
+
+static void sm2_tf_str(id v, char *out, size_t len)
+{
+	double m[16] = {0};	/* CATransform3D is 16 CGFloats (double on arm64) */
+	if ([v isKindOfClass:[NSValue class]] && strcmp([v objCType], "{CATransform3D=dddddddddddddddd}") == 0)
+		[v getValue:m size:sizeof(m)];
+	else {
+		snprintf(out, len, "?");
+		return;
+	}
+	snprintf(out, len, "m11 %g m12 %g m21 %g m22 %g m41 %g m42 %g", m[0], m[1], m[4], m[5], m[12], m[13]);
+}
+
+static void sm2_probe_views(id v, int *count)
+{
+	if (*count >= 20 || !v)
+		return;
+	const char *cn = class_getName(object_getClass(v));
+	if (strstr(cn, "SceneLayerHost") || strstr(cn, "SceneHost")) {
+		(*count)++;
+		char t[160], st[160];
+		id layer = [v valueForKey:@"layer"];
+		sm2_tf_str([layer valueForKey:@"transform"], t, sizeof(t));
+		sm2_tf_str([layer valueForKey:@"sublayerTransform"], st, sizeof(st));
+		id w = sm2_get(v, "window");
+		id wo = sm2_get(w, "interfaceOrientation");
+		sm2_log("orient: P view %s frame %s bounds %s transform %s sublayer %s window %s level %s orientation %s", cn,
+		    sm2_desc([v valueForKey:@"frame"]), sm2_desc([v valueForKey:@"bounds"]), t, st,
+		    w ? class_getName(object_getClass(w)) : "nil", sm2_desc(sm2_get(w, "windowLevel")), sm2_desc(wo));
+	}
+	for (id sv in [v valueForKey:@"subviews"])
+		sm2_probe_views(sv, count);
+}
+
+/* iOS 16.7 front app scenes (rotation-ios16.md): SBMainDisplaySceneManager's foreground app scene handles, else
+ * SBSceneManager sceneIdentityForApplication: -> existingSceneHandleForSceneIdentity: for the front app. */
+static NSArray *sm2_front_scenes(id fa, bool verbose, NSMutableArray *hout = nil, bool all = false)
+{
+	NSMutableArray *out = [NSMutableArray array];
+	id mgr = nil, handles = nil;
+	@try {
+		Class k = objc_getClass("SBSceneManagerCoordinator");
+		SEL md = sel_registerName("mainDisplaySceneManager");
+		mgr = [k respondsToSelector:md] ? ((id (*)(id, SEL))objc_msgSend)(k, md) : nil;
+		/* B20 rot5: all = every app scene handle (background ones too) */
+		handles = sm2_get(mgr, all ? "externalApplicationSceneHandles" : "externalForegroundApplicationSceneHandles");
+		if (![handles count] && fa && !all) {
+			SEL si = sel_registerName("sceneIdentityForApplication:"), eh = sel_registerName("existingSceneHandleForSceneIdentity:");
+			id ident = [mgr respondsToSelector:si] ? ((id (*)(id, SEL, id))objc_msgSend)(mgr, si, fa) : nil;
+			id h = ident && [mgr respondsToSelector:eh] ? ((id (*)(id, SEL, id))objc_msgSend)(mgr, eh, ident) : nil;
+			if (verbose)
+				sm2_log("orient: P fallback identity %s handle %p", sm2_desc(ident), h);
+			handles = h ? @[ h ] : nil;
+		}
+	} @catch (id ex) {
+		sm2_log("orient: scene lookup exception %s", [[ex description] UTF8String]);
+	}
+	if (verbose)
+		sm2_log("orient: P scene manager %p, %lu foreground handles", mgr, (unsigned long)[handles count]);
+	for (id h in handles) {
+		@try {
+			if (verbose)
+				sm2_log("orient: P handle %s currentInterfaceOrientation %s supported %s", class_getName(object_getClass(h)),
+				    sm2_desc(sm2_get(h, "currentInterfaceOrientation")),
+				    sm2_desc(sm2_get(h, "_mainSceneSupportedInterfaceOrientations")));
+			id sc = sm2_get(h, "sceneIfExists");
+			if (sc) {
+				[out addObject:sc];
+				[hout addObject:h];
+			}
+		} @catch (id ex) {
+			sm2_log("orient: handle exception %s", [[ex description] UTF8String]);
+		}
+	}
+	return out;
+}
+
+static void sm2_orient_p(void)
+{
+	Class ac = objc_getClass("UIApplication");
+	id app = [ac respondsToSelector:@selector(sharedApplication)] ? [ac performSelector:@selector(sharedApplication)] : nil;
+	sm2_log("orient: P activeInterfaceOrientation %s", sm2_desc(sm2_get(app, "activeInterfaceOrientation")));
+	/* 1. front app and its scene */
+	id fa = sm2_get(app, "_accessibilityFrontMostApplication");
+	sm2_log("orient: P front app %s %s", fa ? class_getName(object_getClass(fa)) : "nil", sm2_desc(sm2_get(fa, "bundleIdentifier")));
+	for (id sc in sm2_front_scenes(fa, true)) {
+		id set = sm2_get(sc, "settings"), cs = sm2_get(sc, "clientSettings");
+		sm2_log("orient: P scene %s settings %s orientation %s frame %s deviceOrientation %s",
+		    sm2_desc(sm2_get(sc, "identifier")), set ? class_getName(object_getClass(set)) : "nil",
+		    sm2_desc(sm2_get(set, "interfaceOrientation")), sm2_desc(sm2_get(set, "frame")),
+		    [set respondsToSelector:sel_registerName("deviceOrientation")] ? sm2_desc([set valueForKey:@"deviceOrientation"]) : "n/a");
+		sm2_log("orient: P scene clientSettings %s orientation %s", cs ? class_getName(object_getClass(cs)) : "nil",
+		    sm2_desc(sm2_get(cs, "interfaceOrientation")));
+	}
+	/* 2. scene host views in all of SpringBoard's windows */
+	NSMutableArray *ws = [NSMutableArray arrayWithArray:sm2_get(app, "windows") ?: @[]];
+	SEL aw = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	if ([ac respondsToSelector:aw])
+		for (id w in ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(ac, aw, YES, NO))
+			if (![ws containsObject:w])
+				[ws addObject:w];
+	sm2_log("orient: P %lu windows", (unsigned long)ws.count);
+	int count = 0;
+	for (id w in ws)
+		sm2_probe_views(w, &count);
+	sm2_log("orient: P done, %d scene host views", count);
+}
+
+/* "S N [f]" (SpringBoard, patch B20 experiment): write interfaceOrientation (+ deviceOrientation) straight into the front
+ * app scenes' settings, optionally swapping the frame, then re-read at 0.5 s and 2 s to see if SpringBoard reverts it. */
+struct sm2_rect { double x, y, w, h; };
+
+static void sm2_orient_s(long n, bool swap)
+{
+	Class ac = objc_getClass("UIApplication");
+	id app = [ac respondsToSelector:@selector(sharedApplication)] ? [ac performSelector:@selector(sharedApplication)] : nil;
+	id fa = sm2_get(app, "_accessibilityFrontMostApplication");
+	NSArray *scenes = sm2_front_scenes(fa, false);
+	if (!scenes.count)
+		sm2_log("orient: S %ld: no front scene", n);
+	SEL ub = sel_registerName("updateSettingsWithBlock:");
+	for (id sc in scenes) {
+		const char *ident = sm2_desc(sm2_get(sc, "identifier"));
+		if (![sc respondsToSelector:ub]) {
+			sm2_log("orient: S %s missing updateSettingsWithBlock:", ident);
+			continue;
+		}
+		__block bool dev = false, fr = false;
+		__block sm2_rect r = {0, 0, 0, 0};
+		((void (*)(id, SEL, void (^)(id)))objc_msgSend)(sc, ub, ^(id s) {
+			SEL so = sel_registerName("setInterfaceOrientation:"), sd = sel_registerName("setDeviceOrientation:");
+			SEL sf = sel_registerName("setFrame:"), gf = sel_registerName("frame");
+			if ([s respondsToSelector:so])
+				((void (*)(id, SEL, long long))objc_msgSend)(s, so, (long long)n);
+			if ((dev = [s respondsToSelector:sd]))
+				((void (*)(id, SEL, long long))objc_msgSend)(s, sd, (long long)n);
+			if (swap && [s respondsToSelector:sf] && [s respondsToSelector:gf]) {
+				r = ((sm2_rect (*)(id, SEL))objc_msgSend)(s, gf);
+				sm2_rect q = { r.x, r.y, r.h, r.w };
+				((void (*)(id, SEL, sm2_rect))objc_msgSend)(s, sf, q);
+				fr = true;
+			}
+		});
+		sm2_log("orient: S %ld applied to %s (deviceOrientation %d)", n, ident, dev);
+		if (fr)
+			sm2_log("orient: S frame swapped from %gx%g to %gx%g", r.w, r.h, r.h, r.w);
+		static const int delays[] = { 500, 2000 };
+		for (int ms : delays)
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+				@try {
+					id set = sm2_get(sc, "settings");
+					sm2_log("orient: S after %d ms %s: orientation %s frame %s deviceOrientation %s", ms,
+					    sm2_desc(sm2_get(sc, "identifier")), sm2_desc(sm2_get(set, "interfaceOrientation")),
+					    sm2_desc(sm2_get(set, "frame")),
+					    [set respondsToSelector:sel_registerName("deviceOrientation")] ? sm2_desc([set valueForKey:@"deviceOrientation"]) : "n/a");
+				} @catch (id ex) {
+					sm2_log("orient: S recheck exception %s", [[ex description] UTF8String]);
+				}
+			});
+	}
+}
+
+/* "R N" (patch B20, rotation for daily use; delete /var/local/sweet-orient to turn off): backboardd does "D N 0",
+ * SpringBoard does "E N" and then writes N into the front app scenes (frame kept portrait). The last R is remembered:
+ * the 1 s timer re-applies it to new front scenes whose supported mask has N. "R 1" restores portrait (also kept). */
+static long sm2_r_orient;
+
+static void sm2_orient_r_apply(long n, bool reapply)
+{
+	Class ac = objc_getClass("UIApplication");
+	id app = [ac respondsToSelector:@selector(sharedApplication)] ? [ac performSelector:@selector(sharedApplication)] : nil;
+	NSMutableArray *hs = [NSMutableArray array];
+	/* B20 rot5: R N goes to all app scenes (background apps kept the old orientation in rot4); the re-apply only to
+	 * the front ones, logging each change of the front set. */
+	/* B20 rot7: rot5/rot6 (all scenes via externalApplicationSceneHandles) logged "applied" but the screen stayed
+	 * portrait; front scenes again come first exactly like S (worked in rot3/rot4), then the background ones not in
+	 * the front set. Pointers logged to see whether both lists return the same objects. */
+	id fa = sm2_get(app, "_accessibilityFrontMostApplication");
+	NSMutableArray *scenes = [NSMutableArray arrayWithArray:sm2_front_scenes(fa, false, hs)];
+	NSUInteger nfront = scenes.count;
+	if (!reapply) {
+		NSMutableSet *fids = [NSMutableSet set];
+		for (NSUInteger i = 0; i < nfront; i++) {
+			[fids addObject:[NSString stringWithFormat:@"%@", sm2_get(scenes[i], "identifier")]];
+			sm2_log("orient: R front %s scene %p handle %p", sm2_desc(sm2_get(scenes[i], "identifier")), scenes[i], hs[i]);
+		}
+		NSMutableArray *ahs = [NSMutableArray array];
+		NSArray *all = sm2_front_scenes(fa, false, ahs, true);
+		for (NSUInteger i = 0; i < all.count; i++) {
+			NSString *aid = [NSString stringWithFormat:@"%@", sm2_get(all[i], "identifier")];
+			bool dup = [fids containsObject:aid];
+			sm2_log("orient: R %s %s scene %p handle %p", dup ? "all-list (front dup)" : "background", [aid UTF8String],
+			    all[i], ahs[i]);
+			if (!dup) {
+				[scenes addObject:all[i]];
+				[hs addObject:ahs[i]];
+			}
+		}
+	}
+	if (reapply) {
+		static NSString *last_front;
+		NSMutableArray *ids = [NSMutableArray array], *os = [NSMutableArray array];
+		for (id sc in scenes) {
+			[ids addObject:[NSString stringWithFormat:@"%@", sm2_get(sc, "identifier")]];
+			[os addObject:[NSString stringWithFormat:@"%@", sm2_get(sm2_get(sc, "settings"), "interfaceOrientation")]];
+		}
+		NSString *f = [ids componentsJoinedByString:@","];
+		static int stable;
+		if (!last_front || ![f isEqualToString:last_front]) {
+			last_front = f;
+			stable = 0;
+			sm2_log("orient: R front now %s (orientations %s)", f.length ? [f UTF8String] : "none",
+			    [[os componentsJoinedByString:@","] UTF8String]);
+		}
+		/* rot10/rot11: Safari re-applied on its first front tick (still launching) drew only the left ~45%; R sent
+		 * with Safari already in front drew full width. Wait until the front set has been the same for 2 more ticks. */
+		if (++stable < 3)
+			return;
+	}
+	SEL ub = sel_registerName("updateSettingsWithBlock:");
+	for (NSUInteger i = 0; i < scenes.count; i++) {
+		id sc = scenes[i], h = hs[i];
+		const char *ident = sm2_desc(sm2_get(sc, "identifier"));
+		/* app scenes only; setInterfaceOrientation: is checked on the mutable settings in the block below */
+		if (![sc respondsToSelector:ub] || ![[sm2_get(sc, "identifier") description] hasPrefix:@"sceneID:"])
+			continue;
+		id cur = sm2_get(sm2_get(sc, "settings"), "interfaceOrientation");
+		if (reapply && [cur longLongValue] == n)
+			continue;
+		id mask = [h respondsToSelector:sel_registerName("_mainSceneSupportedInterfaceOrientations")] ?
+		    [h valueForKey:@"_mainSceneSupportedInterfaceOrientations"] : nil;
+		if (n != 1 && mask && !([mask unsignedLongLongValue] & (1ull << n))) {
+			if (!reapply)
+				sm2_log("orient: R %ld: %s does not support it (mask %s)", n, ident, sm2_desc(mask));
+			continue;
+		}
+		__block bool fixed = false;
+		((void (*)(id, SEL, void (^)(id)))objc_msgSend)(sc, ub, ^(id s) {
+			SEL so = sel_registerName("setInterfaceOrientation:"), sd = sel_registerName("setDeviceOrientation:");
+			SEL sf = sel_registerName("setFrame:"), gf = sel_registerName("frame");
+			if ([s respondsToSelector:so])
+				((void (*)(id, SEL, long long))objc_msgSend)(s, so, (long long)n);
+			if ([s respondsToSelector:sd])
+				((void (*)(id, SEL, long long))objc_msgSend)(s, sd, (long long)n);
+			/* rot3: only the portrait-shaped frame works; undo an earlier "S N f" swap */
+			if ([s respondsToSelector:sf] && [s respondsToSelector:gf]) {
+				sm2_rect r = ((sm2_rect (*)(id, SEL))objc_msgSend)(s, gf);
+				if (r.w > r.h) {
+					sm2_rect q = { r.x, r.y, r.h, r.w };
+					((void (*)(id, SEL, sm2_rect))objc_msgSend)(s, sf, q);
+					fixed = true;
+				}
+			}
+		});
+		if (reapply)
+			sm2_log("orient: R re-applied %ld to %s", n, ident);
+		else
+			sm2_log("orient: R %ld: applied to %s%s", n, ident, fixed ? " (frame back to portrait)" : "");
+	}
+	if (!reapply && !scenes.count)
+		sm2_log("orient: R %ld: no front scene", n);
+}
+
+/*
+ * Synthetic touch (dev speed: tests tap without a finger; backboardd only, delete /var/local/sweet-orient to turn
+ * off): "T X Y" taps, "W X1 Y1 X2 Y2 MS" swipes; X, Y normalized 0..1 in portrait. IOKit HID private API via dlsym.
+ */
+typedef void *sm2_hid_ev;
+static struct {
+	void *client;
+	uint64_t sender;
+	sm2_hid_ev (*hand)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double,
+	    double, double, double, Boolean, Boolean, uint32_t);
+	sm2_hid_ev (*finger)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, double, double, double, double,
+	    double, Boolean, Boolean, uint32_t);
+	void (*append)(sm2_hid_ev, sm2_hid_ev, uint32_t);
+	void (*setint)(sm2_hid_ev, uint32_t, long);
+	void (*setsender)(sm2_hid_ev, uint64_t);
+	void (*dispatch)(void *, sm2_hid_ev);
+} sm2_hid;
+
+static bool sm2_touch_init(void)
+{
+	if (sm2_hid.client)
+		return true;
+	void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+	if (!h) {
+		sm2_log("touch: IOKit: %s", dlerror());
+		return false;
+	}
+	void *(*create)(CFAllocatorRef, int, void *) = (void *(*)(CFAllocatorRef, int, void *))dlsym(h,
+	    "IOHIDEventSystemClientCreateWithType");
+	CFArrayRef (*services)(void *) = (CFArrayRef (*)(void *))dlsym(h, "IOHIDEventSystemClientCopyServices");
+	CFTypeRef (*prop)(void *, CFStringRef) = (CFTypeRef (*)(void *, CFStringRef))dlsym(h, "IOHIDServiceClientCopyProperty");
+	CFTypeRef (*regid)(void *) = (CFTypeRef (*)(void *))dlsym(h, "IOHIDServiceClientGetRegistryID");
+	*(void **)&sm2_hid.hand = dlsym(h, "IOHIDEventCreateDigitizerEvent");
+	*(void **)&sm2_hid.finger = dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
+	*(void **)&sm2_hid.append = dlsym(h, "IOHIDEventAppendEvent");
+	*(void **)&sm2_hid.setint = dlsym(h, "IOHIDEventSetIntegerValue");
+	*(void **)&sm2_hid.setsender = dlsym(h, "IOHIDEventSetSenderID");
+	*(void **)&sm2_hid.dispatch = dlsym(h, "IOHIDEventSystemClientDispatchEvent");
+	if (!create || !sm2_hid.hand || !sm2_hid.finger || !sm2_hid.append || !sm2_hid.setint || !sm2_hid.setsender ||
+	    !sm2_hid.dispatch) {
+		sm2_log("touch: missing symbol (create %p hand %p finger %p dispatch %p)", create, sm2_hid.hand,
+		    sm2_hid.finger, sm2_hid.dispatch);
+		return false;
+	}
+	void *client = create(kCFAllocatorDefault, 1 /* admin */, NULL);
+	if (!client) {
+		sm2_log("touch: client create failed");
+		return false;
+	}
+	/* sender: the real touchscreen service (PrimaryUsagePage 0x0D digitizer), else a fixed constant */
+	sm2_hid.sender = 0x000000010000027FULL;
+	const char *src = "fixed";
+	CFArrayRef svcs = services ? services(client) : NULL;
+	for (CFIndex i = 0; svcs && prop && regid && i < CFArrayGetCount(svcs); i++) {
+		void *s = (void *)CFArrayGetValueAtIndex(svcs, i);
+		CFTypeRef page = prop(s, CFSTR("PrimaryUsagePage"));
+		int pg = 0;
+		if (page && CFGetTypeID(page) == CFNumberGetTypeID())
+			CFNumberGetValue((CFNumberRef)page, kCFNumberIntType, &pg);
+		if (page)
+			CFRelease(page);
+		CFTypeRef id = pg == 0x0D ? regid(s) : NULL;
+		if (id && CFGetTypeID(id) == CFNumberGetTypeID()) {
+			CFNumberGetValue((CFNumberRef)id, kCFNumberSInt64Type, &sm2_hid.sender);
+			src = "touchscreen service";
+			break;
+		}
+	}
+	if (svcs)
+		CFRelease(svcs);
+	sm2_log("touch: client %p, sender 0x%llx (%s)", client, sm2_hid.sender, src);
+	sm2_hid.client = client;
+	return true;
+}
+
+/* phase 0 down, 1 move, 2 up */
+static void sm2_touch_send(double x, double y, int phase)
+{
+	uint64_t ts = mach_absolute_time();
+	uint32_t mask = phase == 1 ? 0x4 : 0x1 | 0x2 | 0x4;	/* range|touch|position; position on move */
+	Boolean on = phase != 2;
+	sm2_hid_ev parent = sm2_hid.hand(kCFAllocatorDefault, ts, 3 /* hand */, 0, 0, mask, 0, x, y, 0, 0, 0, on, on, 0);
+	sm2_hid_ev child = sm2_hid.finger(kCFAllocatorDefault, ts, 1, 2, mask, x, y, 0, 0, 0, on, on, 0);
+	if (!parent || !child) {
+		sm2_log("touch: event create failed (%p %p)", parent, child);
+		if (parent)
+			CFRelease(parent);
+		if (child)
+			CFRelease(child);
+		return;
+	}
+	sm2_hid.append(parent, child, 0);
+	sm2_hid.setint(parent, 0xB0019 /* DigitizerIsDisplayIntegrated */, 1);
+	sm2_hid.setsender(parent, sm2_hid.sender);
+	sm2_hid.dispatch(sm2_hid.client, parent);
+	CFRelease(child);
+	CFRelease(parent);
+}
+
+/* steps 0 = tap at (x1, y1) */
+static void sm2_touch(double x1, double y1, double x2, double y2, long ms, int steps)
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+		if (!sm2_touch_init())
+			return;
+		sm2_touch_send(x1, y1, 0);
+		if (steps == 0) {
+			usleep(80000);
+			sm2_touch_send(x1, y1, 2);
+			sm2_log("touch: tap %.3f %.3f dispatched", x1, y1);
+			return;
+		}
+		for (int i = 1; i <= steps; i++) {
+			usleep((useconds_t)(ms * 1000 / steps));
+			sm2_touch_send(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps, 1);
+		}
+		sm2_touch_send(x2, y2, 2);
+		sm2_log("touch: swipe %.3f %.3f -> %.3f %.3f in %ld ms dispatched", x1, y1, x2, y2, ms);
+	});
+}
+
+__attribute__((constructor)) static void sm2_orient_init(void)
+{
+	bool bbd = strcmp(getprogname(), "backboardd") == 0;
+	if (!bbd && strcmp(getprogname(), "SpringBoard") != 0)
+		return;
+	int ok = access("/var/local/sweet-orient", F_OK);
+	if (bbd)
+		sm2_log("orient: backboardd watcher: access %d errno %d", ok, ok ? errno : 0);
+	if (ok != 0)
+		return;
+	if (!bbd)
+		sm2_orient_e_hook();
+	if (!bbd && !dlopen("/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities", RTLD_NOW))
+		sm2_log("orient: AccessibilityUtilities: %s", dlerror());
+	/* static: a local source was freed under ARC when the constructor returned (k90a: no orient lines at all). */
+	static dispatch_source_t t;
+	t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+	dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+	sm2_log("orient: watching /var/local/sweet-orient");
+	dispatch_source_set_event_handler(t, ^{
+		static struct timespec last;
+		struct stat st;
+		if (!bbd && sm2_r_orient > 0) {	/* B20 "R" (rot5: also R 1): re-apply to new front apps */
+			@try {
+				sm2_orient_r_apply(sm2_r_orient, true);
+			} @catch (id ex) {
+				sm2_log("orient: R re-apply exception %s", [[ex description] UTF8String]);
+			}
+		}
+		if (stat("/var/local/sweet-orient", &st) != 0 || (st.st_mtimespec.tv_sec == last.tv_sec &&
+		    st.st_mtimespec.tv_nsec == last.tv_nsec))
+			return;
+		last = st.st_mtimespec;
+		char buf[64] = {0};
+		int fd = open("/var/local/sweet-orient", O_RDONLY);
+		if (fd < 0 || read(fd, buf, sizeof(buf) - 1) < 0)
+			buf[0] = 0;
+		if (fd >= 0)
+			close(fd);
+		bool b = buf[0] == 'B', c = buf[0] == 'C', d = buf[0] == 'D', e = buf[0] == 'E';
+		if (buf[0] == 'P') {	/* "P": read-only scene/host probe in SpringBoard */
+			if (!bbd) {
+				@try {
+					sm2_orient_p();
+				} @catch (id ex) {
+					sm2_log("orient: P exception %s", [[ex description] UTF8String]);
+				}
+			}
+			return;
+		}
+		if (buf[0] == 'T' || buf[0] == 'W') {	/* dev speed: "T X Y" tap, "W X1 Y1 X2 Y2 MS" swipe (backboardd) */
+			double v[5] = {0};
+			int k = sscanf(buf + 1, "%lf %lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3], &v[4]);
+			if (bbd && buf[0] == 'T' && k >= 2)
+				sm2_touch(v[0], v[1], v[0], v[1], 0, 0);
+			else if (bbd && buf[0] == 'W' && k >= 5)
+				sm2_touch(v[0], v[1], v[2], v[3], (long)v[4], 10);
+			else if (bbd)
+				sm2_log("touch: bad command '%.20s'", buf);
+			return;
+		}
+		if (buf[0] == 'H' || buf[0] == 'K') {	/* B33 "H": home button, "K": lock button (SpringBoard's own test hooks;
+							 * injected bottom-edge swipes never went home, b33) */
+			if (!bbd) {
+				@try {
+					id app = [objc_getClass("UIApplication") performSelector:@selector(sharedApplication)];
+					SEL h = sel_registerName("_simulateHomeButtonPressWithCompletion:");
+					SEL k = sel_registerName("_simulateLockButtonPress");
+					bool home = buf[0] == 'H';
+					bool ok = [app respondsToSelector:home ? h : k];
+					if (ok && home)
+						((void (*)(id, SEL, id))objc_msgSend)(app, h, nil);
+					else if (ok)
+						((void (*)(id, SEL))objc_msgSend)(app, k);
+					sm2_log("orient: %s button: %s", home ? "home" : "lock", ok ? "sent" : "no selector");
+				} @catch (id ex) {
+					sm2_log("orient: H/K exception %s", [[ex description] UTF8String]);
+				}
+			}
+			return;
+		}
+		if (buf[0] == 'L') {	/* B32 "L 0|1": Location Services off/on as Settings does it (plist edit had no effect) */
+			if (!bbd) {
+				@try {
+					dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
+					Class lm = objc_getClass("CLLocationManager");
+					SEL ge = sel_registerName("locationServicesEnabled"), se = sel_registerName("setLocationServicesEnabled:");
+					BOOL before = [lm respondsToSelector:ge] ? ((BOOL (*)(id, SEL))objc_msgSend)(lm, ge) : -1;
+					if ([lm respondsToSelector:se])
+						((void (*)(id, SEL, BOOL))objc_msgSend)(lm, se, buf[2] == '1');
+					BOOL after = [lm respondsToSelector:ge] ? ((BOOL (*)(id, SEL))objc_msgSend)(lm, ge) : -1;
+					sm2_log("orient: L: class %p set %d, enabled %d -> %d", lm, [lm respondsToSelector:se], before, after);
+				} @catch (id ex) {
+					sm2_log("orient: L exception %s", [[ex description] UTF8String]);
+				}
+			}
+			return;
+		}
+		if (buf[0] == 'R') {	/* "R N": D N 0 in backboardd; E N + front scenes in SpringBoard */
+			long rn = strtol(buf + 1, NULL, 10);
+			if (rn < 1 || rn > 4)
+				return;
+			@try {
+				if (bbd) {
+					/* rot9: S N alone rotates and stays; with backboardd's D the app scene was reset to
+					 * portrait (rot5-rot8). D (touch mapping) only on request: "R N t". */
+					if (strchr(buf + 2, 't'))
+						sm2_orient_d(rn, 0);
+				} else {
+					/* rot7: with E first the app scene was rotated back (re-apply needed) and never redrew in
+					 * landscape; "R N s" skips E (scenes only, as the working S N in rot3) */
+					bool skip_e = !strchr(buf + 2, 'e');	/* rot9: E only with "R N e" */
+					sm2_log("orient: R %ld: %sall app scenes", rn, skip_e ? "" : "E + ");
+					sm2_r_orient = rn;
+					if (!skip_e)
+						sm2_orient_e(rn);
+					sm2_orient_r_apply(rn, false);
+				}
+			} @catch (id ex) {
+				sm2_log("orient: R exception %s", [[ex description] UTF8String]);
+			}
+			return;
+		}
+		if (buf[0] == 'S') {	/* "S N [f]": write the front scenes' orientation directly (SpringBoard) */
+			char *se = NULL;
+			long sn = strtol(buf + 1, &se, 10);
+			if (!bbd && sn >= 1 && sn <= 4) {
+				@try {
+					sm2_orient_s(sn, se && strchr(se, 'f'));
+				} @catch (id ex) {
+					sm2_log("orient: S exception %s", [[ex description] UTF8String]);
+				}
+			}
+			return;
+		}
+		char *end = NULL;
+		long n = strtol(b || c || d || e ? buf + 1 : buf, &end, 10);
+		if (n < 1 || n > 4)
+			return;
+		if (d && !bbd) {	/* "D" lines are backboardd's; SpringBoard only probes what it sees */
+			sm2_orient_probe(n);
+			return;
+		}
+		if (d != bbd || (e && bbd))
+			return;
+		if (e) {
+			sm2_orient_e(n);
+			return;
+		}
+		if (d) {
+			sm2_orient_d(n, strtol(end, NULL, 10));
+			return;
+		}
+		@try {
+			c ? sm2_orient_c(n) : b ? sm2_orient_b(n) : sm2_orient_a(n);
+		} @catch (id ex) {
+			sm2_log("orient: exception %s", [[ex description] UTF8String]);
+		}
+	});
+	dispatch_resume(t);
+}

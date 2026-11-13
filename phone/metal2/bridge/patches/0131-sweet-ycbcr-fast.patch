@@ -1,0 +1,1197 @@
+Bridge 0131 (G7): fast YCbCr conversion of video surfaces. A 1080p NV12 frame took ~45-60 ms GPU through the staging copy of both
+planes and a kernel loading 18 storage-buffer words a texel (0128's bake cut 35 %: latency-bound). For 8-bit 4:2:0 textures (420v/420f,
+YCBCR8_420_2P and its _sRGB twin) the conversion now fetches the planes in place: an R8G8_UINT uniform texel buffer view over the
+surface's own VkBuffer (no staging copy), one invocation per chroma pair writing its 2x2 texels from the 3x3 pairs around it (11 fetches
+for 4 texels), the shape baked in (at most 8 shapes a process, as 0128). Same integer arithmetic: bit-exact with the old kernel (tests on
+the CPU interpreter, every range/matrix, odd sizes, view offsets). Image format unchanged (RGBA16F / RGBA32F): the texture's views and
+consumers stay as they are. Falls back to the old path for other layouts, plane-1 textures, a view past the span or the device's
+limits, a rebound VkBuffer, or past 8 shapes. 0128's seed gating unchanged. Reuse: the binding (R8G8_UINT uniform texel buffer over the
+planes' bytes, element-unit offsets) from upstream metal2vulkan cdf59197 bind/ycbcr_in_place.rs; not a1f16771/2f033d30's
+VkSamplerYcbcrConversion route (needs samplerYcbcrConversion enabled at device creation, immutable-sampler layouts and a multi-planar
+image over imported memory; those two still copy the planes into an optimal image). OwnedKernel gains uniform texel buffer bindings.
+Off: SWEET_YCBCR_FAST=0. Log: "YCBCR FAST: WxH Converted in place (base N)" or "... kept the staging copy: why" (first 8).
+
+diff --git a/crates/metal2vulkan-runtime/src/owned_kernel.rs b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+index a8185eec..11638f17 100644
+--- a/crates/metal2vulkan-runtime/src/owned_kernel.rs
++++ b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+@@ -23,7 +23,7 @@ use crate::shader_cache::driver::Making;
+ use ash::vk;
+ use metal2vulkan::bind::{
+     BlockDecode, CompressedBlit, MipmapFilterKernel, RewritePhase, RewriteProgram, TexelWords,
+-    YCbCrOutput,
++    YCbCrFast, YCbCrOutput,
+ };
+ use metal2vulkan::metal::format::ExtendedRange;
+ use std::collections::HashMap;
+@@ -80,6 +80,10 @@ pub(super) enum OwnedModule {
+     /// or (`YCbCrOutput::Codes`) the packed codes. 0128 (G7): with one texture's shape words baked
+     /// in (`bind::ycbcr_convert_module_baked`), else the shape read from its binding.
+     YCbCrConvert(YCbCrOutput, Option<BakedShape>),
++    /// Sunfish 0131 (G7): `bind::ycbcr_fast_module` of one shape: the same texels of a video
++    /// surface's planes, fetched from a uniform texel buffer over the surface's own bytes
++    /// (`ycbcr.rs`), its image bound as a storage image.
++    YCbCrFast(YCbCrFast),
+     /// `bind::two_plane_texels_module`: a heap's two-plane extended-range texture's texels moved
+     /// between its image and its two planes in the heap's bytes (`texture/heap_two_planes.rs`).
+     TwoPlaneTexels,
+@@ -134,11 +138,20 @@ impl OwnedModule {
+     fn storage_images(self) -> u32 {
+         match self {
+             OwnedModule::YCbCrConvert(..) | OwnedModule::YCbCrWrite => 1,
++            OwnedModule::YCbCrFast(_) => 1,
+             OwnedModule::ExtendedShadowLoad(_) => 2,
+             _ => 0,
+         }
+     }
+ 
++    /// Sunfish 0131: the module's uniform texel buffer bindings, after its storage images.
++    fn texel_buffers(self) -> u32 {
++        match self {
++            OwnedModule::YCbCrFast(_) => 1,
++            _ => 0,
++        }
++    }
++
+     /// The module's SPIR-V words for `device`, its storage-buffer bindings (after its
+     /// [`images`](Self::images)), and its push bytes.
+     fn build(self, device: &Device) -> Result<(Vec<u32>, u32, u32), Error> {
+@@ -220,6 +233,11 @@ impl OwnedModule {
+                 .map_err(Error::Compile)?;
+                 Ok((module.spirv.to_vec(), 2, 0))
+             }
++            OwnedModule::YCbCrFast(fast) => {
++                let module = metal2vulkan::bind::ycbcr_fast_module(device.compile_device(), &fast)
++                    .map_err(Error::Compile)?;
++                Ok((module.spirv.to_vec(), 0, 0))
++            }
+             OwnedModule::RotateTexels => {
+                 let module = metal2vulkan::bind::rotate_texels_module(device.compile_device())
+                     .map_err(Error::Compile)?;
+@@ -305,6 +323,8 @@ pub(super) struct OwnedKernel {
+     pub(super) images: u32,
+     /// Storage-image bindings of set 0, after the sampled images.
+     pub(super) storage_images: u32,
++    /// Sunfish 0131: uniform texel buffer bindings of set 0, after the storage images.
++    pub(super) texel_buffers: u32,
+     /// Storage-buffer bindings of set 0, after the images.
+     pub(super) buffers: u32,
+ }
+@@ -340,6 +360,7 @@ pub(super) struct OwnedKernels {
+     index_rewrites: HashMap<(RewriteProgram, RewritePhase), OwnedKernel>,
+     rotate_texels: Option<OwnedKernel>,
+     ycbcr_converts: HashMap<(YCbCrOutput, Option<BakedShape>), OwnedKernel>,
++    ycbcr_fasts: HashMap<YCbCrFast, OwnedKernel>, // 0131
+     two_plane_texels: Option<OwnedKernel>,
+     plane_bytes_copy: Option<OwnedKernel>,
+     ycbcr_write: Option<OwnedKernel>,
+@@ -383,6 +404,7 @@ impl OwnedKernels {
+         .chain(self.mipmap_filters.values().copied())
+         .chain(self.index_rewrites.values().copied())
+         .chain(self.ycbcr_converts.values().copied())
++        .chain(self.ycbcr_fasts.values().copied())
+         .chain(self.unused_bits.values().copied())
+         .chain(self.compressed_blits.values().copied())
+         .chain(self.extended_shadow_loads.values().copied())
+@@ -402,6 +424,7 @@ impl OwnedKernels {
+             OwnedModule::YCbCrConvert(output, baked) => {
+                 self.ycbcr_converts.get(&(output, baked)).copied()
+             }
++            OwnedModule::YCbCrFast(fast) => self.ycbcr_fasts.get(&fast).copied(),
+             OwnedModule::UnusedBits(form, words) => self.unused_bits.get(&(form, words)).copied(),
+             OwnedModule::CompressedBlit(rule) => self.compressed_blits.get(&rule).copied(),
+             OwnedModule::ExtendedShadowLoad(form) => self.extended_shadow_loads.get(&form).copied(),
+@@ -422,6 +445,9 @@ impl OwnedKernels {
+             OwnedModule::YCbCrConvert(output, baked) => {
+                 self.ycbcr_converts.insert((output, baked), kernel);
+             }
++            OwnedModule::YCbCrFast(fast) => {
++                self.ycbcr_fasts.insert(fast, kernel);
++            }
+             OwnedModule::UnusedBits(form, words) => {
+                 self.unused_bits.insert((form, words), kernel);
+             }
+@@ -457,6 +483,7 @@ impl OwnedKernels {
+             OwnedModule::MipmapFilter(_)
+             | OwnedModule::IndexRewrite(..)
+             | OwnedModule::YCbCrConvert(..)
++            | OwnedModule::YCbCrFast(_)
+             | OwnedModule::UnusedBits(..)
+             | OwnedModule::CompressedBlit(_)
+             | OwnedModule::ExtendedShadowLoad(_)
+@@ -491,19 +518,20 @@ impl Device {
+         }
+         let (spirv, buffers, push_bytes) = which.build(self)?;
+         let bindings = (which.images(), which.storage_images(), buffers);
+-        let kernel = make(self, &spirv, bindings, push_bytes)?;
++        let kernel = make(self, &spirv, bindings, which.texel_buffers(), push_bytes)?;
+         kernels.put(which, kernel);
+         Ok(kernel)
+     }
+ }
+ 
+ /// The objects of a kernel of `spirv` (entry point `main`) with `images` sampled images, then
+-/// `storage_images` storage images and then `buffers` storage buffers in set 0, and `push_bytes`
+-/// of `COMPUTE` push constants.
++/// `storage_images` storage images, `texel_buffers` uniform texel buffers (0131) and then
++/// `buffers` storage buffers in set 0, and `push_bytes` of `COMPUTE` push constants.
+ fn make(
+     device: &Device,
+     spirv: &[u32],
+     (images, storage_images, buffers): (u32, u32, u32),
++    texel_buffers: u32,
+     push_bytes: u32,
+ ) -> Result<OwnedKernel, Error> {
+     let shared = device.shared();
+@@ -515,6 +543,7 @@ fn make(
+         pipeline: vk::Pipeline::null(),
+         images,
+         storage_images,
++        texel_buffers,
+         buffers,
+     };
+     let made = (|| {
+@@ -522,11 +551,12 @@ fn make(
+         // SAFETY: the code is live SPIR-V words for the call.
+         kernel.module = unsafe { raw.create_shader_module(&info, None) }.map_err(vulkan)?;
+         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
+-            (0..images + storage_images + buffers)
++            (0..images + storage_images + texel_buffers + buffers)
+                 .map(|binding| {
++                    let images = (images, storage_images, texel_buffers);
+                     vk::DescriptorSetLayoutBinding::default()
+                         .binding(binding)
+-                        .descriptor_type(descriptor_type(binding, images, storage_images))
++                        .descriptor_type(descriptor_type(binding, images))
+                         .descriptor_count(1)
+                         .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                 })
+@@ -584,12 +614,18 @@ fn make(
+ }
+ 
+ /// The type of binding `binding` of a set whose first `images` bindings are sampled images, the
+-/// next `storage_images` storage images, and the rest storage buffers.
+-fn descriptor_type(binding: u32, images: u32, storage_images: u32) -> vk::DescriptorType {
++/// next `storage_images` storage images, the next `texel_buffers` uniform texel buffers (0131),
++/// and the rest storage buffers.
++fn descriptor_type(
++    binding: u32,
++    (images, storage_images, texel_buffers): (u32, u32, u32),
++) -> vk::DescriptorType {
+     if binding < images {
+         vk::DescriptorType::SAMPLED_IMAGE
+     } else if binding < images + storage_images {
+         vk::DescriptorType::STORAGE_IMAGE
++    } else if binding < images + storage_images + texel_buffers {
++        vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+     } else {
+         vk::DescriptorType::STORAGE_BUFFER
+     }
+@@ -647,15 +683,33 @@ impl OwnedSets {
+         device: &Device,
+         kernels: &[OwnedKernel],
+         sets: &[OwnedSet],
++    ) -> Result<OwnedSets, Error> {
++        let none = vec![Vec::new(); sets.len()];
++        OwnedSets::write_each_texels(device, kernels, sets, &none)
++    }
++
++    /// Sunfish 0131: [`write_each`](Self::write_each), each set's uniform texel buffers written
++    /// with its entry of `texels` after its storage images.
++    pub(super) fn write_each_texels(
++        device: &Device,
++        kernels: &[OwnedKernel],
++        sets: &[OwnedSet],
++        texels: &[Vec<vk::BufferView>],
+     ) -> Result<OwnedSets, Error> {
+         let raw = device.shared().vk();
+         let count = u32::try_from(sets.len()).map_err(|_| internal("too many owned sets"))?;
+         if kernels.len() != sets.len()
+-            || sets.iter().zip(kernels).any(|(set, kernel)| {
+-                set.images.len() != kernel.images as usize
+-                    || set.storage_images.len() != kernel.storage_images as usize
+-                    || set.buffers.len() != kernel.buffers as usize
+-            })
++            || texels.len() != sets.len()
++            || sets
++                .iter()
++                .zip(kernels)
++                .zip(texels)
++                .any(|((set, kernel), texels)| {
++                    set.images.len() != kernel.images as usize
++                        || set.storage_images.len() != kernel.storage_images as usize
++                        || texels.len() != kernel.texel_buffers as usize
++                        || set.buffers.len() != kernel.buffers as usize
++                })
+             || count == 0
+         {
+             return Err(internal("owned sets that do not match their kernel"));
+@@ -671,10 +725,13 @@ impl OwnedSets {
+             total(|k| k.storage_images)?,
+             total(|k| k.buffers)?,
+         );
++        // 0131: and the uniform texel buffers.
++        let texel_buffers = total(|k| k.texel_buffers)?;
+         // A pool size names at least one descriptor.
+         let sizes: Vec<vk::DescriptorPoolSize> = [
+             (vk::DescriptorType::SAMPLED_IMAGE, images),
+             (vk::DescriptorType::STORAGE_IMAGE, storage_images),
++            (vk::DescriptorType::UNIFORM_TEXEL_BUFFER, texel_buffers),
+             (vk::DescriptorType::STORAGE_BUFFER, buffers),
+         ]
+         .into_iter()
+@@ -726,8 +783,8 @@ impl OwnedSets {
+             })
+             .collect();
+         let mut writes = Vec::new();
+-        let infos = image_infos.iter().zip(&storage_infos).zip(&buffer_infos);
+-        for (set, ((images, storage), buffers)) in owned.sets.iter().zip(infos) {
++        let infos = image_infos.iter().zip(&storage_infos).zip(&buffer_infos).zip(texels);
++        for (set, (((images, storage), buffers), texels)) in owned.sets.iter().zip(infos) {
+             for (binding, info) in images.iter().enumerate() {
+                 writes.push(
+                     vk::WriteDescriptorSet::default()
+@@ -746,7 +803,18 @@ impl OwnedSets {
+                         .image_info(std::slice::from_ref(info)),
+                 );
+             }
+-            for (binding, info) in (images.len() + storage.len()..).zip(buffers) {
++            // 0131: uniform texel buffers after the storage images.
++            for (binding, view) in (images.len() + storage.len()..).zip(texels) {
++                writes.push(
++                    vk::WriteDescriptorSet::default()
++                        .dst_set(*set)
++                        .dst_binding(binding as u32)
++                        .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
++                        .texel_buffer_view(std::slice::from_ref(view)),
++                );
++            }
++            let first = images.len() + storage.len() + texels.len();
++            for (binding, info) in (first..).zip(buffers) {
+                 writes.push(
+                     vk::WriteDescriptorSet::default()
+                         .dst_set(*set)
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 5c541504..7ad5ade8 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -1076,7 +1076,7 @@ fn cache_mode() -> u8 {
+ }
+ 
+ /// 0116: one line into /dev/console and /var/local/mtl2.log, as 0108's.
+-fn cache_line(text: &str) {
++pub(super) fn cache_line(text: &str) { // 0131: also ycbcr.rs's
+     use std::io::Write;
+     let line = format!(
+         "MTL2[{} {}]: {text}\n",
+diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+index f2dad026..fa5f1bcb 100644
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -174,7 +174,8 @@ impl Device {
+             usage: ImageUsageFlags::STORAGE,
+         })?;
+         let (raw, at) = texels.buffer.at(span.start);
+-        let conversion = YCbCrConversion::new(self, (planes, span.clone()), at, view, seed)?;
++        let conversion =
++            YCbCrConversion::new(self, (planes, span.clone()), (raw, at), view, seed)?; // 0131: raw
+         let (bytes, tracked) = texels.buffer.tracked(span);
+         let copies = ShadowCopies {
+             source: ShadowSource::Converted {
+diff --git a/crates/metal2vulkan-runtime/src/ycbcr.rs b/crates/metal2vulkan-runtime/src/ycbcr.rs
+index 901d232f..09c0404f 100644
+--- a/crates/metal2vulkan-runtime/src/ycbcr.rs
++++ b/crates/metal2vulkan-runtime/src/ycbcr.rs
+@@ -141,8 +141,10 @@ use super::values::ResourceOptions;
+ use super::Device;
+ use ash::vk;
+ use metal2vulkan::bind::{
+-    YCbCrCodes, YCbCrConvertModule, YCbCrMatrix, YCbCrPlanes, YCbCrRange, YCbCrWriteModule,
++    YCbCrCodes, YCbCrConvertModule, YCbCrFast, YCbCrMatrix, YCbCrPlanes, YCbCrRange,
++    YCbCrWriteModule,
+ };
++use metal2vulkan::device::{FormatUsage, VkFeature};
+ use metal2vulkan::error::{DiagName, Feature, Unsupported};
+ use metal2vulkan::metal::format::{ycbcr_format, ChromaSubsampling};
+ use metal2vulkan::metal::PixelFormat;
+@@ -435,6 +437,136 @@ fn baked_shape(planes: &YCbCrPlanes) -> Option<BakedShape> {
+ /// 0128: the shapes baked into kernels of their own (decoder pools share one shape).
+ const BAKED_MAX: usize = 8;
+ 
++/// Sunfish 0131 (G7): `SWEET_YCBCR_FAST`, read once: 0 converts every texture through the staging
++/// copy and the kernel above, as before; else a video surface's texture (8-bit 4:2:0, `420v` and
++/// `420f`) is converted by `bind::ycbcr_fast_module`, its planes fetched in place through a uniform
++/// texel buffer over the surface's own bytes (no staging copy), 2 x 2 texels an invocation, the
++/// same texels (`FastConversion`). Kernels for at most [`BAKED_MAX`] shapes a process, as 0128's.
++fn fast_shape(fast: YCbCrFast) -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    static SHAPES: Mutex<Vec<YCbCrFast>> = Mutex::new(Vec::new());
++    if !*ON.get_or_init(|| std::env::var("SWEET_YCBCR_FAST").as_deref() != Ok("0")) {
++        return false;
++    }
++    let mut shapes = lock(&SHAPES);
++    if !shapes.contains(&fast) {
++        if shapes.len() >= BAKED_MAX {
++            return false;
++        }
++        shapes.push(fast);
++    }
++    true
++}
++
++/// Sunfish 0131: a line for the first textures [`FastConversion::new`] decides on.
++fn fast_note(text: impl FnOnce() -> String) {
++    static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++    if LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
++        super::shadow::cache_line(&format!("YCBCR FAST: {}", text()));
++    }
++}
++
++/// Sunfish 0131 (G7): the fast conversion of a video surface's texture (`fast_shape`): a uniform
++/// texel buffer view over the planes' bytes in the surface's `VkBuffer`, and the fast kernel's set
++/// and dispatch. Ported from upstream metal2vulkan cdf59197's binding (`bind::YCbCrFast`).
++struct FastConversion {
++    device: Device,
++    /// The `VkBuffer` the view lies in: a conversion of another (a rebound buffer's) takes the
++    /// staging copy.
++    raw: vk::Buffer,
++    view: vk::BufferView,
++    kernel: OwnedKernel,
++    sets: OwnedSets,
++    groups: [u32; 2],
++}
++
++impl Drop for FastConversion {
++    fn drop(&mut self) {
++        // SAFETY: no pending command uses the view: a committed command buffer holds every
++        // texture it binds until it completes.
++        unsafe { crate::release::object(self.device.shared().vk(), self.view) };
++    }
++}
++
++impl FastConversion {
++    /// The fast conversion of `planes`, which lie from `at` in `raw` (`span` bytes), into `view`, a
++    /// storage view of the texture's image; `None` where the shape is not one (`YCbCrFast::of`), a
++    /// texel buffer view of it does not fit the device's limits, or it is off.
++    fn new(
++        device: &Device,
++        planes: &YCbCrPlanes,
++        (raw, at, span): (vk::Buffer, u64, u64),
++        image: vk::ImageView,
++    ) -> Option<FastConversion> {
++        let limits = &device.properties().description.limits;
++        let align = limits.min_texel_buffer_offset_alignment.max(1);
++        let start = at - at % align;
++        let fast = YCbCrFast::of(planes, u32::try_from(at - start).ok()?)?;
++        let [w, h] = planes.size;
++        let refuse = |why: &str| {
++            fast_note(|| format!("{w}x{h} kept the staging copy: {why}"));
++            None
++        };
++        // The fetches stay in the planes' span (an odd width's last luma element past it does not).
++        let bytes = fast.view_bytes();
++        if fast.reach() > span || bytes / 2 > u64::from(limits.max_texel_buffer_elements) {
++            return refuse("the view passes the span or the device's texel buffer elements");
++        }
++        // A view's format serves every texel buffer usage of the buffer (both, which the runtime
++        // makes every buffer with), or `maintenance5` names its own (`buffer_texture::view_usage`).
++        let profile = device.compile_device().profile();
++        let format = metal2vulkan::vk::Format::R8G8_UINT;
++        let both = profile.supports_format(format, FormatUsage::StorageTexelBuffer);
++        let own = profile.supports_format(format, FormatUsage::UniformTexelBuffer);
++        let maintenance5 = device.enabled().features.contains(&VkFeature::Maintenance5);
++        if !own || !(both || maintenance5) {
++            return refuse("R8G8_UINT texel buffers");
++        }
++        if !fast_shape(fast) {
++            return refuse("SWEET_YCBCR_FAST=0 or past the shapes");
++        }
++        let kernel = device.owned_kernel(OwnedModule::YCbCrFast(fast)).ok()?;
++        let mut only = vk::BufferUsageFlags2CreateInfoKHR::default()
++            .usage(vk::BufferUsageFlags2KHR::UNIFORM_TEXEL_BUFFER);
++        let mut info = vk::BufferViewCreateInfo::default()
++            .buffer(raw)
++            .format(vk::Format::R8G8_UINT)
++            .offset(start)
++            .range(bytes);
++        if !both {
++            info = info.push_next(&mut only);
++        }
++        // SAFETY: `raw` is live and made for both texel buffer usages; the range lies in the
++        // planes' span, from a multiple of the offset alignment, within the device's elements.
++        let view = unsafe { device.shared().vk().create_buffer_view(&info, None) }.ok()?;
++        let set = OwnedSet {
++            images: Vec::new(),
++            storage_images: vec![image],
++            buffers: Vec::new(),
++        };
++        let fast_conversion = |sets| FastConversion {
++            device: device.clone(),
++            raw,
++            view,
++            kernel,
++            sets,
++            groups: fast.groups(),
++        };
++        match OwnedSets::write_each_texels(device, &[kernel], &[set], &[vec![view]]) {
++            Ok(sets) => {
++                let output = planes.codes.output;
++                fast_note(|| format!("{w}x{h} {output:?} in place (base {})", fast.base()));
++                Some(fast_conversion(sets))
++            }
++            Err(_) => {
++                // SAFETY: nothing uses the view.
++                unsafe { crate::release::object(device.shared().vk(), view) };
++                None
++            }
++        }
++    }
++}
++
+ /// The conversion of a two-plane YCbCr texture's planes into its image (the module docs): the
+ /// copy in of its shadow (`ShadowSource::Converted`).
+ pub(super) struct YCbCrConversion {
+@@ -460,17 +592,19 @@ pub(super) struct YCbCrConversion {
+     /// seed and 0116 stamp the last planned conversion saw.
+     seed: Arc<OnceLock<SurfaceSeed>>,
+     seed_held: Mutex<Option<(u32, u64)>>,
++    /// Sunfish 0131 (G7): the fast conversion, where it takes the texture (`fast_shape`).
++    fast: Option<FastConversion>,
+ }
+ 
+ impl YCbCrConversion {
+     /// The conversion of `planes`, whose bytes lie in `bytes` of their buffer, at `at` of its
+-    /// `VkBuffer`, into `view`, a storage view of the texture's image, on `device`, its surface's
+-    /// seed read through `seed` once set (0128). Refused as `new_buffer` refuses the staging
+-    /// buffer and as the kernel's objects are refused.
++    /// `VkBuffer` (`raw`, 0131), into `view`, a storage view of the texture's image, on `device`,
++    /// its surface's seed read through `seed` once set (0128). Refused as `new_buffer` refuses
++    /// the staging buffer and as the kernel's objects are refused.
+     pub(super) fn new(
+         device: &Device,
+         (planes, bytes_in): (&YCbCrPlanes, Range<u64>),
+-        at: u64,
++        (raw_in, at): (vk::Buffer, u64),
+         view: vk::ImageView,
+         seed: Arc<OnceLock<SurfaceSeed>>,
+     ) -> Result<YCbCrConversion, Error> {
+@@ -512,7 +646,13 @@ impl YCbCrConversion {
+                 "a YCbCr texture past the device's workgroup counts",
+             ));
+         }
++        // 0131: no zeros past the span (`YCbCrFast::of` takes no texture over plane 1).
++        let fast = match zeros {
++            0 => FastConversion::new(device, planes, (raw_in, at, span), view),
++            _ => None,
++        };
+         Ok(YCbCrConversion {
++            fast,
+             source: (*planes, bytes_in),
+             staging_use: (identity.key, range),
+             shape_at: start,
+@@ -566,10 +706,17 @@ impl YCbCrConversion {
+     /// writes and read, and the write of every texel of the image of `copies`.
+     pub(super) fn uses(
+         &self,
+-        truth: Use<ResourceKey>,
++        mut truth: Use<ResourceKey>,
+         copies: &ShadowCopies,
+     ) -> Vec<Use<ResourceKey>> {
+         let (key, range) = self.staging_use.clone();
++        // 0131: the fast kernel reads the planes in place, through its texel buffer.
++        if self.fast.is_some() {
++            truth.read = Access::new(
++                vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::COMPUTE_SHADER,
++                vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::SHADER_SAMPLED_READ,
++            );
++        }
+         vec![
+             truth,
+             Use {
+@@ -610,6 +757,29 @@ impl YCbCrConversion {
+         command_buffer: vk::CommandBuffer,
+         source: vk::Buffer,
+     ) {
++        // 0131 (G7): the fast kernel over the planes in place, while they lie in its view's buffer.
++        if let Some(fast) = self.fast.as_ref().filter(|fast| fast.raw == source) {
++            // SAFETY: the caller's contract; the set binds the view of `source` and the image.
++            unsafe {
++                // As the staging copy's: every earlier write of the planes before the fetches.
++                Barrier::everything().record(device, command_buffer);
++                device.cmd_bind_pipeline(
++                    command_buffer,
++                    vk::PipelineBindPoint::COMPUTE,
++                    fast.kernel.pipeline,
++                );
++                device.cmd_bind_descriptor_sets(
++                    command_buffer,
++                    vk::PipelineBindPoint::COMPUTE,
++                    fast.kernel.layout,
++                    0,
++                    &fast.sets.sets,
++                    &[],
++                );
++                device.cmd_dispatch(command_buffer, fast.groups[0], fast.groups[1], 1);
++            }
++            return;
++        }
+         let staging = self.staging.at(0).0;
+         // SAFETY: the caller's contract; the shape and the copy lie in the staging buffer and
+         // the copy in `source` (checked when the texture was made), and the set binds them.
+diff --git a/crates/metal2vulkan/src/bind/mod.rs b/crates/metal2vulkan/src/bind/mod.rs
+index fb9a6dcf..0f5afd7a 100644
+--- a/crates/metal2vulkan/src/bind/mod.rs
++++ b/crates/metal2vulkan/src/bind/mod.rs
+@@ -270,7 +270,8 @@ pub use visibility_resolve::{
+     visibility_resolve_module, VisibilityResolve, VisibilityResolveModule,
+ };
+ pub use ycbcr_convert::{
+-    ycbcr_convert_module, ycbcr_convert_module_baked, ycbcr_read, ycbcr_texel, YCbCrCodes,
+-    YCbCrConvertModule, YCbCrMatrix, YCbCrOutput, YCbCrPlanes, YCbCrRange,
++    ycbcr_convert_module, ycbcr_convert_module_baked, ycbcr_fast_module, ycbcr_read, ycbcr_texel,
++    YCbCrCodes, YCbCrConvertModule, YCbCrFast, YCbCrFastModule, YCbCrMatrix, YCbCrOutput,
++    YCbCrPlanes, YCbCrRange,
+ };
+ pub use ycbcr_write::{ycbcr_store, ycbcr_write, ycbcr_write_module, YCbCrWriteModule};
+diff --git a/crates/metal2vulkan/src/bind/ycbcr_convert.rs b/crates/metal2vulkan/src/bind/ycbcr_convert.rs
+index 5a149e95..f3f31525 100644
+--- a/crates/metal2vulkan/src/bind/ycbcr_convert.rs
++++ b/crates/metal2vulkan/src/bind/ycbcr_convert.rs
+@@ -978,3 +978,7 @@ pub fn ycbcr_convert_module_baked(
+ 
+ #[cfg(test)]
+ mod tests;
++
++// Sunfish 0131 (G7): the fast conversion of video surfaces (`ycbcr_convert/fast.rs`).
++mod fast;
++pub use fast::{ycbcr_fast_module, YCbCrFast, YCbCrFastModule};
+diff --git a/crates/metal2vulkan/src/bind/ycbcr_convert/fast.rs b/crates/metal2vulkan/src/bind/ycbcr_convert/fast.rs
+new file mode 100644
+index 00000000..e0147437
+--- /dev/null
++++ b/crates/metal2vulkan/src/bind/ycbcr_convert/fast.rs
+@@ -0,0 +1,466 @@
++//! Sunfish 0131 (G7): the fast YCbCr conversion. The texels of [`ycbcr_convert`](super)'s module,
++//! read from the surface's own bytes through a uniform texel buffer instead of a staging copy and
++//! storage-buffer words, for the layout a video decoder's surfaces hold (8-bit 4:2:0 codes, `420v`
++//! and `420f`), read converted or through the sRGB curve.
++//!
++//! Taken from upstream metal2vulkan cdf59197 (`bind/ycbcr_in_place.rs`, "Read a YCbCr texture's
++//! planes in place"): the binding, an `R8G8_UINT` uniform texel buffer over the planes' bytes, one
++//! element two luma codes or one chroma pair (Vulkan requires the format's
++//! `UNIFORM_TEXEL_BUFFER` on every device), with each plane's place and rows in elements. Ours: it
++//! still fills the texture's image (no lowering of the functions that sample it), each invocation
++//! writes a 2 x 2 block of texels from the 3 x 3 chroma pairs around it (9 fetches and 2 luma
++//! fetches for 4 texels, where the module above loads 18 words a texel), and the shape is baked in
++//! as constants (as 0128's bake). The arithmetic is the module's: every texel is the one it writes.
++//!
++//! **The module** (one per shape). One `GLCompute` entry `main`, local size
++//! ([`YCbCrFast::LOCAL_SIZE`], [`YCbCrFast::LOCAL_SIZE`], 1), no push constants, in set 0:
++//! [`YCbCrFast::IMAGE_BINDING`], the texture's image as the module above binds it (`Rgba16f` or
++//! `Rgba32f`); [`YCbCrFast::TEXELS_BINDING`], the texel buffer, from [`YCbCrFast::base`] bytes
++//! before the planes' first byte, [`YCbCrFast::view_bytes`] long. Invocation `(i, j)` inside the
++//! chroma plane writes the texels `(2i + dx, 2j + dy)` inside the texture. The consumer dispatches
++//! [`YCbCrFast::groups`] and orders the planes' writes before `SHADER_SAMPLED_READ` in
++//! `COMPUTE_SHADER`.
++
++use std::sync::Arc;
++
++use super::{coefficients, knots_table, scalar, Cx, YCbCrOutput, YCbCrPlanes, YCbCrRange};
++use crate::budget::{Budget, Meter};
++use crate::device::requirements::Requirements;
++use crate::device::Device;
++use crate::error::{Error, InternalError, InternalKind};
++use crate::metal::format::ChromaSubsampling;
++use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage, Symbol};
++use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
++use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
++use crate::spirv::error::BResult;
++use crate::spirv::ids::Value;
++use crate::spirv::ir::{
++    BinOp, ConvOp, Dim, ExecMode, ExecModel, GlslOp, ImageOperands, ImageType, ImageUsage, IoDir,
++    MemAccess, StorageClass, TexelMemory, Type, TypedModule,
++};
++
++/// Sunfish 0131: the shape of one fast conversion (the module docs): the planes, as the module
++/// above reads them from the span's first byte, and the bytes the texel buffer starts before it.
++#[non_exhaustive]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub struct YCbCrFast {
++    planes: YCbCrPlanes,
++    base: u32,
++}
++
++impl YCbCrFast {
++    /// Descriptor set of every binding.
++    pub const SET: u32 = 0;
++    /// The texture's image: a 2D storage image, written.
++    pub const IMAGE_BINDING: u32 = 0;
++    /// The planes' bytes: an `R8G8_UINT` uniform texel buffer.
++    pub const TEXELS_BINDING: u32 = 1;
++    /// Invocations of one workgroup along x, and along y: a 2 x 2 block of texels each.
++    pub const LOCAL_SIZE: u32 = 8;
++
++    /// The fast form of `planes`, its texel buffer starting `base` bytes before their span: 8-bit
++    /// 4:2:0 codes, unpacked, read converted or through the sRGB curve, over both planes (not the
++    /// row of zeros a texture over plane 1 reads), every offset and row a whole element. `None`
++    /// for every other: the module above converts it.
++    pub fn of(planes: &YCbCrPlanes, base: u32) -> Option<YCbCrFast> {
++        let codes = planes.codes;
++        let even = [
++            planes.luma[0],
++            planes.luma[1],
++            planes.chroma[0],
++            planes.chroma[1],
++            base,
++        ]
++        .iter()
++        .all(|v| v % 2 == 0);
++        let fits = codes.bits == 8
++            && codes.bytes == 1
++            && !codes.packed
++            && codes.subsampling == ChromaSubsampling::Chroma420
++            && matches!(codes.output, YCbCrOutput::Converted | YCbCrOutput::Srgb)
++            && planes.chroma[1] != 0
++            && planes.size[0] > 0
++            && planes.size[1] > 0;
++        (fits && even).then_some(YCbCrFast {
++            planes: *planes,
++            base,
++        })
++    }
++
++    /// The planes.
++    pub fn planes(&self) -> &YCbCrPlanes {
++        &self.planes
++    }
++
++    /// The bytes the texel buffer starts before the planes' span.
++    pub fn base(&self) -> u32 {
++        self.base
++    }
++
++    /// The bytes of the planes' span the fetches reach: a row's last luma element holds the code
++    /// past an odd width's last.
++    pub fn reach(&self) -> u64 {
++        let p = &self.planes;
++        let [cw, ch] = p.chroma_size().map(u64::from);
++        let end =
++            |[at, row]: [u32; 2], rows: u64| u64::from(at) + u64::from(row) * (rows - 1) + 2 * cw;
++        end(p.luma, u64::from(p.size[1])).max(end(p.chroma, ch))
++    }
++
++    /// The bytes the texel buffer views, from its first: through the reach.
++    pub fn view_bytes(&self) -> u64 {
++        u64::from(self.base) + self.reach()
++    }
++
++    /// The workgroups the consumer dispatches: one invocation per chroma pair.
++    pub fn groups(&self) -> [u32; 2] {
++        self.planes
++            .chroma_size()
++            .map(|n| n.div_ceil(Self::LOCAL_SIZE))
++    }
++}
++
++/// The crate-owned fast YCbCr conversion module of one device and shape.
++#[non_exhaustive]
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct YCbCrFastModule {
++    /// SPIR-V 1.5 words, entry point `main`, bindings numbered as [`YCbCrFast`] states.
++    pub spirv: Arc<[u32]>,
++    /// What the module needs from the device.
++    pub requirements: Requirements,
++}
++
++/// The binding symbol of the image in the typed module.
++pub(super) const IMAGE: ResourceSlot = ResourceSlot {
++    stage: Stage::Kernel,
++    kind: ResourceKind::Texture,
++    index: 0,
++};
++/// The binding symbol of the texel buffer in the typed module.
++pub(super) const TEXELS: ResourceSlot = ResourceSlot {
++    stage: Stage::Kernel,
++    kind: ResourceKind::Texture,
++    index: 1,
++};
++
++/// The module of `fast` as a typed module, before serialization.
++pub(super) fn typed_module(fast: &YCbCrFast) -> BResult<TypedModule> {
++    let p = fast.planes;
++    let output = p.codes.output;
++    let [w, h] = p.size;
++    let [cw, ch] = p.chroma_size();
++    let mut b = ModuleBuilder::new();
++    let u32_ = b.ty(Type::Int {
++        width: 32,
++        signed: false,
++    })?;
++    let f32_ = b.ty(Type::Float { width: 32 })?;
++    let uvec2 = b.ty(Type::Vector { elem: u32_, len: 2 })?;
++    let uvec3 = b.ty(Type::Vector { elem: u32_, len: 3 })?;
++    let format = match output {
++        YCbCrOutput::Srgb => crate::spv::ImageFormat::Rgba32f,
++        _ => crate::spv::ImageFormat::Rgba16f,
++    };
++    let vec4 = b.ty(Type::Vector { elem: f32_, len: 4 })?;
++    let image_ty = b.ty(Type::Image(ImageType {
++        sampled_type: f32_,
++        dim: Dim::D2,
++        depth: false,
++        arrayed: false,
++        multisampled: false,
++        usage: ImageUsage::Storage,
++        format,
++    }))?;
++    let image = b.resource(IMAGE, StorageClass::UniformConstant, image_ty)?;
++    let texels_ty = b.ty(Type::Image(ImageType {
++        sampled_type: u32_,
++        dim: Dim::Buffer,
++        depth: false,
++        arrayed: false,
++        multisampled: false,
++        usage: ImageUsage::Sampled,
++        format: crate::spv::ImageFormat::Unknown,
++    }))?;
++    let texels = b.resource(TEXELS, StorageClass::UniformConstant, texels_ty)?;
++    let knots = match output {
++        YCbCrOutput::Srgb => Some(knots_table(&mut b, u32_)?),
++        _ => None,
++    };
++    let invocation = b.builtin(crate::spv::BuiltIn::GlobalInvocationId, IoDir::Input, uvec3)?;
++    let void = b.ty(Type::Void)?;
++    let mut f = b.function(void)?;
++    let zero = scalar(&mut f, u32_, 0)?;
++    let one = scalar(&mut f, u32_, 1)?;
++    // `bytes` is the module above's words binding, which nothing here reads.
++    let cx = Cx {
++        u32_,
++        zero,
++        one,
++        bytes: zero,
++    };
++    let invocation = f.module().global_value(invocation)?;
++    let invocation = f.load(invocation, MemAccess::default())?;
++    let i = f.composite_extract(invocation, &[0])?;
++    let j = f.composite_extract(invocation, &[1])?;
++    let cw_ = cx.uint(&mut f, cw)?;
++    let ch_ = cx.uint(&mut f, ch)?;
++    let in_x = f.binary(BinOp::ULessThan, i, cw_)?;
++    let in_y = f.binary(BinOp::ULessThan, j, ch_)?;
++    let inside = f.binary(BinOp::LogicalAnd, in_x, in_y)?;
++    let texels = f.module().global_value(texels)?;
++    let image = f.module().global_value(image)?;
++    let element = |at: u32| (fast.base + at) / 2;
++    let k = coefficients(p.range, p.matrix);
++    let block: ArmFn<'_, ()> = Box::new(move |f, _| {
++        let texels = f.load(texels, MemAccess::default())?;
++        let image = f.load(image, MemAccess::default())?;
++        // The pair (or luma codes) at element `e`: its first and second codes.
++        let fetch = |f: &mut FunctionBuilder<'_>, e: Value| -> BResult<[Value; 2]> {
++            let v = f.fetch(texels, e, &ImageOperands::default())?;
++            Ok([f.composite_extract(v, &[0])?, f.composite_extract(v, &[1])?])
++        };
++        // The pairs' columns and rows before, at and after `(i, j)`, clamped to the plane.
++        let around = |f: &mut FunctionBuilder<'_>, c: Value, n: u32| -> BResult<[Value; 3]> {
++            let at_start = f.binary(BinOp::IEqual, c, zero)?;
++            let before = f.binary(BinOp::ISub, c, one)?;
++            let before = f.select(at_start, zero, before)?;
++            let next = f.binary(BinOp::IAdd, c, one)?;
++            let last = cx.uint(f, n - 1)?;
++            let after = f.glsl(GlslOp::UMin, &[next, last])?;
++            Ok([before, c, after])
++        };
++        let cols = around(f, i, cw)?;
++        let rows = around(f, j, ch)?;
++        let three = cx.uint(f, 3)?;
++        let chroma_at = cx.uint(f, element(p.chroma[0]))?;
++        let chroma_row = cx.uint(f, p.chroma[1] / 2)?;
++        // Each row's sums across: `[dx][Cb, Cr]`, weighted 1 / 3 for an even column and 3 / 1
++        // for an odd one.
++        let mut across = Vec::with_capacity(3);
++        for r in rows {
++            let start = f.binary(BinOp::IMul, r, chroma_row)?;
++            let start = f.binary(BinOp::IAdd, chroma_at, start)?;
++            let mut pairs = Vec::with_capacity(3);
++            for c in cols {
++                let e = f.binary(BinOp::IAdd, start, c)?;
++                pairs.push(fetch(f, e)?);
++            }
++            let mut sums = [[zero; 2]; 2];
++            for component in 0..2 {
++                let mid = f.binary(BinOp::IMul, pairs[1][component], three)?;
++                sums[0][component] = f.binary(BinOp::IAdd, pairs[0][component], mid)?;
++                sums[1][component] = f.binary(BinOp::IAdd, mid, pairs[2][component])?;
++            }
++            across.push(sums);
++        }
++        let luma_at = cx.uint(f, element(p.luma[0]))?;
++        let luma_row = cx.uint(f, p.luma[1] / 2)?;
++        let eight = cx.uint(f, 8)?;
++        let four = cx.uint(f, 4)?;
++        let two_i = f.binary(BinOp::ShiftLeftLogical, i, one)?;
++        let two_j = f.binary(BinOp::ShiftLeftLogical, j, one)?;
++        for dy in 0..2u32 {
++            let dy_ = cx.uint(f, dy)?;
++            let y = f.binary(BinOp::IAdd, two_j, dy_)?;
++            // An odd height's last row: its block's second row lies past the texture, its luma
++            // fetched from the last row and its texels not written.
++            let y_inside = (dy == 1 && h % 2 == 1)
++                .then(|| -> BResult<Value> {
++                    let h_ = cx.uint(f, h)?;
++                    f.binary(BinOp::ULessThan, y, h_)
++                })
++                .transpose()?;
++            let luma_y = match y_inside {
++                Some(_) => {
++                    let last = cx.uint(f, h - 1)?;
++                    f.glsl(GlslOp::UMin, &[y, last])?
++                }
++                None => y,
++            };
++            let start = f.binary(BinOp::IMul, luma_y, luma_row)?;
++            let start = f.binary(BinOp::IAdd, luma_at, start)?;
++            let e = f.binary(BinOp::IAdd, start, i)?;
++            let lumas = fetch(f, e)?;
++            // Down: rows before and at weighted 1 / 3 for an even row, at and after 3 / 1.
++            let (upper, lower, upper_weight, lower_weight) = match dy {
++                0 => (&across[0], &across[1], one, three),
++                _ => (&across[1], &across[2], three, one),
++            };
++            for dx in 0..2u32 {
++                let mut chroma = [zero; 2];
++                for (component, c) in chroma.iter_mut().enumerate() {
++                    let a = f.binary(BinOp::IMul, upper[dx as usize][component], upper_weight)?;
++                    let b = f.binary(BinOp::IMul, lower[dx as usize][component], lower_weight)?;
++                    let s = f.binary(BinOp::IAdd, a, b)?;
++                    // `C = (S + 8) >> 4`.
++                    let s = f.binary(BinOp::IAdd, s, eight)?;
++                    *c = f.binary(BinOp::ShiftRightLogical, s, four)?;
++                }
++                let texel = convert(
++                    f,
++                    &cx,
++                    (f32_, vec4),
++                    (p.range, k, knots),
++                    lumas[dx as usize],
++                    chroma,
++                )?;
++                let dx_ = cx.uint(f, dx)?;
++                let x = f.binary(BinOp::IAdd, two_i, dx_)?;
++                let coord = f.composite_construct(uvec2, &[x, y])?;
++                // An odd width's last column, as an odd height's last row.
++                let x_inside = (dx == 1 && w % 2 == 1)
++                    .then(|| -> BResult<Value> {
++                        let w_ = cx.uint(f, w)?;
++                        f.binary(BinOp::ULessThan, x, w_)
++                    })
++                    .transpose()?;
++                let guard = match (x_inside, y_inside) {
++                    (Some(a), Some(b)) => Some(f.binary(BinOp::LogicalAnd, a, b)?),
++                    (a, b) => a.or(b),
++                };
++                let store: ArmFn<'_, ()> = Box::new(move |f, _| {
++                    f.write(
++                        image,
++                        coord,
++                        texel,
++                        &ImageOperands::default(),
++                        TexelMemory::PRIVATE,
++                    )?;
++                    Ok(ArmEnd::FallThrough(Vec::new()))
++                });
++                match guard {
++                    Some(guard) => {
++                        f.if_(&mut (), guard, store, None)?;
++                    }
++                    None => {
++                        store(f, &mut ())?;
++                    }
++                }
++            }
++        }
++        Ok(ArmEnd::FallThrough(Vec::new()))
++    });
++    f.if_(&mut (), inside, block, None)?;
++    f.ret(None)?;
++    let id = f.finish()?;
++    b.entry(
++        ExecModel::GLCompute,
++        id,
++        vec![ExecMode::LocalSize {
++            x: YCbCrFast::LOCAL_SIZE,
++            y: YCbCrFast::LOCAL_SIZE,
++            z: 1,
++        }],
++    )?;
++    b.finalize()
++}
++
++/// The texel of 8-bit luma code `luma` and chroma codes `[cb, cr]`, by the module above's
++/// arithmetic (`ycbcr_read`): the range's luma term, the matrix's `(kb, kr)` of each channel, onto
++/// the grid of `1 / 2048`, or through the sRGB curve's `knots` onto the grid of `1 / 8192`.
++fn convert(
++    f: &mut FunctionBuilder<'_>,
++    cx: &Cx,
++    (f32_, vec4): (crate::spirv::ids::TypeId, crate::spirv::ids::TypeId),
++    (range, k, knots): (
++        YCbCrRange,
++        [(i32, i32); 3],
++        Option<crate::spirv::ids::GlobalId>,
++    ),
++    luma: Value,
++    [cb, cr]: [Value; 2],
++) -> BResult<Value> {
++    // Counted as 10-bit codes (`<< 2`), less 512.
++    let two = cx.uint(f, 2)?;
++    let offset = cx.uint(f, 512)?;
++    let mut chroma = [cb, cr];
++    for c in chroma.iter_mut() {
++        let ten = f.binary(BinOp::ShiftLeftLogical, *c, two)?;
++        *c = f.binary(BinOp::ISub, ten, offset)?;
++    }
++    let l = match range {
++        // `9576 ((Y << 2) - 64)`.
++        YCbCrRange::Video => {
++            let y10 = f.binary(BinOp::ShiftLeftLogical, luma, two)?;
++            let sixty_four = cx.uint(f, 64)?;
++            let video = f.binary(BinOp::ISub, y10, sixty_four)?;
++            let scale = cx.uint(f, 9576)?;
++            f.binary(BinOp::IMul, video, scale)?
++        }
++        // `256 ⌊(32768 Y + 127) / 255⌋`.
++        YCbCrRange::Full => {
++            let fifteen = cx.uint(f, 15)?;
++            let wide = f.binary(BinOp::ShiftLeftLogical, luma, fifteen)?;
++            let half = cx.uint(f, 127)?;
++            let wide = f.binary(BinOp::IAdd, wide, half)?;
++            let max = cx.uint(f, 255)?;
++            let quotient = f.binary(BinOp::UDiv, wide, max)?;
++            let eight = cx.uint(f, 8)?;
++            f.binary(BinOp::ShiftLeftLogical, quotient, eight)?
++        }
++    };
++    let (bias, dropped, grid) = match knots {
++        Some(_) => (512, 10, 8192),
++        None => (2048, 12, 2048),
++    };
++    let round = cx.uint(f, bias)?;
++    let shift = cx.uint(f, dropped)?;
++    let top = cx.uint(f, grid)?;
++    let step = 1.0f32 / grid as f32;
++    let step = scalar(f, f32_, u64::from(step.to_bits()))?;
++    let mut channels = Vec::with_capacity(4);
++    for (kb, kr) in k {
++        let kb = cx.uint(f, kb as u32)?;
++        let kr = cx.uint(f, kr as u32)?;
++        let b_term = f.binary(BinOp::IMul, kb, chroma[0])?;
++        let r_term = f.binary(BinOp::IMul, kr, chroma[1])?;
++        let t = f.binary(BinOp::IAdd, l, b_term)?;
++        let t = f.binary(BinOp::IAdd, t, r_term)?;
++        let t = f.binary(BinOp::IAdd, t, round)?;
++        let v = f.binary(BinOp::ShiftRightArithmetic, t, shift)?;
++        let below = f.binary(BinOp::SLessThan, v, cx.zero)?;
++        let v = f.select(below, cx.zero, v)?;
++        let above = f.binary(BinOp::SGreaterThan, v, top)?;
++        let v = f.select(above, top, v)?;
++        let v = match knots {
++            Some(table) => cx.srgb_step(f, table, v)?,
++            None => v,
++        };
++        let v = f.convert(ConvOp::ConvertUToF, v, f32_)?;
++        channels.push(f.binary(BinOp::FMul, v, step)?);
++    }
++    channels.push(scalar(f, f32_, u64::from(1.0f32.to_bits()))?);
++    f.composite_construct(vec4, &channels)
++}
++
++/// The fixed binding numbers of the module's symbols.
++fn binding_of(sym: &Symbol) -> Option<u32> {
++    match sym {
++        Symbol::DescriptorSet(_) => Some(YCbCrFast::SET),
++        Symbol::Binding(s) if *s == IMAGE => Some(YCbCrFast::IMAGE_BINDING),
++        Symbol::Binding(s) if *s == TEXELS => Some(YCbCrFast::TEXELS_BINDING),
++        _ => None,
++    }
++}
++
++/// Sunfish 0131: the fast YCbCr conversion module of `device` for `fast`: built with the typed
++/// builder, checked by the owned verifier against the device's profile, serialized, and numbered
++/// with the fixed bindings of [`YCbCrFast`].
++pub fn ycbcr_fast_module(device: &Device, fast: &YCbCrFast) -> Result<YCbCrFastModule, Error> {
++    let profile = device.profile();
++    let m = typed_module(fast)?;
++    let mut meter = Meter::new(&Budget::default());
++    crate::spirv::verify::verify(&m, profile, &mut meter)?;
++    let r = crate::spirv::serialize::serialize(m)?;
++    profile.check(&r.requirements).map_err(|c| {
++        Error::Internal(InternalError::new(
++            InternalKind::RequirementsExceedProfile,
++            format!("the fast YCbCr conversion module needs {c:?}"),
++        ))
++    })?;
++    let words = crate::spirv::serialize::relocate(&r, &binding_of)?;
++    Ok(YCbCrFastModule {
++        spirv: words.into(),
++        requirements: r.requirements,
++    })
++}
+diff --git a/crates/metal2vulkan/src/bind/ycbcr_convert/tests.rs b/crates/metal2vulkan/src/bind/ycbcr_convert/tests.rs
+index f69f082a..4e587c8a 100644
+--- a/crates/metal2vulkan/src/bind/ycbcr_convert/tests.rs
++++ b/crates/metal2vulkan/src/bind/ycbcr_convert/tests.rs
+@@ -1262,3 +1262,153 @@ fn the_srgb_knots_are_the_curves() {
+     assert_eq!(srgb_step(24), 2);
+     assert_eq!(srgb_step(8192), 8192);
+ }
++
++/// Sunfish 0131: the fast module's texels of `surface` over a texel buffer starting `base` bytes
++/// before its bytes, each channel's `v` of `v / 2048` or of `v / 8192`, both invocation orders
++/// alike; alpha checked to be 1.
++fn fast_texels(surface: &Surface, base: u32) -> Vec<[u16; 3]> {
++    let fast = super::YCbCrFast::of(&surface.planes, base).expect("a fast shape");
++    let m = super::fast::typed_module(&fast).expect("fast module");
++    let mut bytes = vec![0x5A; base as usize];
++    bytes.extend_from_slice(&surface.bytes);
++    let view = fast.view_bytes() as usize;
++    assert!(
++        view <= bytes.len() && view % 2 == 0,
++        "the view lies in the bytes"
++    );
++    let [w, h] = surface.planes.size;
++    let grid = match surface.planes.codes.output {
++        YCbCrOutput::Srgb => 8192.0,
++        _ => 2048.0,
++    };
++    let groups = fast.groups();
++    let mut runs = Vec::new();
++    for order in [Order::Forward, Order::Reverse] {
++        let mut texels = Image::new(super::fast::TEXELS, [view as u32 / 2, 1, 1], 1, 1, 1);
++        for (e, t) in texels.texels.iter_mut().enumerate() {
++            *t = [u32::from(bytes[2 * e]), u32::from(bytes[2 * e + 1]), 0, 1];
++        }
++        let image = Image::new(super::fast::IMAGE, [w, h, 1], 1, 1, 1);
++        let cfg = Config {
++            order,
++            workgroups: [groups[0], groups[1], 1],
++            ..Config::default()
++        };
++        let res = Resources {
++            buffers: Vec::new(),
++            push: Vec::new(),
++            spec: Default::default(),
++        };
++        let (_, images) = run_with_images(&m, &cfg, res, vec![image, texels]).expect("run");
++        let out: Vec<[u16; 3]> = images[0]
++            .texels
++            .iter()
++            .map(|t| {
++                assert_eq!(f32::from_bits(t[3]), 1.0, "alpha 1 (every texel written)");
++                std::array::from_fn(|c| {
++                    let v = f32::from_bits(t[c]) * grid;
++                    assert!(
++                        v == v.round() && (0.0..=grid).contains(&v),
++                        "{v} off the grid"
++                    );
++                    v as u16
++                })
++            })
++            .collect();
++        runs.push(out);
++    }
++    assert_eq!(runs[0], runs[1], "order independent");
++    runs.swap_remove(0)
++}
++
++/// Sunfish 0131: the fast module writes the module's texels, every one, of random surfaces and of
++/// a test pattern (bars of luma, a chroma ramp), even and odd sizes, under every range and matrix,
++/// read converted and through the sRGB curve, its texel buffer at several places before the planes.
++#[test]
++fn the_fast_kernel_writes_the_kernels_texels() {
++    let shapes: [([u32; 2], u32, [u32; 2]); 6] = [
++        ([1, 1], 0, [16, 16]),
++        ([2, 2], 0, [16, 16]),
++        ([33, 17], 48, [48, 48]),
++        ([2, 3], 16, [16, 16]),
++        ([17, 9], 512, [32, 32]),
++        ([40, 24], 0, [48, 48]),
++    ];
++    let mut random = Random::ycf3(131);
++    for pf in [PixelFormat::YCBCR84202P, PixelFormat::YCBCR84202PSRGB] {
++        let codes = codes_of(pf);
++        for conversion in CONVERSIONS {
++            for (size, at, rows) in shapes {
++                let [w, h] = size;
++                let pattern = random.next() % 2 == 0;
++                let luma: Vec<u16> = (0..w * h)
++                    .map(|i| match pattern {
++                        true => [16, 235, 128, 0, 255, 81][((i % w) * 6 / w) as usize],
++                        false => u16::from(random.next()),
++                    })
++                    .collect();
++                let [cw, ch] =
++                    YCbCrPlanes::new(size, [0; 2], [0; 2], conversion, codes).chroma_size();
++                let chroma: Vec<u16> = (0..2 * cw * ch)
++                    .map(|i| match pattern {
++                        true => ((i * 37) % 256) as u16,
++                        false => u16::from(random.next()),
++                    })
++                    .collect();
++                let surface = Surface::new(
++                    size,
++                    at,
++                    rows,
++                    (conversion, codes),
++                    &|x, y| luma[(y * w + x) as usize],
++                    &|x, y| {
++                        let i = (2 * (y * cw + x)) as usize;
++                        [chroma[i], chroma[i + 1]]
++                    },
++                );
++                let want = surface.converted();
++                for base in [0, 2, 62] {
++                    assert_eq!(
++                        fast_texels(&surface, base),
++                        want,
++                        "{pf:?} {conversion:?} {size:?} base {base}"
++                    );
++                }
++            }
++        }
++    }
++}
++
++/// Sunfish 0131: the fast form holds only 8-bit 4:2:0 codes read converted or through the sRGB
++/// curve, over both planes.
++#[test]
++fn the_fast_form_holds_the_video_layouts_alone() {
++    let conversion = CONVERSIONS[0];
++    for pf in HELD
++        .into_iter()
++        .chain(HELD_SUBSAMPLED.into_iter().flatten())
++        .chain(HELD_PACKED)
++    {
++        let codes = codes_of(pf);
++        let planes = YCbCrPlanes::new([4, 4], [0, 16], [64, 16], conversion, codes);
++        let held = matches!(pf, PixelFormat::YCBCR84202P | PixelFormat::YCBCR84202PSRGB);
++        assert_eq!(super::YCbCrFast::of(&planes, 0).is_some(), held, "{pf:?}");
++        // Over plane 1 (chroma codes 0, rows 0 apart): never.
++        let planes = YCbCrPlanes::new([4, 4], [0, 16], [64, 0], conversion, codes);
++        assert!(
++            super::YCbCrFast::of(&planes, 0).is_none(),
++            "{pf:?} over plane 1"
++        );
++    }
++    // The modules of a 1080p video surface's shape (and an odd one) on every committed profile.
++    for (_, p) in committed_profiles().expect("profiles") {
++        for pf in [PixelFormat::YCBCR84202P, PixelFormat::YCBCR84202PSRGB] {
++            for (size, chroma_at) in [([1920, 1080], 1920 * 1088), ([33, 17], 48 * 17)] {
++                let planes =
++                    YCbCrPlanes::new(size, [0, 1920], [chroma_at, 1920], conversion, codes_of(pf));
++                let fast = super::YCbCrFast::of(&planes, 0).expect("fast");
++                assert_valid(super::fast::typed_module(&fast).expect("module"), &p);
++            }
++        }
++    }
++}

@@ -1,0 +1,40 @@
+#version 450
+// m2vtest readbench (S0b): bridge 0131's fast YCbCr conversion (bind/ycbcr_convert/fast.rs), simplified: one invocation per
+// chroma pair of a 1920x1080 NV12 surface (luma rows 1920 at byte 0, chroma rows 1920 at byte 2073600) read through an
+// R8G8_UINT uniform texel buffer, 9 chroma pairs (3 x 3, clamped) and 2 luma elements for a 2 x 2 block of texels, BT.601
+// video range, written to a storage image of the caller's format (RGBA8 or RGBA16F: no format qualifier).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) writeonly uniform image2D dst;
+layout(set = 0, binding = 1) uniform usamplerBuffer planes;
+const uint CW = 960u, CH = 540u, LUMA_ROW = 960u, CHROMA_AT = 1036800u, CHROMA_ROW = 960u;
+
+vec4 rgb(uint y, uvec2 c)
+{
+	float l = (float(y) - 16.0) * (255.0 / 219.0), cb = float(c.x) - 128.0, cr = float(c.y) - 128.0;
+	return vec4(clamp(vec3(l + 1.596 * cr, l - 0.392 * cb - 0.813 * cr, l + 2.017 * cb) / 255.0, 0.0, 1.0), 1.0);
+}
+
+void main()
+{
+	uint i = gl_GlobalInvocationID.x, j = gl_GlobalInvocationID.y;
+	if (i >= CW || j >= CH)
+		return;
+	uint cols[3] = uint[3](i == 0u ? 0u : i - 1u, i, min(i + 1u, CW - 1u));
+	uint rows[3] = uint[3](j == 0u ? 0u : j - 1u, j, min(j + 1u, CH - 1u));
+	uvec2 across[3][2];
+	for (int r = 0; r < 3; r++) {
+		uint start = CHROMA_AT + rows[r] * CHROMA_ROW;
+		uvec2 a = texelFetch(planes, int(start + cols[0])).xy, b = texelFetch(planes, int(start + cols[1])).xy,
+		      c = texelFetch(planes, int(start + cols[2])).xy;
+		across[r][0] = a + 3u * b;
+		across[r][1] = 3u * b + c;
+	}
+	for (uint dy = 0u; dy < 2u; dy++) {
+		uint y = 2u * j + dy;
+		uvec2 lumas = texelFetch(planes, int(y * LUMA_ROW + i)).xy;
+		for (uint dx = 0u; dx < 2u; dx++) {
+			uvec2 s = dy == 0u ? across[0][dx] + 3u * across[1][dx] : 3u * across[1][dx] + across[2][dx];
+			imageStore(dst, ivec2(2u * i + dx, y), rgb(lumas[dx], (s + 8u) >> 4));
+		}
+	}
+}

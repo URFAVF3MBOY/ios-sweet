@@ -1,11 +1,10 @@
 name: metal2
 
-# SweetMetal2.bundle for iOS 16 arm64 (Metal on the Adreno 640 through metal2vulkan + Turnip).
-# Sources and this build come from ios-redfin (github.com/DenialOfGravity/ios-redfin, MIT) at fb7149ad:
-# phone/metal2, phone/turnip, tools/build-turnip-ios.sh, tools/build-m2v-bridge.sh.
-# Turnip = Mesa 85fda3b3 + UniXNU's mesa patches (UniXNU e95b37d9) + phone/turnip/patches; the bridge =
-# steelbrain/metal2vulkan 720ef1ce + phone/metal2/bridge/patches. Turnip's darwin backend talks to the kernel
-# through phone/turnip/NativeAdrenoABI.h (IOAcceleratorES, open type 0x4147).
+# SweetMetal2.bundle for iOS 16 arm64: Metal on the Adreno 640 through metal2vulkan + Turnip.
+# phone/metal2, phone/turnip, tools/build-turnip-ios.sh, tools/build-m2v-bridge.sh and this build come from
+# ios-flame (github.com/Yofuness/ios-flame, MIT) at 28fb6363. Turnip = Mesa 85fda3b3 + UniXNU's mesa patches
+# (UniXNU e95b37d9) + phone/turnip/patches; the bridge = steelbrain/metal2vulkan 720ef1ce + phone/metal2/bridge/patches.
+# Turnip's darwin backend talks to the kernel through phone/turnip/NativeAdrenoABI.h (IOAcceleratorES, open type 0x4147).
 
 on:
   workflow_dispatch:
@@ -20,7 +19,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
