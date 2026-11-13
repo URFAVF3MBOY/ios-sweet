@@ -60,7 +60,7 @@ diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
  static void ud_start_thread(void *arg, wait_result_t wr);
  extern int sweet_smmu_bypass(uint32_t sid);    /* sweet_smmu.c, 0133 */
  extern int sweet_smmu_identity(uint32_t sid);  /* sweet_smmu.c, 0138 */
-@@ -124,7 +133,14 @@ sweet_usb_probe(void)
+@@ -124,7 +133,13 @@ sweet_usb_probe(void)
  	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
  	    usb_rd(dwc, 0xc140));
  	if (enabled >= 2) {
@@ -68,14 +68,13 @@ diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
  		ud_rndis = (enabled == 3);      /* 0155 */
 +		PE_parse_boot_argn("sweetusbdebug", &debug, sizeof(debug));
 +		ud_apple = !debug && sweet_usbdev_available();  /* 0217 */
-+		printf("HOTDOGB USB: sweetusbdebug=%d, Apple IOUSBDeviceFamily %s: %s
-+", debug,
++		printf("HOTDOGB USB: sweetusbdebug=%d, Apple IOUSBDeviceFamily %s: %s\n", debug,
 +		    sweet_usbdev_available() ? "prelinked" : "not in this image",
 +		    ud_apple ? "iPhone mode" : "debug mode (RNDIS/ECM)");
  		/*
  		 * OnePlus 7T (0092): not here. The probe runs inside the storage driver's init, before the
  		 * persistent log saves anything, and on the 7T the start-up below sent the phone to
-@@ -1391,10 +1407,39 @@ ud_start_thread(void *arg, wait_result_t wr)
+@@ -1391,10 +1406,38 @@ ud_start_thread(void *arg, wait_result_t wr)
  			return;
  		}
  	}
@@ -85,8 +84,7 @@ diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 +			thread_terminate(current_thread());
 +			return;
 +		}
-+		printf("HOTDOGB USB: iPhone mode did not start: falling back to %s
-+", ud_rndis ? "RNDIS" : "CDC ECM");
++		printf("HOTDOGB USB: iPhone mode did not start: falling back to %s\n", ud_rndis ? "RNDIS" : "CDC ECM");
 +	}
  	sweet_usb_gadget_start(ud_start_dwc);
  	thread_terminate(current_thread());
