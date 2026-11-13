@@ -177,7 +177,16 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --target aarch64-apple-ios
           export IPHONEOS_DEPLOYMENT_TARGET=16.0
+          # metal2vulkan at the bridge's rev with metal/m2v-patches applied, in place of the git source
+          M2V_REV=$(sed -n 's/^metal2vulkan-runtime = .*rev = "\([0-9a-f]*\)".*/\1/p' metal/bridge/Cargo.toml)
+          rm -rf work/m2v && git init -q work/m2v
+          git -C work/m2v fetch -q --depth 1 https://github.com/steelbrain/metal2vulkan "$M2V_REV"
+          git -C work/m2v checkout -q FETCH_HEAD
+          for p in metal/m2v-patches/*.patch; do echo "apply $p"; git -C work/m2v apply "$PWD/$p"; done
+          M2V='patch."https://github.com/steelbrain/metal2vulkan"'
           cargo +1.98.1 build --release --target aarch64-apple-ios --manifest-path metal/bridge/Cargo.toml \
+            --config "$M2V.metal2vulkan-runtime.path=\"$PWD/work/m2v/crates/metal2vulkan-runtime\"" \
+            --config "$M2V.metal2vulkan.path=\"$PWD/work/m2v/crates/metal2vulkan\"" \
             --target-dir work/mtl-target > work/bridge.log 2>&1 ||
             { grep -E "^(error|warning: unused)" -A8 work/bridge.log | head -120; exit 1; }
           B=out/SweetMTL.bundle
