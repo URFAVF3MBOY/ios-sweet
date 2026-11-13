@@ -1,0 +1,79 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 12 Nov 2026 19:20:00 -0500
+Subject: [PATCH] op7t-0221: NECP reads the socket-delegation entitlement from the asking process
+
+0220 booted (2026-11-12 19:01 phone time): Safari's first page still took
+30.59 s ("finally received commit 30.59s after visible content rect update
+request") and the kernel still said every 3 s "necp_application_find_
+policy_match_internal: com.apple.WebKit(624) does not hold the necessary
+entitlement to delegate network traffic for other processes" (also
+nsurlsessiond, dasd, trustd, geod).
+
+NECP_VERIFY_DELEGATION_ENTITLEMENT(_p, _c, ...) asks priv_check_cred(_c,
+PRIV_NET_PRIVILEGED_SOCKET_DELEGATE); 0220's priv_grant hook only gets the
+credential and looks at current_proc(), which is the kernel when NECP
+re-evaluates its clients from its own update thread call. Now the check
+also accepts the process it names (_p) when that process's signature holds
+com.apple.private.network.socket-delegate (sweet_amfi.c:
+sweet_proc_entitled()).
+
+Checked with tools/xnu-cc.py (CI flags, 0216 build tree): both files compile.
+
+Apply after 0220.
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 16a63ec..ac64d0c 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -64,6 +64,22 @@ sweet_proc_entitlements(proc_t proc)
+ 	return blob != NULL ? csblob_os_entitlements_get(blob) : NULL;
+ }
+ 
++/*
++ * 0221: does `proc' (not the current process) hold the boolean entitlement `name'? For callers that have the process
++ * in hand: NECP checks a client's socket-delegation entitlement from its own update thread call too, where
++ * current_proc() is the kernel, so 0220's priv_grant hook (which can only look at the current process) refused
++ * WebKit's Networking process every 3 s and Safari waited ~30 s for its first page.
++ */
++bool sweet_proc_entitled(proc_t proc, const char *name);
++
++bool
++sweet_proc_entitled(proc_t proc, const char *name)
++{
++	void *ent = proc != NULL ? sweet_proc_entitlements(proc) : NULL;
++
++	return ent != NULL && sweet_entitlements_bool(ent, name);
++}
++
+ static void
+ sweet_amfi_entitlements_invalidate(__unused void *os_entitlements)
+ {
+diff --git a/bsd/net/necp.c b/bsd/net/necp.c
+index d421733..295ef61 100644
+--- a/bsd/net/necp.c
++++ b/bsd/net/necp.c
+@@ -6858,9 +6858,23 @@ necp_send_network_denied_event(pid_t pid, uuid_t proc_uuid, u_int32_t network_ty
+ 
+ extern char *proc_name_address(void *p);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0221 (OnePlus 7T): the delegation entitlement of the process asking, read from its signature (sweet_amfi.c).
++ * There is no AMFI here to answer priv_check_cred for it, and this check also runs from NECP's own client
++ * updates, where the current process is the kernel: WebKit's Networking process was refused every 3 s ("does not
++ * hold the necessary entitlement to delegate network traffic") and Safari's first page took ~30 s.
++ */
++extern bool sweet_proc_entitled(proc_t proc, const char *name);
++#define NECP_SWEET_DELEGATION_ENTITLED(_p) sweet_proc_entitled((proc_t)(_p), "com.apple.private.network.socket-delegate")
++#else
++#define NECP_SWEET_DELEGATION_ENTITLED(_p) false
++#endif
++
+ #define NECP_VERIFY_DELEGATION_ENTITLEMENT(_p, _c, _d) \
+ 	if (!has_checked_delegation_entitlement) { \
+-	        has_delegation_entitlement = (priv_check_cred(_c, PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, 0) == 0); \
++	        has_delegation_entitlement = (priv_check_cred(_c, PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, 0) == 0) || \
++	            NECP_SWEET_DELEGATION_ENTITLED(_p); \
+ 	        has_checked_delegation_entitlement = TRUE; \
+ 	} \
+ 	if (!has_delegation_entitlement) { \
