@@ -3,6 +3,15 @@
 ## Status / current work (2026-11-09, latest)
 
 ### >>> RESUME HERE (2026-11-12, latest) <<<
+- **0223: IOSurface plane bytes-per-row fixed (video's H264SW SIGBUS) (2026-11-12 ~20:40 phone time).**
+  - IOSurface.framework's plane getters, disassembled from the phone (scratchpad iosfn.py/iosfn2.py: dlsym + follow the wrapper's `b` + dump; capstone on the PC). Lock result at IOSurfaceClient + 0x68, plane i record at result + 0x68 + i*0x80:
+    - width +0x00 (client+0xd0), height +0x04 (+0xd4), offset +0x0c (GetBaseAddressOfPlane +0xdc), **bytes per row +0x10 (+0xe0)**, bytes per element +0x18, element width/height +0x1a/+0x1b, component count +0x1c, bit depths +0x20...
+    - A byte at +0x54 (+0x124) equal to 1 makes bpr and base address report 0.
+    - sweet_surface_fill_result wrote bpr only at +0x08.
+  - **0223** (`xnu/patches/0223-op7t-iosurface-plane-bytes-per-row.patch`, arm64 CI 43364561666, kernel d6b23aa9, image `research/kexts/shim-boot-0223-iphone.img`): bpr also at +0x10 (+0x08 kept).
+  - **Checked:** `tools/cv420v_test.py` (352x288 '420v'): CV planes bpr [384, 384]; IOSurface plane 0 352x288 bpr 384, plane 1 176x144 bpr 384 (was [0, 0]).
+    - 2 min oslog while a YouTube test was asked for: no mediaserverd crash (CrashReporter count 25 -> 25; mediaserverd still the boot instance, pid 28).
+    - Whether a video actually played with picture and sound: to be confirmed.
 - **SAFARI'S 30 s FIRST PAGE FIXED: 0222 (2026-11-12, checked: "loads instantly, no black").**
   - **Cause:** a spindump 10 s into the black (`logs/spin0221/`, script: kill Safari/WebKit, wait for MobileSafari, sleep 10, `spindump PID 3 -file` each) showed the WebKit GPU process's "RemoteRenderingBackend work queue" blocked by turnstile on thread "CA::CG::Queue".
     - Names resolved against `QuartzCore` in the repo root (UUID DC2DD4C1, same as the phone; llvm-nm nearest symbol): `CA::CG::ContextDelegate::operation_` -> `CA::CG::AccelRenderer::acquire` -> `CAMetalContextCreate` -> `___CAMetalContextCreate_block_invoke` (0x1885356b8).
