@@ -12,7 +12,7 @@ B=out/SweetMetal2.bundle
 rm -rf "$B" && mkdir -p "$B"
 "$CC" -x objective-c++ -std=c++17 -fobjc-arc -O2 -g -Wall -Wno-deprecated-declarations -Wno-unused-function -bundle \
 	-o "$B/SweetMetal2" SweetMetal2.mm NativeBridgeMetalFrontend.mm -x none "$BRIDGE" -Wl,-dead_strip -lc++ \
-	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation 2>&1 |
+	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework Accelerate 2>&1 |
 	grep -v "was built for newer 'iOS' version" || true
 [ -f "$B/SweetMetal2" ] || exit 1
 rm -rf out/SweetMetal2.dSYM; mv "$B/SweetMetal2.dSYM" out/ 2>/dev/null || dsymutil "$B/SweetMetal2" -o out/SweetMetal2.dSYM 2>/dev/null || true
