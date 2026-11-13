@@ -1,0 +1,30 @@
+0224: IOAcceleratorES names a Metal plugin bundle (boot-arg sweetmtl=NAME, off by default).
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 9a317fb..671a499 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -523,6 +523,23 @@ SweetAcceleratorStub(IOService * provider)
+ 		return;
+ 	}
+ 	acc->setName("IOAcceleratorES");
++	/*
++	 * 0224: Metal. Metal.framework loads the bundle /System/Library/Extensions/<MetalPluginName>.bundle and
++	 * makes a device of its class <MetalPluginClassName> (-initWithAcceleratorPort:). Off unless boot-arg
++	 * sweetmtl=NAME names the bundle (SweetMTL: my frontend over metal2vulkan + Turnip). The bundle itself
++	 * decides which processes get a device; the others get none, and QuartzCore stays on OpenGL ES.
++	 */
++	{
++		char plugin[32] = "";
++
++		if (PE_parse_boot_argn("sweetmtl", plugin, sizeof(plugin)) && plugin[0] != '\0' && strcmp(plugin, "0") != 0) {
++			acc->setProperty("MetalPluginName", plugin);
++			acc->setProperty("MetalPluginClassName", "SweetMTLDevice");
++			acc->setProperty("IOGLBundleName", plugin);
++			acc->setProperty("model", "Adreno 640");
++			IOLog("RedwoodGPU: IOAcceleratorES names Metal plugin %s.bundle (SweetMTLDevice)\n", plugin);
++		}
++	}
+ 	acc->registerService();
+ 	acc->release();
+ 	IOLog("RedwoodGPU: IOAcceleratorES stand-in published (QuartzCore's 30 s Metal wait)\n");
