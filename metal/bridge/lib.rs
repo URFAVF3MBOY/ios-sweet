@@ -241,7 +241,12 @@ pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_wait(c: *const CommandBuffer) -> i32 {
-    match timed("wait", || (*c).wait_until_completed()) {
+    let r = timed("wait", || (*c).wait_until_completed());
+    if std::env::var_os("SWEETMTL_COUNTS").is_some() {
+        // the runtime's own counters of what its commit path did (copies, shadows, barriers), all of them
+        eprintln!("sweetmtl: work counts {:?}", (*c).device().work_counts());
+    }
+    match r {
         Ok(()) => 0,
         Err(e) => fail("wait_until_completed", e),
     }
