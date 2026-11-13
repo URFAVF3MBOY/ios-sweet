@@ -141,6 +141,19 @@ errno_of(kern_return_t kr)
 	}
 }
 
+/* SWEETDRM_TRACE=1: every request to the kernel, and every syncobj wait that fails, to stderr. */
+static bool
+trace(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *t = getenv("SWEETDRM_TRACE");
+		on = t != NULL && t[0] == '1';
+	}
+	return on;
+}
+
 /* One request to the kernel: 0 or -errno (errno set as well). */
 static int
 gpu_call(int fd, uint32_t selector, void *arg, size_t size)
@@ -153,7 +166,16 @@ gpu_call(int fd, uint32_t selector, void *arg, size_t size)
 		errno = EBADF;
 		return -EBADF;
 	}
-	e = errno_of(IOConnectCallStructMethod(conn, selector, arg, size, arg, &out));
+	kern_return_t kr = IOConnectCallStructMethod(conn, selector, arg, size, arg, &out);
+
+	e = errno_of(kr);
+	if (trace()) {
+		const uint32_t *w = arg;
+
+		/* the request, its first words (handles, sizes, params) and the kernel's answer */
+		fprintf(stderr, "sweetdrm: sel %#x size %zu [%#x %#x %#x %#x] -> kr %#x errno %d\n", selector, size,
+		    size > 0 ? w[0] : 0, size > 4 ? w[1] : 0, size > 8 ? w[2] : 0, size > 12 ? w[3] : 0, kr, e);
+	}
 	errno = e;
 	return -e;
 }
@@ -323,6 +345,9 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, 
 
 			if (s == NULL) {
 				pthread_mutex_unlock(&lock);
+				if (trace()) {
+					fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+				}
 				return -(errno = EINVAL);
 			}
 			if (syncobj_done_locked(s)) {
@@ -347,10 +372,16 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, 
 		}
 		if (unsubmitted != 0 && !for_submit) {
 			pthread_mutex_unlock(&lock);
+			if (trace()) {
+				fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+			}
 			return -(errno = EINVAL);
 		}
 		if (now >= timeout_nsec) {
 			pthread_mutex_unlock(&lock);
+			if (trace()) {
+				fprintf(stderr, "sweetdrm: %s:%d refused (ETIME)\n", __func__, __LINE__);
+			}
 			return -(errno = ETIME);
 		}
 		/*
@@ -398,6 +429,9 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 	(void)fd;
 	(void)flags;
 	if (dst_point != 0 || src_point != 0) {
+		if (trace()) {
+			fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+		}
 		return -(errno = EINVAL);       /* no timelines (DRM_CAP_SYNCOBJ_TIMELINE is 0) */
 	}
 	pthread_mutex_lock(&lock);
@@ -418,6 +452,9 @@ int
 drmSyncobjTimelineSignal(int fd, const uint32_t *h, uint64_t *p, uint32_t n)
 {
 	(void)fd; (void)h; (void)p; (void)n;
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+	}
 	return -(errno = EINVAL);
 }
 
@@ -425,6 +462,9 @@ int
 drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *first)
 {
 	(void)fd; (void)h; (void)p; (void)n; (void)t; (void)f; (void)first;
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+	}
 	return -(errno = EINVAL);
 }
 
@@ -432,6 +472,9 @@ int
 drmSyncobjQuery(int fd, uint32_t *h, uint64_t *p, uint32_t n)
 {
 	(void)fd; (void)h; (void)p; (void)n;
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+	}
 	return -(errno = EINVAL);
 }
 
@@ -439,6 +482,9 @@ int
 drmSyncobjQuery2(int fd, uint32_t *h, uint64_t *p, uint32_t n, uint32_t f)
 {
 	(void)fd; (void)h; (void)p; (void)n; (void)f;
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: %s:%d refused (EINVAL)\n", __func__, __LINE__);
+	}
 	return -(errno = EINVAL);
 }
 
@@ -482,6 +528,10 @@ msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 	req->flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
 	req->nr_in_syncobjs = req->nr_out_syncobjs = 0;
 	req->in_syncobjs = req->out_syncobjs = 0;
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: submit queue %u: %u cmds, %u bos, %u in / %u out syncobjs, flags %#x\n",
+		    req->queueid, req->nr_cmds, req->nr_bos, nr_in, nr_out, req->flags);
+	}
 	ret = gpu_call(fd, DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, req, size);
 	if (ret != 0) {
 		return ret;
