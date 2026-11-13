@@ -497,7 +497,98 @@ int drmSyncobjFDToHandle(int fd, int o, uint32_t *h) { (void)fd; (void)o; (void)
 int drmSyncobjImportSyncFile(int fd, uint32_t h, int s) { (void)fd; (void)h; (void)s; return -(errno = ENOSYS); }
 int drmSyncobjExportSyncFile(int fd, uint32_t h, int *s) { (void)fd; (void)h; (void)s; return -(errno = ENOSYS); }
 int drmPrimeHandleToFD(int fd, uint32_t h, uint32_t f, int *p) { (void)fd; (void)h; (void)f; (void)p; return -(errno = ENOSYS); }
-int drmPrimeFDToHandle(int fd, int p, uint32_t *h) { (void)fd; (void)p; (void)h; return -(errno = ENOSYS); }
+
+/*
+ * IOSurfaces as "dma-bufs", for Turnip's VK_EXT_external_memory_dma_buf import (SweetMTL's
+ * newTextureWithDescriptor:iosurface:plane:). sweetdrm_surface_fd() makes a descriptor that stands for
+ * the surface: an unlinked file as long as the surface's memory, since Turnip asks lseek() for the
+ * size, remembered with the surface's ID. drmPrimeFDToHandle() on it asks RedwoodGPU for the surface's
+ * memory as a buffer (kRedwoodSurface, 0x7e; the same surface gives the same handle, as one dma-buf
+ * gives one GEM handle on Linux), and forgets the descriptor: a successful Vulkan import owns and
+ * closes it. A failed one is the caller's to close (sweetdrm_surface_fd_forget).
+ */
+#define REDWOOD_SURFACE 0x7e
+struct redwood_surface {
+	uint32_t surface, handle;
+	uint64_t size;
+	uint32_t offset, row_bytes, width, height, pixel_format, planes;
+};
+#define MAX_SURFACE_FDS 256
+static struct { int fd; uint32_t surface; } surface_fds[MAX_SURFACE_FDS];
+
+int
+sweetdrm_surface_fd(uint32_t surface, uint64_t size)
+{
+	char path[] = "/var/tmp/sweetdrm-surface-XXXXXX";
+	int fd = mkstemp(path);
+
+	if (fd < 0) {
+		return -1;
+	}
+	unlink(path);
+	if (ftruncate(fd, (off_t)size) != 0) {
+		close(fd);
+		return -1;
+	}
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_SURFACE_FDS; i++) {
+		if (surface_fds[i].surface == 0) {
+			surface_fds[i].fd = fd;
+			surface_fds[i].surface = surface;
+			pthread_mutex_unlock(&lock);
+			return fd;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	close(fd);
+	errno = ENFILE;
+	return -1;
+}
+
+void
+sweetdrm_surface_fd_forget(int fd)
+{
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_SURFACE_FDS; i++) {
+		if (surface_fds[i].surface != 0 && surface_fds[i].fd == fd) {
+			surface_fds[i].surface = 0;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+int
+drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
+{
+	uint32_t surface = 0;
+
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_SURFACE_FDS; i++) {
+		if (surface_fds[i].surface != 0 && surface_fds[i].fd == prime_fd) {
+			surface = surface_fds[i].surface;
+			surface_fds[i].surface = 0;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	if (surface == 0) {
+		return -(errno = ENOSYS);               /* not one of ours: no other dma-bufs here */
+	}
+	struct redwood_surface r = { .surface = surface };
+	int ret = gpu_call(fd, REDWOOD_SURFACE, &r, sizeof(r));
+
+	if (ret != 0) {
+		if (trace()) {
+			fprintf(stderr, "sweetdrm: IOSurface %u as a buffer: errno %d\n", surface, -ret);
+		}
+		return ret;
+	}
+	if (trace()) {
+		fprintf(stderr, "sweetdrm: IOSurface %u -> handle %u, %llu bytes, %ux%u rows of %u at %u\n", surface,
+		    r.handle, (unsigned long long)r.size, r.width, r.height, r.row_bytes, r.offset);
+	}
+	*handle = r.handle;
+	return 0;
+}
 
 /* ---- msm requests ---- */
 

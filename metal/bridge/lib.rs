@@ -49,6 +49,8 @@ pub(crate) fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
 
 type Gipa = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
 static TURNIP_GIPA: OnceLock<usize> = OnceLock::new();
+/// Turnip's dlopen handle: sweetdrm's own exports (IOSurface descriptors) are looked up in it.
+pub(crate) static TURNIP_HANDLE: OnceLock<usize> = OnceLock::new();
 
 /// Turnip's vk_icdGetInstanceProcAddr, for every instance-level and global request.
 #[no_mangle]
@@ -79,6 +81,7 @@ fn open_turnip(path: &CStr) -> Result<(), String> {
             return Err(format!("no vk_icdGetInstanceProcAddr in {}", path.to_string_lossy()));
         }
         let _ = TURNIP_GIPA.set(f as usize);
+        let _ = TURNIP_HANDLE.set(h as usize);
     }
     Ok(())
 }

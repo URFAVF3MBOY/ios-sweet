@@ -143,4 +143,9 @@ int smtl_blit_texture_to_texture(smtl_blit *e, const smtl_texture *src, uint64_t
     uint64_t dst_level, uint64_t dx, uint64_t dy, uint64_t dz);
 int smtl_blit_mipmaps(smtl_blit *e, const smtl_texture *t);
 
+/* A texture over an IOSurface's plane, the surface's own memory imported (no copy) where possible. */
+smtl_texture *smtl_texture_new_iosurface(const smtl_device *d, uint32_t type, uint32_t pixel_format, uint64_t width,
+    uint64_t height, uint64_t mipmaps, uint64_t usage, uint32_t surface, void *base, uint64_t alloc_size,
+    uint64_t plane_offset, uint64_t bytes_per_row, bool planar);
+
 #endif

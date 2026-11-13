@@ -20,6 +20,7 @@ use metal2vulkan_runtime::{
     LoadAction, Origin, PipelineOptions, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
     SamplerState, ScissorRect, Size, StoreAction, Texture, TextureDescriptor, Viewport,
 };
+use std::ffi::c_void;
 use std::ptr;
 
 fn boxed<T, E: std::fmt::Display>(what: &str, r: Result<T, E>) -> *mut T {
@@ -563,4 +564,74 @@ pub unsafe extern "C" fn smtl_function_type(f: *const Function) -> u32 {
             0
         }
     }
+}
+
+// ---- IOSurface textures (newTextureWithDescriptor:iosurface:plane:) ----
+
+type SurfaceFd = unsafe extern "C" fn(u32, u64) -> i32;
+
+/// sweetdrm_surface_fd from Turnip (sweetdrm is linked into libvulkan_freedreno), or None.
+fn surface_fd_fn() -> Option<SurfaceFd> {
+    let h = *crate::TURNIP_HANDLE.get()?;
+    // SAFETY: dlsym on the handle open_turnip got; the symbol has this C signature (sweetdrm.h).
+    unsafe {
+        let f = libc::dlsym(h as *mut c_void, c"sweetdrm_surface_fd".as_ptr());
+        if f.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, SurfaceFd>(f)) }
+    }
+}
+
+/// A texture over plane `plane_offset`/`bytes_per_row` of IOSurface `surface`, whose memory this process maps at
+/// `base` (`alloc_size` bytes). The surface's memory becomes a no-copy buffer whose pages the runtime imports as
+/// dma-bufs (Turnip refuses host pointers, mesa patch 0006): sweetdrm hands out a descriptor standing for the
+/// surface, and RedwoodGPU gives the surface's own memory to the GPU (no copy). Only requests that start at
+/// the surface's first page are answered that way; any other (a plane further in) gets an error, and the
+/// runtime makes that texture a shadow of the bytes instead (correct, with copies).
+#[no_mangle]
+pub unsafe extern "C" fn smtl_texture_new_iosurface(
+    d: *const Device, texture_type: u32, pixel_format: u32, width: u64, height: u64, mipmaps: u64, usage: u64,
+    surface: u32, base: *mut u8, alloc_size: u64, plane_offset: u64, bytes_per_row: u64, planar: bool,
+) -> *mut Texture {
+    use metal2vulkan_runtime::{DmaBufChunk, DmaBufRequest, DmaBufSource, HostMemory, IoSurfacePlane, ResourceOptions};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::Arc;
+
+    let Some(base_nn) = std::ptr::NonNull::new(base) else {
+        fail("newTextureWithDescriptor:iosurface:", "surface not mapped");
+        return ptr::null_mut();
+    };
+    let Some(make_fd) = surface_fd_fn() else {
+        fail("newTextureWithDescriptor:iosurface:", "Turnip has no sweetdrm_surface_fd");
+        return ptr::null_mut();
+    };
+    let base_addr = base as usize;
+    let source: DmaBufSource = Arc::new(move |req: DmaBufRequest| {
+        if req.start.as_ptr() as usize != base_addr {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "pages not at the surface's start"));
+        }
+        // SAFETY: sweetdrm's C function; a new descriptor or -1.
+        let fd = unsafe { make_fd(surface, req.length) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor just made for this, owned from here on.
+        Ok(vec![DmaBufChunk { fd: unsafe { OwnedFd::from_raw_fd(fd) }, length: req.length }])
+    });
+    let memory = HostMemory::with_dma_buf(base_nn, source);
+    let buffer = match timed("iosurface_buffer", || (*d).new_buffer_with_bytes_no_copy(memory, alloc_size, ResourceOptions::shared(), None)) {
+        Ok(b) => b,
+        Err(e) => {
+            fail("new_buffer_with_bytes_no_copy (IOSurface)", e);
+            return ptr::null_mut();
+        }
+    };
+    let mut t = TextureDescriptor::default();
+    t.texture_type = raw_p!(TextureType, texture_type, "texture type");
+    t.pixel_format = raw_p!(PixelFormat, pixel_format, "pixel format");
+    t.width = width.max(1);
+    t.height = height.max(1);
+    t.mipmap_level_count = mipmaps.max(1);
+    t.usage = raw_p!(TextureUsage, usage & 0x37, "texture usage");
+    t.resource_options = ResourceOptions::shared();
+    let plane = IoSurfacePlane::new(plane_offset, bytes_per_row, planar);
+    boxed("new_texture_with_iosurface_plane", timed("iosurface_texture", || buffer.new_texture_with_iosurface_plane(&t, plane)))
 }

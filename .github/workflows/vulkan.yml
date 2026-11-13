@@ -200,7 +200,7 @@ jobs:
           xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/render.metal -o work/render.air
           xcrun -sdk iphoneos metallib work/render.air -o out/render.metallib
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlrender \
-            metal/test/mtlrender.m -framework Foundation -framework Metal
+            metal/test/mtlrender.m -framework Foundation -framework Metal -framework IOSurface
           codesign -f -s - out/mtltest out/mtlcompute out/mtlrender
           ls -la $B out/mtltest out/mtlrender
 

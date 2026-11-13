@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <mach/mach.h>
 #include <os/log.h>
 #include <string.h>
@@ -106,6 +107,8 @@ SWEET_CATCH_ALL
 @property (nonatomic, weak) id<MTLDevice> device;
 @property (nullable, copy, atomic) NSString *label;
 @property (nonatomic, readonly) MTLResourceOptions resourceOptions;
+@property (nonatomic) IOSurfaceRef surface;          /* retained; NULL for a texture of its own */
+@property (nonatomic) NSUInteger surfacePlane;
 @end
 
 @implementation SweetMTLTexture {
@@ -124,6 +127,9 @@ SWEET_CATCH_ALL
 - (void)dealloc
 {
 	smtl_texture_release(_t);
+	if (_surface != NULL) {
+		CFRelease(_surface);
+	}
 }
 - (MTLTextureType)textureType { return (MTLTextureType)_info[0]; }
 - (MTLPixelFormat)pixelFormat { return (MTLPixelFormat)_info[1]; }
@@ -143,7 +149,8 @@ SWEET_CATCH_ALL
 - (BOOL)isSparse { return NO; }
 - (id<MTLTexture>)parentTexture { return nil; }
 - (id<MTLBuffer>)buffer { return nil; }
-- (IOSurfaceRef)iosurface { return NULL; }
+- (IOSurfaceRef)iosurface { return _surface; }
+- (NSUInteger)iosurfacePlane { return _surfacePlane; }
 - (id<MTLResource>)rootResource { return self; }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
     bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
@@ -968,6 +975,29 @@ process_wanted(void)
 		return nil;
 	}
 	return [[SweetMTLTexture alloc] initWith:x options:o device:self];
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)t iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	if (surface == NULL) {
+		return nil;
+	}
+	size_t planes = IOSurfaceGetPlaneCount(surface);
+	uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	uint64_t offset = planes ? (uint64_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, plane) - base) : 0;
+	uint64_t bpr = planes ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
+	smtl_texture *x = smtl_texture_new_iosurface(_d, (uint32_t)t.textureType, (uint32_t)t.pixelFormat, t.width, t.height,
+	    t.mipmapLevelCount, t.usage, IOSurfaceGetID(surface), base, IOSurfaceGetAllocSize(surface), offset, bpr, planes != 0);
+	if (x == NULL) {
+		say(@"newTextureWithDescriptor:iosurface:%u plane:%lu (%lux%lu format %lu): %s", IOSurfaceGetID(surface),
+		    (unsigned long)plane, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat,
+		    smtl_last_error());
+		return nil;
+	}
+	SweetMTLTexture *tx = [[SweetMTLTexture alloc] initWith:x options:MTLResourceStorageModeShared device:self];
+	CFRetain(surface);
+	tx.surface = surface;
+	tx.surfacePlane = plane;
+	return tx;
 }
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
 {

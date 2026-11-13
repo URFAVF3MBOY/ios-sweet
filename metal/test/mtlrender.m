@@ -11,6 +11,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include "../../vulkan/bench/bench.h"
 
 static id<MTLDevice> dev;
@@ -187,6 +188,102 @@ correctness(void)
 	check("depth test", cb, rt, ^uint32_t(int x, int y) { (void)x; (void)y; return GREEN; });
 }
 
+/* 4. IOSurfaces: the GPU draws into one and the CPU reads it (IOSurfaceLock); the CPU writes one and the GPU samples it */
+static IOSurfaceRef
+surface(int w, int h)
+{
+	NSDictionary *p = @{
+		(id)kIOSurfaceWidth : @(w), (id)kIOSurfaceHeight : @(h), (id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+	};
+	return IOSurfaceCreate((__bridge CFDictionaryRef)p);
+}
+
+static void
+iosurfaces(void)
+{
+	IOSurfaceRef s = surface(64, 64);
+	if (s == NULL) {
+		printf("IOSurfaceCreate failed\n");
+		failures++;
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64
+	    height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModeShared;
+	NSDate *t0 = [NSDate date];
+	id<MTLTexture> st = [dev newTextureWithDescriptor:td iosurface:s plane:0];
+	printf("texture over IOSurface %u (%zu bytes a row): %s in %.2f ms\n", IOSurfaceGetID(s), IOSurfaceGetBytesPerRow(s),
+	    st ? "made" : "nil", -t0.timeIntervalSinceNow * 1000);
+	if (st == nil) {
+		failures++;
+		return;
+	}
+	/* GPU -> surface: clear green, a red quarter (top-left) drawn with the BGRA pipeline */
+	MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+	d.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+	d.fragmentFunction = [lib newFunctionWithName:@"flat_fragment"];
+	d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> flat = [dev newRenderPipelineStateWithDescriptor:d error:NULL];
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass(st, MTLClearColorMake(0, 1, 0, 1), nil)];
+	[e setRenderPipelineState:flat];
+	struct { float rect[4]; float z; float pad[3]; } q = { { -1, 0, 1, 1 }, 0, { 0 } };
+	const float red[4] = { 1, 0, 0, 1 };
+	[e setVertexBytes:&q length:sizeof(q) atIndex:0];
+	[e setFragmentBytes:red length:sizeof(red) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+	t0 = [NSDate date];
+	[cb commit];
+	[cb waitUntilCompleted];
+	double ms = -t0.timeIntervalSinceNow * 1000;
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *px = IOSurfaceGetBaseAddress(s);
+	size_t bpr = IOSurfaceGetBytesPerRow(s);
+	int bad = 0;
+	for (int y = 0; y < 64; y++) {
+		for (int x = 0; x < 64; x++) {
+			uint32_t got = *(const uint32_t *)(px + y * bpr + x * 4);
+			uint32_t want = x < 32 && y < 32 ? 0xffff0000u : 0xff00ff00u;      /* BGRA in memory: word = a r g b */
+			if (got != want && bad++ < 3) {
+				printf("  surface pixel (%d, %d) is %08x, not %08x\n", x, y, got, want);
+			}
+		}
+	}
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	printf("GPU into IOSurface, read by the CPU: %s (%d of 4096 wrong), %.2f ms\n", bad ? "WRONG" : "ok", bad, ms);
+	failures += bad != 0;
+
+	/* CPU -> surface -> GPU: fill blue by the CPU, sample it into an 8x8 target */
+	IOSurfaceLock(s, 0, NULL);
+	uint8_t *w = IOSurfaceGetBaseAddress(s);
+	for (int y = 0; y < 64; y++) {
+		for (int x = 0; x < 64; x++) {
+			*(uint32_t *)(w + y * bpr + x * 4) = 0xff0000ffu;              /* blue */
+		}
+	}
+	IOSurfaceUnlock(s, 0, NULL);
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	id<MTLSamplerState> sampler = [dev newSamplerStateWithDescriptor:sd];
+	d.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+	d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	id<MTLRenderPipelineState> textured = [dev newRenderPipelineStateWithDescriptor:d error:NULL];
+	id<MTLTexture> rt = target(8, 8, MTLPixelFormatRGBA8Unorm);
+	cb = [queue commandBuffer];
+	e = [cb renderCommandEncoderWithDescriptor:pass(rt, MTLClearColorMake(0, 0, 0, 1), nil)];
+	[e setRenderPipelineState:textured];
+	struct { float rect[4]; float z; float pad[3]; } full = { { -1, -1, 2, 2 }, 0, { 0 } };
+	[e setVertexBytes:&full length:sizeof(full) atIndex:0];
+	[e setFragmentTexture:st atIndex:0];
+	[e setFragmentSamplerState:sampler atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+	check("CPU-written IOSurface sampled", cb, rt, ^uint32_t(int x, int y) { (void)x; (void)y; return BLUE; });
+	CFRelease(s);
+}
+
 static void
 bench(int quads)
 {
@@ -267,6 +364,7 @@ main(int argc, char **argv)
 			return 1;
 		}
 		correctness();
+		iosurfaces();
 		int counts[8] = { 20, 150, 500 }, n = 3;
 		if (argc > 1) {
 			n = 0;
