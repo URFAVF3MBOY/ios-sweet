@@ -313,9 +313,46 @@ pub extern "C" fn sweetmtl_add_device_protocols() {
     }
 }
 
+extern "C" {
+    fn class_setSuperclass(cls: *mut c_void, superclass: *mut c_void) -> *mut c_void;
+    fn getprogname() -> *const c_char;
+}
+
+/// The same choice as SweetMTL.m's process_wanted: SWEETMTL=1, or the program named in /var/local/sweetmtl-clients.
+fn process_wanted() -> bool {
+    if std::env::var("SWEETMTL").map(|v| v.starts_with('1')).unwrap_or(false) {
+        return true;
+    }
+    // SAFETY: getprogname returns this process's NUL-terminated name.
+    let me = unsafe { CStr::from_ptr(getprogname()) }.to_string_lossy().into_owned();
+    std::fs::read_to_string("/var/local/sweetmtl-clients")
+        .map(|t| t.lines().any(|l| !l.trim().is_empty() && l.trim() == me))
+        .unwrap_or(false)
+}
+
+/// When the bundle loads: the protocols, and in a process that gets no device, SweetMTLDevice made a plain
+/// NSObject subclass. Metal 16.5's plugin loader skips a class that is not an _MTLDevice without a word, but a
+/// device class whose init answers nil crashes it inside MTLCreateSystemDefaultDevice (seen 2026-11-13: the
+/// window server, not a client, crashed every 10 s once the kernel named the plugin; mtltest without
+/// SWEETMTL=1 too). So a non-client sees no Metal device, as before the plugin existed.
+extern "C" fn sweetmtl_load() {
+    sweetmtl_add_device_protocols();
+    if process_wanted() {
+        return;
+    }
+    // SAFETY: Objective-C runtime calls on classes that exist (checked); no SweetMTLDevice was made yet.
+    unsafe {
+        let cls = objc_getClass(c"SweetMTLDevice".as_ptr());
+        let root = objc_getClass(c"NSObject".as_ptr());
+        if !cls.is_null() && !root.is_null() {
+            class_setSuperclass(cls, root);
+        }
+    }
+}
+
 #[used]
 #[link_section = "__DATA,__mod_init_func"]
-static ADD_DEVICE_PROTOCOLS: extern "C" fn() = sweetmtl_add_device_protocols;
+static LOAD: extern "C" fn() = sweetmtl_load;
 
 // ---- libraries, functions, compute pipelines (milestone 2) ----
 
