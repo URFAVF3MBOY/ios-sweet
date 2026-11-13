@@ -463,7 +463,7 @@ msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 		const struct drm_msm_syncobj *o = (const void *)(ins + (size_t)i * stride);
 		struct syncobj *s = syncobj(o->handle);
 
-		if (s != NULL && (o->flags & MSM_SUBMIT_SYNCOBJ_RESET)) {
+		if (s != NULL && (o->flags & MSM_SYNCOBJ_RESET)) {
 			s->signalled = s->submitted = false;
 		}
 	}
