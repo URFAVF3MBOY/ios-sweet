@@ -467,10 +467,17 @@ msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 		const struct drm_msm_syncobj *o = (const void *)(ins + (size_t)i * stride);
 		uint32_t h = o->handle;
 
-		ret = drmSyncobjWait(fd, &h, 1, INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
-		if (ret != 0 && errno != ETIME) {
-			return ret;
+		/*
+		 * Only until it is signalled or has a ring fence: work already on the ring is ahead of this
+		 * submission anyway. (Waiting for it to be done, as drmSyncobjWait does, serialized every frame:
+		 * 2026-11-13 bench_vk back-to-back = its single-frame time.)
+		 */
+		pthread_mutex_lock(&lock);
+		struct syncobj *s;
+		while ((s = syncobj(h)) != NULL && !s->signalled && !s->submitted) {
+			pthread_cond_wait(&changed, &lock);
 		}
+		pthread_mutex_unlock(&lock);
 	}
 	req->flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
 	req->nr_in_syncobjs = req->nr_out_syncobjs = 0;
