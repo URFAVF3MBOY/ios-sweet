@@ -1,0 +1,36 @@
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+index ab27798c0f6..4c7cc323ad0 100644
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -27,6 +27,13 @@
+ #include "tu_queue.h"
+ #include "tu_rmv.h"
+ 
++#ifdef __APPLE__
++/* iOS: BO maps go through RedwoodGPU's IOKit client (sweetdrm), not mmap of a DRM node */
++#include "sweetdrm.h"
++#define mmap sweetdrm_mmap
++#define munmap sweetdrm_munmap
++#endif
++
+ VkResult
+ tu_bo_init_new_explicit_iova(struct tu_device *dev,
+                              struct vk_object_base *base,
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index 4061f172998..0fd7efe28ba 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -12,6 +12,13 @@
+ #include <sys/mman.h>
+ #include <xf86drm.h>
+ 
++#ifdef __APPLE__
++/* iOS: BO maps go through RedwoodGPU's IOKit client (sweetdrm), not mmap of a DRM node */
++#include "sweetdrm.h"
++#define mmap sweetdrm_mmap
++#define munmap sweetdrm_munmap
++#endif
++
+ #include "util/hash_table.h"
+ #include "util/libsync.h"
+ #include "util/u_debug.h"

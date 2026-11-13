@@ -1,0 +1,20 @@
+diff --git a/src/util/cache_ops_aarch64.c b/src/util/cache_ops_aarch64.c
+index d56ab8a9ece..0a6a61b2fc3 100644
+--- a/src/util/cache_ops_aarch64.c
++++ b/src/util/cache_ops_aarch64.c
+@@ -29,9 +29,15 @@
+ static uint32_t
+ get_ctr_el0(void)
+ {
++#if defined(__APPLE__)
++   /* iOS on the OnePlus 7T (Kryo 485, Cortex-A76/A55): reading CTR_EL0 at EL0 is SIGILL there.
++    * The cores' value: CWG 4 and DminLine 4 (64-byte lines), IminLine 4, VIPT. */
++   return 0x8444c004;
++#else
+    uint32_t ctr_el0;
+    __asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+    return ctr_el0;
++#endif
+ }
+ 
+ static uint32_t

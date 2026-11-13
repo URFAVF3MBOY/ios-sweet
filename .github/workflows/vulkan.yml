@@ -1,0 +1,118 @@
+name: vulkan
+
+# Turnip (Mesa's Vulkan driver for Adreno) for iOS 16 arm64, msm backend over sweetdrm (vulkan/sweetdrm: the
+# libdrm calls Turnip makes, answered by RedwoodGPU's IOKit client), plus vulkan/vktest.
+# Mesa 85fda3b3 + vulkan/mesa-patches. libdrm-2.4.124 gives only its header (xf86drm.h).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  LIBDRM_TAG: libdrm-2.4.124
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          brew install meson ninja bison flex pkgconf >/dev/null
+          python3 -m venv work/venv
+          work/venv/bin/pip install -q meson mako pyyaml packaging
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "IOSCC=$(xcrun --sdk iphoneos --find clang)" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/work/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin" >> $GITHUB_PATH
+
+      - name: Sources
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
+          git -C work/mesa checkout -q $MESA_COMMIT
+          for p in vulkan/mesa-patches/*.patch; do echo "apply $p"; git -C work/mesa apply --whitespace=nowarn "$PWD/$p"; done
+          mkdir -p work/sysroot/include work/sysroot/lib/pkgconfig
+          curl -sSfL -o work/sysroot/include/xf86drm.h \
+            https://gitlab.freedesktop.org/mesa/drm/-/raw/$LIBDRM_TAG/xf86drm.h
+
+      - name: sweetdrm
+        run: |
+          R=$GITHUB_WORKSPACE
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -Wextra -Wno-unused-parameter \
+            -I work/sysroot/include -I work/mesa/include -I work/mesa/include/drm-uapi -I vulkan/sweetdrm \
+            -c vulkan/sweetdrm/sweetdrm.c -o work/sweetdrm.o
+          ar rcs work/sysroot/lib/libsweetdrm.a work/sweetdrm.o
+          cat > work/sysroot/lib/pkgconfig/libdrm.pc <<EOF
+          Name: libdrm
+          Description: sweetdrm (libdrm over RedwoodGPU)
+          Version: 2.4.124
+          Libs: -L$R/work/sysroot/lib -lsweetdrm -framework IOKit
+          Cflags: -I$R/work/sysroot/include -I$R/work/mesa/include/drm-uapi
+          EOF
+
+      - name: Turnip
+        run: |
+          R=$GITHUB_WORKSPACE
+          flags="'-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK', '-I$R/vulkan/sweetdrm'"
+          cat > work/ios.cross <<EOF
+          [binaries]
+          c = '$IOSCC'
+          cpp = '$(xcrun --sdk iphoneos --find clang++)'
+          objc = '$IOSCC'
+          ar = '$(xcrun --sdk iphoneos --find ar)'
+          strip = '$(xcrun --sdk iphoneos --find strip)'
+          pkg-config = '$(brew --prefix pkgconf)/bin/pkgconf'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+          [properties]
+          needs_exe_wrapper = true
+          [built-in options]
+          c_args = [$flags]
+          cpp_args = [$flags]
+          objc_args = [$flags]
+          c_link_args = [$flags]
+          cpp_link_args = [$flags]
+          objc_link_args = [$flags]
+          EOF
+          export PKG_CONFIG_LIBDIR=$R/work/sysroot/lib/pkgconfig PKG_CONFIG_PATH=
+          meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
+            -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dplatforms= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+            -Dllvm=disabled -Dshader-cache=disabled -Dxmlconfig=disabled -Dzstd=disabled -Dexpat=disabled \
+            -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dtools= \
+            -Dvideo-codecs= -Dvulkan-layers= -Dperfetto=false -Dandroid-libbacktrace=disabled \
+            -Dbuildtype=release -Db_ndebug=true > work/configure.log 2>&1 || { tail -60 work/configure.log; exit 1; }
+          grep -iE "libdrm|zlib|freedreno|kmds" work/configure.log | head -20
+          ninja -C work/build src/freedreno/vulkan/libvulkan_freedreno.dylib > work/build.log 2>&1 ||
+            { grep -E "error:|FAILED|undefined" -A3 work/build.log | head -80; exit 1; }
+          lib=work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib
+          nm -gU "$lib" | grep -E " T _(vk_icd|vkGetInstanceProcAddr)" || true
+          nm -m "$lib" | grep "weak external" || true
+          ls -la "$lib"
+
+      - name: vktest
+        run: |
+          mkdir -p out
+          cp work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib out/
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include \
+            -o out/vktest vulkan/vktest/vktest.c
+          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan
+          path: |
+            out/
+            work/configure.log
+            work/build.log
+            work/build/meson-logs/meson-log.txt
