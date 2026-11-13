@@ -240,7 +240,15 @@ SWEET_CATCH_ALL
 
 /* ---- device ---- */
 
-@interface SweetMTLDevice : NSObject <MTLDevice>
+/*
+ * Metal.framework (16.5, the plugin loader at Metal+0x27ba4) takes the class named by MetalPluginClassName only
+ * when it is a subclass of its private _MTLDevice (seen 2026-11-13: a plain NSObject class is skipped without a
+ * word, so MTLCreateSystemDefaultDevice() gave nil). _MTLDevice is Metal's own class, declared here by hand.
+ */
+@interface _MTLDevice : NSObject <MTLDevice>
+@end
+
+@interface SweetMTLDevice : _MTLDevice
 @property (nonatomic, readonly) smtl_device *d;
 @end
 
