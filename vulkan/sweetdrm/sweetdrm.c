@@ -166,15 +166,18 @@ gpu_call(int fd, uint32_t selector, void *arg, size_t size)
 		errno = EBADF;
 		return -EBADF;
 	}
+	uint64_t t0 = trace() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 	kern_return_t kr = IOConnectCallStructMethod(conn, selector, arg, size, arg, &out);
 
 	e = errno_of(kr);
 	if (trace()) {
 		const uint32_t *w = arg;
+		uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
-		/* the request, its first words (handles, sizes, params) and the kernel's answer */
-		fprintf(stderr, "sweetdrm: sel %#x size %zu [%#x %#x %#x %#x] -> kr %#x errno %d\n", selector, size,
-		    size > 0 ? w[0] : 0, size > 4 ? w[1] : 0, size > 8 ? w[2] : 0, size > 12 ? w[3] : 0, kr, e);
+		/* the request, its first words (handles, sizes, params), the kernel's answer and how long it took */
+		fprintf(stderr, "sweetdrm: sel %#x size %zu [%#x %#x %#x %#x] -> kr %#x errno %d, %.3f ms\n", selector,
+		    size, size > 0 ? w[0] : 0, size > 4 ? w[1] : 0, size > 8 ? w[2] : 0, size > 12 ? w[3] : 0, kr, e,
+		    (double)(t1 - t0) / 1e6);
 	}
 	errno = e;
 	return -e;
