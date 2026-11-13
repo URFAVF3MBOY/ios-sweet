@@ -3,6 +3,12 @@
 ## Status / current work (2026-11-09, latest)
 
 ### >>> RESUME HERE (2026-11-12, latest) <<<
+- **YouTube in Safari stays at 360p: not the phone (2026-11-13, observed).**
+  - Playing: YouTube's single muxed file (itag 18, 640x360 avc1), progressive download (CoreMedia CRABS byte stream, no HLS). Software decode 2 ms per frame, 0 dropped, ~11.7 Mbps measured.
+  - A watch page fetched with the iOS 16.5 Safari user agent has no `hlsManifestUrl`: only `adaptiveFormats` (144p-2160p60) behind `serverAbrStreamingUrl`, which need Media Source. iPhone Safari on 16.5 has none (`MediaSource`/`ManagedMediaSource` undefined), so itag 18 is the only thing it can play. A real iPhone on 16.5 should be in the same place (guess, not compared).
+  - Ruled out: hardware-decode reporting. VideoToolbox says no hardware decoder for any codec (no AppleAVD), so MediaCapabilities said powerEfficient=false. `tools/vthw/` (interposes VTIsHardwareDecodeSupported + dlsym, injected into com.apple.WebKit.GPU/WebContent through sweetinject, image `research/kexts/shim-boot-0223-vthw.img`, line scratchpad `bootline-0224vthw.txt`, 528 bytes) made it report powerEfficient=true up to 1080p: still 360p. Not kept.
+  - Turning on Settings > Safari > Advanced > Experimental Features > Media Source API and reopening Safari: still `MediaSource` undefined (WebKit on iPhone did not pick it up; not looked into).
+  - Lesson: a file copied to /var/jb right before `kern.sweetreboot=2` was gone after the reboot (not flushed): `sync` before rebooting.
 - **0223: IOSurface plane bytes-per-row fixed; videos play (was H264SW SIGBUS) (2026-11-12 ~20:40 phone time).**
   - IOSurface.framework's plane getters, disassembled from the phone (scratchpad iosfn.py/iosfn2.py: dlsym + follow the wrapper's `b` + dump; capstone on the PC). Lock result at IOSurfaceClient + 0x68, plane i record at result + 0x68 + i*0x80:
     - width +0x00 (client+0xd0), height +0x04 (+0xd4), offset +0x0c (GetBaseAddressOfPlane +0xdc), **bytes per row +0x10 (+0xe0)**, bytes per element +0x18, element width/height +0x1a/+0x1b, component count +0x1c, bit depths +0x20...
