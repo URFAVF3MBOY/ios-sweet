@@ -28,6 +28,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 
 #include <xf86drm.h>
 #include "drm-uapi/msm_drm.h"
@@ -173,24 +174,44 @@ syncobj(uint32_t handle)
 	return handle > 0 && handle < MAX_SYNCOBJS && syncobjs[handle].used ? &syncobjs[handle] : NULL;
 }
 
+/* Mesa's deadlines: CLOCK_MONOTONIC (os_time_get_nano), as on Linux. */
 static int64_t
 now_ns(void)
 {
 	struct timespec t;
 
-	clock_gettime(CLOCK_MONOTONIC, &t);     /* = the kernel's msm_timespec clock (it goes on in sleep) */
+	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
-/* Is ring fence `fence` done? The kernel waits until `deadline` (absolute, CLOCK_MONOTONIC ns). */
+/* RedwoodGPU's msm_timespec deadlines: mach_continuous_time in ns (seen 2026-11-13: ~62 s from CLOCK_MONOTONIC). */
+static int64_t
+kernel_now_ns(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return (int64_t)(mach_continuous_time() * tb.numer / tb.denom);
+}
+
+/* Is ring fence `fence` done? The kernel waits until `deadline` (absolute, CLOCK_MONOTONIC ns; 0 = poll). */
 static bool
 fence_done(int fd, uint32_t queue, uint32_t fence, int64_t deadline)
 {
 	struct drm_msm_wait_fence w = { .fence = fence, .queueid = queue };
 
 	if (deadline > 0) {
-		w.timeout.tv_sec = deadline / 1000000000;
-		w.timeout.tv_nsec = deadline % 1000000000;
+		int64_t left = deadline - now_ns();
+		int64_t k;
+
+		if (left > 60 * (int64_t)1000000000) {
+			left = 60 * (int64_t)1000000000;        /* (the kernel caps a wait anyway) */
+		}
+		k = left > 0 ? kernel_now_ns() + left : 0;
+		w.timeout.tv_sec = k / 1000000000;
+		w.timeout.tv_nsec = k % 1000000000;
 	}
 	return gpu_call(fd, DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE, &w, sizeof(w)) == 0;
 }

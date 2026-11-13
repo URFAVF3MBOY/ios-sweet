@@ -38,9 +38,15 @@ main(int argc, char **argv)
 	const char *lib = argc > 1 ? argv[1] : NULL;
 
 	if (lib == NULL) {
-		const char *slash = strrchr(argv[0], '/');
+		char self[1024];
+		const char *slash;
 
-		snprintf(path, sizeof(path), "%.*slibvulkan_freedreno.dylib", slash ? (int)(slash - argv[0] + 1) : 0, argv[0]);
+		/* dyld will not take a relative path here: make it absolute */
+		if (realpath(argv[0], self) == NULL) {
+			snprintf(self, sizeof(self), "%s", argv[0]);
+		}
+		slash = strrchr(self, '/');
+		snprintf(path, sizeof(path), "%.*slibvulkan_freedreno.dylib", slash ? (int)(slash - self + 1) : 0, self);
 		lib = path;
 	}
 	void *h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
