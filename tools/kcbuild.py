@@ -4,7 +4,7 @@
 # from Apple's kernelcache, relinked at their final addresses (see kextlink.py for the method).
 #
 # Layout, as xnu's arm_vm_init expects it (comment block at the top of arm_vm_init.c):
-#   __PRELINK_TEXT, __PLK_DATA_CONST, __PLK_TEXT_EXEC  below our __TEXT (between virt_base and __TEXT: the shim
+#   __PRELINK_TEXT, __PLK_TEXT_EXEC, __PLK_DATA_CONST  below our __TEXT (between virt_base and __TEXT: the shim
 #                                                      copies segments to phys_base + vmaddr - virt_base)
 #   __PRELINK_DATA, __PRELINK_INFO                     where our empty ones are (after __BOOTDATA); __LINKINFO and
 #                                                      __LINKEDIT move up behind them
@@ -116,7 +116,9 @@ def main():
             rel[(b, sn)] = off
             cur = off + vsz
         lens[kind] = (cur + PAGE - 1) & ~(PAGE - 1)
-    below = ['__PRELINK_TEXT', '__PLK_DATA_CONST', '__PLK_TEXT_EXEC']
+    # order as Apple's kernelcache: arm_vm_init maps the gap from the end of __PLK_DATA_CONST up to __TEXT RW/NX,
+    # so __PLK_DATA_CONST must come last (with it before __PLK_TEXT_EXEC the kext code was non-executable)
+    below = ['__PRELINK_TEXT', '__PLK_TEXT_EXEC', '__PLK_DATA_CONST']
     need = sum(lens[x] for x in below)
     base = {}
     cur = (text_vm - need - 0x100000) & ~(0x100000 - 1)        # 1 MB aligned start, ends below __TEXT
