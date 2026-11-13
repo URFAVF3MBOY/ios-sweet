@@ -78,9 +78,9 @@ jobs:
           c_args = [$flags]
           cpp_args = [$flags]
           objc_args = [$flags]
-          c_link_args = [$flags, '-Wl,-undefined,dynamic_lookup']
-          cpp_link_args = [$flags, '-Wl,-undefined,dynamic_lookup']
-          objc_link_args = [$flags, '-Wl,-undefined,dynamic_lookup']
+          c_link_args = [$flags]
+          cpp_link_args = [$flags]
+          objc_link_args = [$flags]
           EOF
           export PKG_CONFIG_LIBDIR=$R/work/sysroot/lib/pkgconfig PKG_CONFIG_PATH=
           meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
