@@ -201,22 +201,29 @@ def main():
             if sn == '__TEXT' and secname != '__const':
                 continue
             na = nv + (saddr - vm)
-            for o in range(0, ssize - 7, 8):
-                if (na + o) & 7:
-                    continue
+            # every 4-byte offset: packed structs (kmod_info is #pragma pack(4): address/start/stop at +0x9c/+0xb4/
+            # +0xbc) hold pointers that are not 8-byte aligned. Only exact hits (our kexts, named exports) count.
+            o = 0
+            while o <= ssize - 8:
                 v = struct.unpack_from('<Q', get(na + o, 8))[0]
+                o += 4
                 if v >> 32 != 0xfffffff0:
                     continue
+                if v >> 32 != 0xfffffff0:
+                    continue
+                at = na + o - 4
                 t = where(v)
                 if t is not None:
-                    put(na + o, struct.pack('<Q', t))
+                    put(at, struct.pack('<Q', t))
                     st_['rebase'] += 1
+                    o += 4
                 elif v in byaddr and byaddr[v] in ours:
-                    put(na + o, struct.pack('<Q', ours[byaddr[v]]))
+                    put(at, struct.pack('<Q', ours[byaddr[v]]))
                     st_['bind'] += 1
+                    o += 4
                 elif v in byaddr:
                     st_['missing'].append(byaddr[v])
-                else:
+                elif not (at & 7):
                     st_['unknown'].append(hex(v))
 
     # ---- each kext's mach header: segment and section addresses ----
