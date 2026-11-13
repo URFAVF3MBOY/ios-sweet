@@ -134,6 +134,144 @@ SWEET_CATCH_ALL
 SWEET_CATCH_ALL
 @end
 
+/* ---- library, function, compute pipeline (milestone 2) ---- */
+
+static NSError *
+sweet_error(NSString *what)
+{
+	return [NSError errorWithDomain:@"com.sweet.mtl" code:1
+	    userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:@"%@: %s", what, smtl_last_error()] }];
+}
+
+@interface SweetMTLFunction : NSObject <MTLFunction>
+@property (nonatomic, readonly) smtl_function *f;
+@property (nonatomic, weak) id<MTLDevice> device;
+@property (nonatomic, copy) NSString *name;
+@property (nullable, copy, atomic) NSString *label;
+@end
+
+@implementation SweetMTLFunction
+- (instancetype)initWith:(smtl_function *)f name:(NSString *)name device:(id<MTLDevice>)d
+{
+	if ((self = [super init])) {
+		_f = f;
+		_name = [name copy];
+		_device = d;
+	}
+	return self;
+}
+- (void)dealloc
+{
+	smtl_function_release(_f);
+}
+- (MTLFunctionType)functionType { return MTLFunctionTypeKernel; }
+SWEET_CATCH_ALL
+@end
+
+@interface SweetMTLLibrary : NSObject <MTLLibrary>
+@property (nonatomic, readonly) smtl_library *l;
+@property (nonatomic, weak) id<MTLDevice> device;
+@property (nullable, copy, atomic) NSString *label;
+@end
+
+@implementation SweetMTLLibrary
+- (instancetype)initWith:(smtl_library *)l device:(id<MTLDevice>)d
+{
+	if ((self = [super init])) {
+		_l = l;
+		_device = d;
+	}
+	return self;
+}
+- (void)dealloc
+{
+	smtl_library_release(_l);
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+{
+	smtl_function *f = smtl_function_new(_l, name.UTF8String);
+	if (f == NULL) {
+		say(@"newFunctionWithName:%@: %s", name, smtl_last_error());
+		return nil;
+	}
+	return [[SweetMTLFunction alloc] initWith:f name:name device:_device];
+}
+SWEET_CATCH_ALL
+@end
+
+@interface SweetMTLComputePipeline : NSObject <MTLComputePipelineState>
+@property (nonatomic, readonly) smtl_cpipe *p;
+@property (nonatomic, weak) id<MTLDevice> device;
+@property (nullable, copy, atomic) NSString *label;
+@end
+
+@implementation SweetMTLComputePipeline
+- (instancetype)initWith:(smtl_cpipe *)p device:(id<MTLDevice>)d
+{
+	if ((self = [super init])) {
+		_p = p;
+		_device = d;
+	}
+	return self;
+}
+- (void)dealloc
+{
+	smtl_compute_pipeline_release(_p);
+}
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return smtl_compute_pipeline_max_threads(_p); }
+- (NSUInteger)threadExecutionWidth { return smtl_compute_pipeline_width(_p); }
+- (NSUInteger)staticThreadgroupMemoryLength { return 0; }
+SWEET_CATCH_ALL
+@end
+
+@interface SweetMTLComputeEncoder : NSObject <MTLComputeCommandEncoder>
+@property (nonatomic, readonly) smtl_compute *e;
+@property (nonatomic, weak) id<MTLDevice> device;
+@property (nullable, copy, atomic) NSString *label;
+@end
+
+@implementation SweetMTLComputeEncoder
+- (instancetype)initWith:(smtl_compute *)e device:(id<MTLDevice>)d
+{
+	if ((self = [super init])) {
+		_e = e;
+		_device = d;
+	}
+	return self;
+}
+#define SWEET_CALL(call) do { if (_e != NULL && (call) != 0) say(@"%s: %s", __func__, smtl_last_error()); } while (0)
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)state
+{
+	SWEET_CALL(smtl_compute_set_pipeline(_e, ((SweetMTLComputePipeline *)state).p));
+}
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	SWEET_CALL(smtl_compute_set_buffer(_e, buffer ? ((SweetMTLBuffer *)buffer).b : NULL, offset, (uint32_t)index));
+}
+- (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	SWEET_CALL(smtl_compute_set_bytes(_e, bytes, length, (uint32_t)index));
+}
+- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads
+{
+	SWEET_CALL(smtl_compute_dispatch_groups(_e, groups.width, groups.height, groups.depth, threads.width, threads.height, threads.depth));
+}
+- (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)per
+{
+	SWEET_CALL(smtl_compute_dispatch_threads(_e, threads.width, threads.height, threads.depth, per.width, per.height, per.depth));
+}
+- (void)endEncoding
+{
+	SWEET_CALL(smtl_compute_end(_e));
+	_e = NULL;
+}
+- (MTLDispatchType)dispatchType { return MTLDispatchTypeSerial; }
+- (void)insertDebugSignpost:(NSString *)s { (void)s; }
+- (void)pushDebugGroup:(NSString *)s { (void)s; }
+- (void)popDebugGroup { }
+SWEET_CATCH_ALL
+@end
+
 /* ---- command buffer ---- */
 
 @interface SweetMTLCommandBuffer : NSObject <MTLCommandBuffer>
@@ -167,6 +305,20 @@ SWEET_CATCH_ALL
 		return nil;
 	}
 	return [[SweetMTLBlitEncoder alloc] initWith:e device:_device];
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoder
+{
+	smtl_compute *e = smtl_compute_new(_c);
+	if (e == NULL) {
+		say(@"computeCommandEncoder: %s", smtl_last_error());
+		return nil;
+	}
+	return [[SweetMTLComputeEncoder alloc] initWith:e device:_device];
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type
+{
+	(void)type;
+	return [self computeCommandEncoder];
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block
 {
@@ -345,6 +497,51 @@ process_wanted(void)
 		memcpy(b.contents, bytes, length);
 	}
 	return b;
+}
+- (id<MTLLibrary>)newLibraryWithBytes:(const void *)bytes length:(size_t)len error:(NSError **)error
+{
+	smtl_library *l = smtl_library_new_data(_d, bytes, len);
+	if (l == NULL) {
+		say(@"newLibrary (%zu bytes): %s", len, smtl_last_error());
+		if (error) *error = sweet_error(@"newLibrary");
+		return nil;
+	}
+	return [[SweetMTLLibrary alloc] initWith:l device:self];
+}
+- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error
+{
+	const void *bytes = NULL;
+	size_t len = 0;
+	dispatch_data_t flat = dispatch_data_create_map(data, &bytes, &len);
+	id<MTLLibrary> l = [self newLibraryWithBytes:bytes length:len error:error];
+	(void)flat;
+	return l;
+}
+- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	NSData *d = [NSData dataWithContentsOfURL:url options:0 error:error];
+	return d ? [self newLibraryWithBytes:d.bytes length:d.length error:error] : nil;
+}
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error
+{
+	return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
+}
+- (id<MTLLibrary>)newDefaultLibrary
+{
+	NSString *path = [[NSBundle mainBundle] pathForResource:@"default" ofType:@"metallib"];
+	return path ? [self newLibraryWithFile:path error:NULL] : nil;
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error
+{
+	NSDate *t0 = [NSDate date];
+	smtl_cpipe *p = smtl_compute_pipeline_new(_d, ((SweetMTLFunction *)function).f);
+	if (p == NULL) {
+		say(@"newComputePipelineStateWithFunction:%@: %s", function.name, smtl_last_error());
+		if (error) *error = sweet_error(@"newComputePipelineState");
+		return nil;
+	}
+	say(@"compute pipeline %@ in %.1f ms", function.name, -t0.timeIntervalSinceNow * 1000);
+	return [[SweetMTLComputePipeline alloc] initWith:p device:self];
 }
 - (BOOL)supportsFamily:(MTLGPUFamily)family
 {

@@ -35,6 +35,9 @@ jobs:
           path: |
             work/mesa
             work/build
+            work/sysroot
+            work/sweetdrm-src
+            work/ios.cross
           key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}
           restore-keys: |
             mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-
@@ -66,38 +69,51 @@ jobs:
 
       - name: Sources
         run: |
-          if [ -d work/mesa/.git ]; then
-            echo "Mesa from the cache"
-            git -C work/mesa reset -q --hard $MESA_COMMIT
+          want=$(cat vulkan/mesa-patches/*.patch | shasum | cut -c1-16)
+          if [ -d work/mesa/.git ] && [ "$(cat work/mesa/.sweet-patches 2>/dev/null)" = "$want" ]; then
+            echo "Mesa from the cache, patches unchanged: tree left as it is"
           else
-            git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
-            git -C work/mesa checkout -q $MESA_COMMIT
+            if [ -d work/mesa/.git ]; then
+              echo "Mesa from the cache, patches changed: reset and re-apply"
+              git -C work/mesa reset -q --hard $MESA_COMMIT
+            else
+              git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
+              git -C work/mesa checkout -q $MESA_COMMIT
+            fi
+            for p in vulkan/mesa-patches/*.patch; do echo "apply $p"; git -C work/mesa apply --whitespace=nowarn "$PWD/$p"; done
+            echo "$want" > work/mesa/.sweet-patches
           fi
-          for p in vulkan/mesa-patches/*.patch; do echo "apply $p"; git -C work/mesa apply --whitespace=nowarn "$PWD/$p"; done
           mkdir -p work/sysroot/include work/sysroot/lib/pkgconfig
-          curl -sSfL -o work/sysroot/include/xf86drm.h \
-            https://gitlab.freedesktop.org/mesa/drm/-/raw/$LIBDRM_TAG/xf86drm.h
+          curl -sSfL -o work/xf86drm.h.new https://gitlab.freedesktop.org/mesa/drm/-/raw/$LIBDRM_TAG/xf86drm.h
+          cmp -s work/xf86drm.h.new work/sysroot/include/xf86drm.h && rm -f work/xf86drm.h.new || mv -f work/xf86drm.h.new work/sysroot/include/xf86drm.h
 
       - name: sweetdrm
         run: |
           R=$GITHUB_WORKSPACE
+          # replace $2 with $1 only if they differ, so an unchanged input keeps its old mtime in a cached tree
+          keep() { cmp -s "$1" "$2" && rm -f "$1" || mv -f "$1" "$2"; }
+          echo 'keep() { cmp -s "$1" "$2" && rm -f "$1" || mv -f "$1" "$2"; }' > work/keep.sh
+          mkdir -p work/sweetdrm-src
+          cp vulkan/sweetdrm/sweetdrm.h work/sweetdrm-src/sweetdrm.h.new && keep work/sweetdrm-src/sweetdrm.h.new work/sweetdrm-src/sweetdrm.h
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -Wextra -Wno-unused-parameter \
             -I work/sysroot/include -I work/mesa/include -I work/mesa/include/drm-uapi -I vulkan/sweetdrm \
             -c vulkan/sweetdrm/sweetdrm.c -o work/sweetdrm.o
-          ar rcs work/sysroot/lib/libsweetdrm.a work/sweetdrm.o
-          cat > work/sysroot/lib/pkgconfig/libdrm.pc <<EOF
+          ZERO_AR_DATE=1 ar rcs work/libsweetdrm.a.new work/sweetdrm.o && keep work/libsweetdrm.a.new work/sysroot/lib/libsweetdrm.a
+          cat > work/libdrm.pc.new <<EOF
           Name: libdrm
           Description: sweetdrm (libdrm over RedwoodGPU)
           Version: 2.4.124
           Libs: -L$R/work/sysroot/lib -lsweetdrm -framework IOKit
           Cflags: -I$R/work/sysroot/include -I$R/work/mesa/include/drm-uapi
           EOF
+          keep work/libdrm.pc.new work/sysroot/lib/pkgconfig/libdrm.pc
 
       - name: Turnip
         run: |
           R=$GITHUB_WORKSPACE
-          flags="'-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK', '-I$R/vulkan/sweetdrm'"
-          cat > work/ios.cross <<EOF
+          . work/keep.sh
+          flags="'-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK', '-I$R/work/sweetdrm-src'"
+          cat > work/ios.cross.new <<EOF
           [binaries]
           c = '$IOSCC'
           cpp = '$(xcrun --sdk iphoneos --find clang++)'
@@ -120,6 +136,7 @@ jobs:
           cpp_link_args = [$flags]
           objc_link_args = [$flags]
           EOF
+          keep work/ios.cross.new work/ios.cross
           export PKG_CONFIG_LIBDIR=$R/work/sysroot/lib/pkgconfig PKG_CONFIG_PATH=
           [ -f work/build/build.ninja ] && echo "build tree from the cache" || meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
             -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dplatforms= \
@@ -177,7 +194,10 @@ jobs:
           codesign -f -s - $B/libvulkan_freedreno.dylib $B
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtltest \
             metal/test/mtltest.m -framework Foundation -framework Metal
-          codesign -f -s - out/mtltest
+          xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/compute.metal -o work/compute.air
+          xcrun -sdk iphoneos metallib work/compute.air -o out/compute.metallib
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlcompute             metal/test/mtlcompute.m -framework Foundation -framework Metal
+          codesign -f -s - out/mtltest out/mtlcompute
           ls -la $B out/mtltest
 
       - name: Save Mesa cache
@@ -187,6 +207,9 @@ jobs:
           path: |
             work/mesa
             work/build
+            work/sysroot
+            work/sweetdrm-src
+            work/ios.cross
           key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-${{ github.run_id }}
 
       - name: Save Rust cache

@@ -35,4 +35,26 @@ smtl_blit *smtl_blit_new(const smtl_cmdbuf *c);
 int smtl_blit_fill(smtl_blit *e, const smtl_buffer *b, uint64_t start, uint64_t end, uint8_t value);
 int smtl_blit_end(smtl_blit *e);    /* consumes the encoder */
 
+/* milestone 2: libraries, functions, compute */
+typedef struct smtl_library smtl_library;
+typedef struct smtl_function smtl_function;
+typedef struct smtl_cpipe smtl_cpipe;
+typedef struct smtl_compute smtl_compute;
+
+smtl_library *smtl_library_new_data(const smtl_device *d, const void *bytes, size_t len);
+void smtl_library_release(smtl_library *l);
+smtl_function *smtl_function_new(const smtl_library *l, const char *name);
+void smtl_function_release(smtl_function *f);
+smtl_cpipe *smtl_compute_pipeline_new(const smtl_device *d, const smtl_function *f);
+void smtl_compute_pipeline_release(smtl_cpipe *p);
+uint32_t smtl_compute_pipeline_max_threads(const smtl_cpipe *p);
+uint32_t smtl_compute_pipeline_width(const smtl_cpipe *p);
+smtl_compute *smtl_compute_new(const smtl_cmdbuf *c);
+int smtl_compute_set_pipeline(smtl_compute *e, const smtl_cpipe *p);
+int smtl_compute_set_buffer(smtl_compute *e, const smtl_buffer *b, uint64_t offset, uint32_t index);
+int smtl_compute_set_bytes(smtl_compute *e, const void *bytes, size_t len, uint32_t index);
+int smtl_compute_dispatch_groups(smtl_compute *e, uint64_t gx, uint64_t gy, uint64_t gz, uint64_t tx, uint64_t ty, uint64_t tz);
+int smtl_compute_dispatch_threads(smtl_compute *e, uint64_t x, uint64_t y, uint64_t z, uint64_t tx, uint64_t ty, uint64_t tz);
+int smtl_compute_end(smtl_compute *e);   /* consumes the encoder */
+
 #endif

@@ -301,3 +301,135 @@ pub extern "C" fn sweetmtl_add_device_protocols() {
 #[used]
 #[link_section = "__DATA,__mod_init_func"]
 static ADD_DEVICE_PROTOCOLS: extern "C" fn() = sweetmtl_add_device_protocols;
+
+// ---- libraries, functions, compute pipelines (milestone 2) ----
+
+use metal2vulkan_runtime::{ComputeCommandEncoder, ComputePipelineState, Function, Library, PipelineOptions, Size};
+
+/// A library from a metallib's bytes (newLibraryWithData:).
+#[no_mangle]
+pub unsafe extern "C" fn smtl_library_new_data(d: *const Device, bytes: *const u8, len: usize) -> *mut Library {
+    match (*d).new_library_with_data(std::slice::from_raw_parts(bytes, len)) {
+        Ok(l) => Box::into_raw(Box::new(l)),
+        Err(e) => {
+            fail("new_library_with_data", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_library_release(l: *mut Library) {
+    if !l.is_null() {
+        drop(Box::from_raw(l));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_function_new(l: *const Library, name: *const c_char) -> *mut Function {
+    let name = CStr::from_ptr(name).to_string_lossy();
+    match (*l).new_function_with_name(&name) {
+        Ok(f) => Box::into_raw(Box::new(f)),
+        Err(e) => {
+            fail("new_function_with_name", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_function_release(f: *mut Function) {
+    if !f.is_null() {
+        drop(Box::from_raw(f));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_pipeline_new(d: *const Device, f: *const Function) -> *mut ComputePipelineState {
+    match (*d).new_compute_pipeline_state_with_function(&*f, &PipelineOptions::default()) {
+        Ok(p) => Box::into_raw(Box::new(p)),
+        Err(e) => {
+            fail("new_compute_pipeline_state_with_function", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_pipeline_release(p: *mut ComputePipelineState) {
+    if !p.is_null() {
+        drop(Box::from_raw(p));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_pipeline_max_threads(p: *const ComputePipelineState) -> u32 {
+    (*p).max_total_threads_per_threadgroup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_pipeline_width(p: *const ComputePipelineState) -> u32 {
+    (*p).thread_execution_width()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_new(c: *const CommandBuffer) -> *mut ComputeCommandEncoder {
+    match (*c).compute_command_encoder() {
+        Ok(e) => Box::into_raw(Box::new(e)),
+        Err(e) => {
+            fail("compute_command_encoder", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_set_pipeline(e: *mut ComputeCommandEncoder, p: *const ComputePipelineState) -> i32 {
+    match (*e).set_compute_pipeline_state(&*p) {
+        Ok(()) => 0,
+        Err(err) => fail("set_compute_pipeline_state", err),
+    }
+}
+
+/// setBuffer:offset:atIndex: (b may be NULL).
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_set_buffer(e: *mut ComputeCommandEncoder, b: *const Buffer, offset: u64, index: u32) -> i32 {
+    let b = if b.is_null() { None } else { Some(&*b) };
+    match (*e).set_buffer(b, offset, index) {
+        Ok(()) => 0,
+        Err(err) => fail("set_buffer", err),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_set_bytes(e: *mut ComputeCommandEncoder, bytes: *const u8, len: usize, index: u32) -> i32 {
+    match (*e).set_bytes(std::slice::from_raw_parts(bytes, len), index) {
+        Ok(()) => 0,
+        Err(err) => fail("set_bytes", err),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_dispatch_groups(e: *mut ComputeCommandEncoder, gx: u64, gy: u64, gz: u64, tx: u64, ty: u64, tz: u64) -> i32 {
+    match (*e).dispatch_threadgroups(Size::new(gx, gy, gz), Size::new(tx, ty, tz)) {
+        Ok(()) => 0,
+        Err(err) => fail("dispatch_threadgroups", err),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_dispatch_threads(e: *mut ComputeCommandEncoder, x: u64, y: u64, z: u64, tx: u64, ty: u64, tz: u64) -> i32 {
+    match (*e).dispatch_threads(Size::new(x, y, z), Size::new(tx, ty, tz)) {
+        Ok(()) => 0,
+        Err(err) => fail("dispatch_threads", err),
+    }
+}
+
+/// endEncoding: consumes the encoder.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_compute_end(e: *mut ComputeCommandEncoder) -> i32 {
+    match Box::from_raw(e).end_encoding() {
+        Ok(()) => 0,
+        Err(err) => fail("end_encoding", err),
+    }
+}
