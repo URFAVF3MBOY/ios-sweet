@@ -106,7 +106,9 @@ jobs:
           cp work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib out/
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include \
             -o out/vktest vulkan/vktest/vktest.c
-          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest
+          glslangValidator -V --target-env vulkan1.1 --vn compute_spv -o work/compute_spv.h vulkan/vktest/compute.comp
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/vkcompute vulkan/vktest/vkcompute.c
+          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest out/vkcompute
           ls -la out
 
       - uses: actions/upload-artifact@v4
