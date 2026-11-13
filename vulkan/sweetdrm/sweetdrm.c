@@ -662,6 +662,27 @@ drmFreeDevice(drmDevicePtr *device)
 	}
 }
 
+int
+drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+{
+	(void)fd;
+	return drmGetDevices2(flags, device, 1) == 1 ? 0 : -(errno = ENODEV);
+}
+
+int
+drmGetDevice(int fd, drmDevicePtr *device)
+{
+	return drmGetDevice2(fd, 0, device);
+}
+
+/* There is one device: equal when both are it. */
+int
+drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
+{
+	return a != NULL && b != NULL && a->bustype == b->bustype && a->bustype == DRM_BUS_PLATFORM &&
+	    strcmp(a->businfo.platform->fullname, b->businfo.platform->fullname) == 0;
+}
+
 /* ---- CPU maps (Turnip's mmap of a BO comes here) ---- */
 
 static struct {

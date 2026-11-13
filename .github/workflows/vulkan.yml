@@ -95,7 +95,9 @@ jobs:
             { grep -E "error:|undefined|Undefined" work/build.log | sort | uniq | head -80; exit 1; }
           lib=work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib
           nm -gU "$lib" | grep -E " T _(vk_icd|vkGetInstanceProcAddr)" || true
-          nm -m "$lib" | grep "weak external" || true
+          # anything non-weak left to dynamic lookup is a function sweetdrm (or iOS) lacks: fail here, not on the phone
+          if nm -m "$lib" | grep "dynamically looked up" | grep -v "weak external"; then exit 1; fi
+          echo "optional entrypoints left NULL: $(nm -m "$lib" | grep -c 'weak external.*dynamically looked up')"
           ls -la "$lib"
 
       - name: vktest
