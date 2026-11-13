@@ -118,6 +118,28 @@ jobs:
           codesign -f -s - out/libvulkan_freedreno.dylib out/vktest out/vkcompute out/vkdraw out/bench_vk out/bench_gl
           ls -la out
 
+      - name: SweetMTL (Metal over metal2vulkan + Turnip)
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target aarch64-apple-ios
+          export IPHONEOS_DEPLOYMENT_TARGET=16.0
+          cargo +1.98.1 build --release --target aarch64-apple-ios --manifest-path metal/bridge/Cargo.toml \
+            --target-dir work/mtl-target > work/bridge.log 2>&1 ||
+            { grep -E "^(error|warning: unused)" -A8 work/bridge.log | head -120; exit 1; }
+          B=out/SweetMTL.bundle
+          mkdir -p $B
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -g -Wall -Wno-protocol \
+            -Wno-objc-property-implementation -Wno-incomplete-implementation -bundle -I metal/frontend \
+            -o $B/SweetMTL metal/frontend/SweetMTL.m work/mtl-target/aarch64-apple-ios/release/libsweetmtl_bridge.a \
+            -Wl,-u,_vkGetInstanceProcAddr -framework Foundation -framework Metal -framework IOSurface -lc++
+          nm -gU $B/SweetMTL | grep -E " T _(vkGetInstanceProcAddr|smtl_device_new)"
+          cp metal/frontend/Info.plist $B/
+          cp out/libvulkan_freedreno.dylib $B/
+          codesign -f -s - $B/libvulkan_freedreno.dylib $B
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtltest \
+            metal/test/mtltest.m -framework Foundation -framework Metal
+          codesign -f -s - out/mtltest
+          ls -la $B out/mtltest
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -127,3 +149,4 @@ jobs:
             work/configure.log
             work/build.log
             work/build/meson-logs/meson-log.txt
+            work/bridge.log
