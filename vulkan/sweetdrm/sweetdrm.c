@@ -498,6 +498,11 @@ int drmPrimeFDToHandle(int fd, int p, uint32_t *h) { (void)fd; (void)p; (void)h;
 
 /* ---- msm requests ---- */
 
+/* The last real submission (the kernel's fence numbers are the one ring's, in order). Under `lock`. */
+static bool last_fence_valid;
+static uint32_t last_fence, last_fence_queue;
+static int last_fence_fd;
+
 static int
 msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 {
@@ -532,11 +537,27 @@ msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 		fprintf(stderr, "sweetdrm: submit queue %u: %u cmds, %u bos, %u in / %u out syncobjs, flags %#x\n",
 		    req->queueid, req->nr_cmds, req->nr_bos, nr_in, nr_out, req->flags);
 	}
-	ret = gpu_call(fd, DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, req, size);
-	if (ret != 0) {
-		return ret;
+	if (req->nr_cmds == 0) {
+		/*
+		 * Nothing for the GPU, only syncobjs to signal (Turnip does this for a bare semaphore or fence
+		 * signal). RedwoodGPU refuses an empty submission (seen 2026-11-13: metal2vulkan's device setup
+		 * got EINVAL here and Turnip called the device lost), so answer it here: done when the last real
+		 * submission is done, which the in-order ring makes the same thing.
+		 */
+		pthread_mutex_lock(&lock);
+		req->fence = last_fence_valid ? last_fence : 0;
+		ret = 0;
+	} else {
+		ret = gpu_call(fd, DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, req, size);
+		if (ret != 0) {
+			return ret;
+		}
+		pthread_mutex_lock(&lock);
+		last_fence = req->fence;
+		last_fence_queue = req->queueid;
+		last_fence_fd = fd;
+		last_fence_valid = true;
 	}
-	pthread_mutex_lock(&lock);
 	for (uint32_t i = 0; i < nr_in; i++) {
 		const struct drm_msm_syncobj *o = (const void *)(ins + (size_t)i * stride);
 		struct syncobj *s = syncobj(o->handle);
@@ -549,13 +570,19 @@ msm_submit(int fd, struct drm_msm_gem_submit *req, size_t size)
 		const struct drm_msm_syncobj *o = (const void *)(outs + (size_t)i * stride);
 		struct syncobj *s = syncobj(o->handle);
 
-		if (s != NULL) {
-			s->signalled = false;
-			s->submitted = true;
-			s->fence = req->fence;
-			s->queue = req->queueid;
-			s->fd = fd;
+		if (s == NULL) {
+			continue;
 		}
+		if (req->nr_cmds == 0 && !last_fence_valid) {
+			s->signalled = true;            /* nothing was ever submitted: nothing to wait for */
+			s->submitted = false;
+			continue;
+		}
+		s->signalled = false;
+		s->submitted = true;
+		s->fence = req->fence;
+		s->queue = req->nr_cmds == 0 ? last_fence_queue : req->queueid;
+		s->fd = req->nr_cmds == 0 ? last_fence_fd : fd;
 	}
 	pthread_cond_broadcast(&changed);
 	pthread_mutex_unlock(&lock);
