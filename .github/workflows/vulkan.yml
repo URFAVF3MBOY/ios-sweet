@@ -197,8 +197,12 @@ jobs:
           xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/compute.metal -o work/compute.air
           xcrun -sdk iphoneos metallib work/compute.air -o out/compute.metallib
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlcompute             metal/test/mtlcompute.m -framework Foundation -framework Metal
-          codesign -f -s - out/mtltest out/mtlcompute
-          ls -la $B out/mtltest
+          xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/render.metal -o work/render.air
+          xcrun -sdk iphoneos metallib work/render.air -o out/render.metallib
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlrender \
+            metal/test/mtlrender.m -framework Foundation -framework Metal
+          codesign -f -s - out/mtltest out/mtlcompute out/mtlrender
+          ls -la $B out/mtltest out/mtlrender
 
       - name: Save Mesa cache
         if: always()

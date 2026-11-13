@@ -14,11 +14,14 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::OnceLock;
 
+mod vktrace;
+mod render;
+
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::default());
 }
 
-fn fail<E: std::fmt::Display>(what: &str, e: E) -> i32 {
+pub(crate) fn fail<E: std::fmt::Display>(what: &str, e: E) -> i32 {
     let text = format!("{what}: {e}");
     LAST_ERROR.with(|l| *l.borrow_mut() = CString::new(text.replace('\0', " ")).unwrap_or_default());
     -1
@@ -28,6 +31,18 @@ fn fail<E: std::fmt::Display>(what: &str, e: E) -> i32 {
 #[no_mangle]
 pub extern "C" fn smtl_last_error() -> *const c_char {
     LAST_ERROR.with(|l| l.borrow().as_ptr())
+}
+
+/// SWEETMTL_TIME=1: each timed bridge call prints how long it took (stderr).
+pub(crate) fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SWEETMTL_TIME").is_some()) {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    eprintln!("sweetmtl: {what} {:.3} ms", t.elapsed().as_secs_f64() * 1000.0);
+    r
 }
 
 // ---- the Vulkan entry point (this binary acts as the runtime's "loader") ----
@@ -41,7 +56,7 @@ pub unsafe extern "C" fn vkGetInstanceProcAddr(instance: *mut c_void, name: *con
     match TURNIP_GIPA.get() {
         Some(&f) => {
             let f: Gipa = std::mem::transmute(f);
-            f(instance, name)
+            vktrace::instance_proc(name, f(instance, name))
         }
         None => ptr::null_mut(),
     }
@@ -154,7 +169,7 @@ pub unsafe extern "C" fn smtl_queue_release(q: *mut CommandQueue) {
 }
 
 /// MTLResourceOptions: storage mode in bits 4-7 (0 shared, 1 managed, 2 private, 3 memoryless).
-fn resource_options(raw: u64) -> ResourceOptions {
+pub(crate) fn resource_options(raw: u64) -> ResourceOptions {
     match (raw >> 4) & 0xf {
         2 => ResourceOptions::private(),
         _ => ResourceOptions::shared(),
@@ -197,7 +212,7 @@ pub unsafe extern "C" fn smtl_buffer_length(b: *const Buffer) -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_new(q: *const CommandQueue) -> *mut CommandBuffer {
-    match (*q).command_buffer() {
+    match timed("command_buffer", || (*q).command_buffer()) {
         Ok(c) => Box::into_raw(Box::new(c)),
         Err(e) => {
             fail("command_buffer", e);
@@ -215,7 +230,7 @@ pub unsafe extern "C" fn smtl_cmdbuf_release(c: *mut CommandBuffer) {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
-    match (*c).commit() {
+    match timed("commit", || (*c).commit()) {
         Ok(()) => 0,
         Err(e) => fail("commit", e),
     }
@@ -223,7 +238,7 @@ pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_wait(c: *const CommandBuffer) -> i32 {
-    match (*c).wait_until_completed() {
+    match timed("wait", || (*c).wait_until_completed()) {
         Ok(()) => 0,
         Err(e) => fail("wait_until_completed", e),
     }
@@ -247,7 +262,7 @@ pub unsafe extern "C" fn smtl_cmdbuf_status(c: *const CommandBuffer) -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_blit_new(c: *const CommandBuffer) -> *mut BlitCommandEncoder {
-    match (*c).blit_command_encoder() {
+    match timed("blit_new", || (*c).blit_command_encoder()) {
         Ok(b) => Box::into_raw(Box::new(b)),
         Err(e) => {
             fail("blit_command_encoder", e);
@@ -258,7 +273,7 @@ pub unsafe extern "C" fn smtl_blit_new(c: *const CommandBuffer) -> *mut BlitComm
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_blit_fill(e: *mut BlitCommandEncoder, b: *const Buffer, start: u64, end: u64, value: u8) -> i32 {
-    match (*e).fill_buffer(&*b, start..end, value) {
+    match timed("fill", || (*e).fill_buffer(&*b, start..end, value)) {
         Ok(()) => 0,
         Err(err) => fail("fill_buffer", err),
     }
@@ -267,7 +282,7 @@ pub unsafe extern "C" fn smtl_blit_fill(e: *mut BlitCommandEncoder, b: *const Bu
 /// endEncoding: consumes the encoder (no release afterwards).
 #[no_mangle]
 pub unsafe extern "C" fn smtl_blit_end(e: *mut BlitCommandEncoder) -> i32 {
-    match Box::from_raw(e).end_encoding() {
+    match timed("blit_end", || Box::from_raw(e).end_encoding()) {
         Ok(()) => 0,
         Err(err) => fail("end_encoding", err),
     }
