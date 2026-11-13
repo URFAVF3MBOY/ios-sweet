@@ -23,7 +23,7 @@ jobs:
 
       - name: Toolchain
         run: |
-          brew install meson ninja bison flex pkgconf >/dev/null
+          brew install meson ninja bison flex pkgconf glslang >/dev/null
           python3 -m venv work/venv
           work/venv/bin/pip install -q meson mako pyyaml packaging
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
