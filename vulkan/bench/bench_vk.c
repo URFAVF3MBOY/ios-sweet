@@ -29,7 +29,8 @@ DFN(vkCmdDraw); DFN(vkCmdEndRenderPass); DFN(vkEndCommandBuffer); DFN(vkCreateFe
 DFN(vkQueueSubmit); DFN(vkWaitForFences); DFN(vkCreateSampler); DFN(vkCreateDescriptorSetLayout);
 DFN(vkCreateDescriptorPool); DFN(vkAllocateDescriptorSets); DFN(vkUpdateDescriptorSets);
 DFN(vkCmdBindDescriptorSets); DFN(vkCmdPushConstants); DFN(vkCmdPipelineBarrier); DFN(vkCmdCopyBufferToImage);
-DFN(vkResetCommandBuffer);
+DFN(vkResetCommandBuffer); DFN(vkCreateQueryPool); DFN(vkCmdResetQueryPool); DFN(vkCmdWriteTimestamp);
+DFN(vkGetQueryPoolResults);
 
 static uint32_t
 memory_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -110,7 +111,15 @@ main(int argc, char **argv)
 	GETD(vkCreateSampler); GETD(vkCreateDescriptorSetLayout); GETD(vkCreateDescriptorPool);
 	GETD(vkAllocateDescriptorSets); GETD(vkUpdateDescriptorSets); GETD(vkCmdBindDescriptorSets);
 	GETD(vkCmdPushConstants); GETD(vkCmdPipelineBarrier); GETD(vkCmdCopyBufferToImage); GETD(vkResetCommandBuffer);
-	printf("VK: %s, device in %.1f ms\n", props.deviceName, bench_ms() - t0);
+	GETD(vkCreateQueryPool); GETD(vkCmdResetQueryPool); GETD(vkCmdWriteTimestamp); GETD(vkGetQueryPoolResults);
+	printf("VK: %s, device in %.1f ms, timestamp period %.2f ns\n", props.deviceName, bench_ms() - t0,
+	    props.limits.timestampPeriod);
+	/* GPU time of each frame: a timestamp before the render pass and one after (two per ring slot) */
+	VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+		.queryCount = 2 * RING };
+	VkQueryPool qp;
+	CHECK(vkCreateQueryPool(dev, &qpci, NULL, &qp));
+	const double tick_ms = props.limits.timestampPeriod / 1e6;
 	VkQueue q;
 	vkGetDeviceQueue(dev, 0, 0, &q);
 
@@ -278,7 +287,9 @@ main(int argc, char **argv)
 	}
 	for (int s = 0; s < nsizes; s++) {
 		int quads = sizes[s];
-		double cpu[FRAMES], frame[FRAMES];
+		double cpu[FRAMES], frame[FRAMES], gpu[FRAMES];
+		int ngpu = 0;
+		uint64_t first_start = 0, last_end = 0;
 
 		for (int pass = 0; pass < 2; pass++) {
 			double begin = bench_ms();
@@ -288,6 +299,17 @@ main(int argc, char **argv)
 				double a = bench_ms();
 
 				CHECK(vkWaitForFences(dev, 1, &fence[k], VK_TRUE, 5000000000ull));   /* its last use */
+				if (pass == 1 && f >= RING) {
+					uint64_t ts[2];
+
+					if (vkGetQueryPoolResults(dev, qp, 2 * k, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+						gpu[ngpu++] = (ts[1] - ts[0]) * tick_ms;
+						if (first_start == 0) {
+							first_start = ts[0];
+						}
+						last_end = ts[1];
+					}
+				}
 				CHECK(vkResetFences(dev, 1, &fence[k]));
 				vkResetCommandBuffer(cmd[k], 0);
 				VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -297,6 +319,8 @@ main(int argc, char **argv)
 				VkRenderPassBeginInfo rpbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
 					.framebuffer = fb, .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1,
 					.pClearValues = &clear };
+				vkCmdResetQueryPool(cmd[k], qp, 2 * k, 2);
+				vkCmdWriteTimestamp(cmd[k], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 2 * k);
 				vkCmdBeginRenderPass(cmd[k], &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 				vkCmdBindPipeline(cmd[k], VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
 				float bg[4] = { -1, -1, 2, 2 };
@@ -313,6 +337,7 @@ main(int argc, char **argv)
 					vkCmdDraw(cmd[k], 4, 1, 0, 0);
 				}
 				vkCmdEndRenderPass(cmd[k]);
+				vkCmdWriteTimestamp(cmd[k], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * k + 1);
 				CHECK(vkEndCommandBuffer(cmd[k]));
 				VkSubmitInfo fsi = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
 					.pCommandBuffers = &cmd[k] };
@@ -327,6 +352,16 @@ main(int argc, char **argv)
 			if (pass == 1) {
 				CHECK(vkWaitForFences(dev, RING, fence, VK_TRUE, 5000000000ull));
 				bench_report("Vulkan", quads, cpu, frame, FRAMES, (bench_ms() - begin) / FRAMES);
+				if (ngpu > 0) {
+					double sum = 0;
+
+					for (int i = 0; i < ngpu; i++) {
+						sum += gpu[i];
+					}
+					double span = (last_end - first_start) * tick_ms;
+					printf("        GPU time per frame %.2f ms (mean of %d back-to-back); GPU busy %.0f %% of their span (%.1f ms)\n",
+					    sum / ngpu, ngpu, 100.0 * sum / span, span);
+				}
 			}
 		}
 	}
