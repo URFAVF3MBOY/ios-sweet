@@ -1,0 +1,93 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Fri, 13 Nov 2026 05:30:00 -0500
+Subject: [PATCH] op7t-0219: disk0 registry entry with the size of the iOS partition
+
+3uTools on the PC (iPhone mode, 0218) shows a "2 TB" disk with nonsense
+free space. MobileGestalt DiskUsage on the phone: TotalDiskCapacity -1,
+TotalDataAvailable negative. libMobileGestalt's NANDSize() takes the
+service with BSD name "disk0" and its "Size" (kIOMediaSizeKey): an
+iPhone's NAND IOMedia. Our storage is sweet_ufs.c's ufsroot0, no IOMedia.
+
+New iokit/Kernel/arm/SweetDisk.cpp publishes an IOService "disk0" (BSD
+Name disk0, Size = the ufsroot partition in bytes, Whole, Writable, not
+removable) under the platform expert; sweet_ufs.c calls it once ufsroot0
+exists. Only a registry entry: nothing opens it, rd=ufsroot0 unchanged.
+
+Apply after 0218.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,7 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++extern void sweet_disk0_publish(uint64_t bytes, uint32_t block);       /* iokit/Kernel/arm/SweetDisk.cpp (0219) */
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -760,6 +761,7 @@ sweet_ufs_init(void)
+ 	printf("HOTDOGB UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	sweet_disk0_publish(su.nblocks * UFS_BLOCK, UFS_BLOCK);      /* 0219: MobileGestalt's disk size */
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+diff --git a/iokit/Kernel/arm/SweetDisk.cpp b/iokit/Kernel/arm/SweetDisk.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetDisk.cpp
+@@ -0,0 +1,44 @@
++/*
++ * OnePlus 7T (0219): a disk0 entry in the IOService plane for the UFS partition that holds iOS. MobileGestalt's
++ * NANDSize() looks up the service with BSD name "disk0" and reads its "Size" (kIOMediaSizeKey); on an iPhone that is
++ * the NAND's IOMedia. Here the storage is bsd/dev/sweet_ufs.c's ufsroot0 with no IOMedia, so DiskUsage said
++ * TotalDiskCapacity -1 and tools (3uTools) showed a 2 TB disk with nonsense free space. This is only that
++ * registry entry: nothing opens it, rd=ufsroot0 still names the root device.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSNumber.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" void sweet_disk0_publish(uint64_t bytes, uint32_t block);
++
++extern "C" void
++sweet_disk0_publish(uint64_t bytes, uint32_t block)
++{
++	IOService *disk = new IOService;
++	if (!disk || !disk->init()) {
++		printf("HOTDOGB DISK: no disk0 entry\n");
++		return;
++	}
++	disk->setName("disk0");
++	disk->setProperty("BSD Name", "disk0");
++	disk->setProperty("BSD Unit", 0ULL, 32);
++	disk->setProperty("Size", bytes, 64);
++	disk->setProperty("Preferred Block Size", (unsigned long long)block, 64);
++	disk->setProperty("Whole", true);
++	disk->setProperty("Writable", true);
++	disk->setProperty("Removable", false);
++	disk->setProperty("Ejectable", false);
++	disk->setProperty("Content", "Apple_APFS_Container");
++	IOService *parent = IOService::getPlatform() ? (IOService *)IOService::getPlatform() : IOService::getServiceRoot();
++	if (!parent || !disk->attach(parent)) {
++		printf("HOTDOGB DISK: disk0 attach failed\n");
++		disk->release();
++		return;
++	}
++	disk->registerService();
++	disk->release();
++	printf("HOTDOGB DISK: disk0 published, %llu bytes\n", bytes);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -27,3 +27,4 @@ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitc
+ iokit/Kernel/arm/SweetDrop.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetUSBDevice.cpp                              optional iokitcpp
++iokit/Kernel/arm/SweetDisk.cpp                                   optional iokitcpp
