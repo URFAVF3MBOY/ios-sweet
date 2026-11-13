@@ -91,8 +91,8 @@ jobs:
             -Dvideo-codecs= -Dvulkan-layers= -Dperfetto=false -Dandroid-libbacktrace=disabled \
             -Dbuildtype=release -Db_ndebug=true > work/configure.log 2>&1 || { tail -60 work/configure.log; exit 1; }
           grep -iE "libdrm|zlib|freedreno|kmds" work/configure.log | head -20
-          ninja -C work/build src/freedreno/vulkan/libvulkan_freedreno.dylib > work/build.log 2>&1 ||
-            { grep -E "error:|FAILED|undefined" -A3 work/build.log | head -80; exit 1; }
+          ninja -k 0 -C work/build src/freedreno/vulkan/libvulkan_freedreno.dylib > work/build.log 2>&1 ||
+            { grep -E "error:|undefined|Undefined" work/build.log | sort | uniq | head -80; exit 1; }
           lib=work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib
           nm -gU "$lib" | grep -E " T _(vk_icd|vkGetInstanceProcAddr)" || true
           nm -m "$lib" | grep "weak external" || true
