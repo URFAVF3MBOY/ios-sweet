@@ -108,7 +108,10 @@ jobs:
             -o out/vktest vulkan/vktest/vktest.c
           glslangValidator -V --target-env vulkan1.1 --vn compute_spv -o work/compute_spv.h vulkan/vktest/compute.comp
           "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/vkcompute vulkan/vktest/vkcompute.c
-          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest out/vkcompute
+          glslangValidator -V --target-env vulkan1.1 --vn tri_vert -o work/tri_vert.h vulkan/vktest/tri.vert
+          glslangValidator -V --target-env vulkan1.1 --vn tri_frag -o work/tri_frag.h vulkan/vktest/tri.frag
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/vkdraw vulkan/vktest/vkdraw.c
+          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest out/vkcompute out/vkdraw
           ls -la out
 
       - uses: actions/upload-artifact@v4
