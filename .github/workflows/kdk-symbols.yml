@@ -1,0 +1,55 @@
+name: kdk-symbols
+# Symbol tables of kexts from the macOS 13.5 KDK (same Darwin 22 generation as iOS 16.5): nm and the fixups of
+# their data (vtable slots -> symbols). Text only, as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      kexts:
+        description: kext names (space separated)
+        default: "IOUSBDeviceFamily AppleUSBDeviceMux AppleUSBXDCI AppleUSBXDCIARM"
+jobs:
+  dump:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Restore KDK cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-13.5
+      - name: Install KDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p /tmp/kdk-cache
+          if ! ls /tmp/kdk-cache/*.dmg >/dev/null 2>&1; then
+            gh release download kdk-22G91 -R URFAVF3MBOY/ios-sweet -p '*.dmg' -D /tmp/kdk-cache || \
+              gh release download 22G91 -R dortania/KdkSupportPkg -p '*.dmg' -D /tmp/kdk-cache
+          fi
+          DMG=$(ls /tmp/kdk-cache/*.dmg | head -1)
+          hdiutil attach "$DMG" -nobrowse
+          PKG=$(echo /Volumes/Kernel*/KernelDebugKit.pkg)
+          sudo installer -pkg "$PKG" -target /
+          echo "KDKROOT=$(ls -d /Library/Developer/KDKs/KDK_13.5*.kdk | head -1)" >> "$GITHUB_ENV"
+      - name: Dump
+        env:
+          KEXTS: ${{ inputs.kexts }}
+        run: |
+          mkdir -p out
+          find "$KDKROOT" -iname '*USB*Device*' -o -iname '*XDCI*' | sed "s|$KDKROOT||" > out/found.txt
+          cat out/found.txt
+          for k in $KEXTS; do
+            for bin in $(find "$KDKROOT" -path "*/$k.kext/*" -type f -perm +111 2>/dev/null; find "$KDKROOT" -path "*/$k.kext/*" -name "$k" -type f 2>/dev/null); do
+              tag=$(echo "$bin" | sed "s|$KDKROOT||; s|[/ ]|_|g")
+              file "$bin" > "out/$tag.file.txt" || true
+              nm -n -arch arm64e "$bin" > "out/$tag.nm.txt" 2>/dev/null || nm -n "$bin" > "out/$tag.nm.txt" || true
+              xcrun dyld_info -arch arm64e -fixups "$bin" > "out/$tag.fixups.txt" 2>/dev/null || xcrun dyld_info -fixups "$bin" > "out/$tag.fixups.txt" || true
+              otool -arch arm64e -lv "$bin" > "out/$tag.lc.txt" 2>/dev/null || true
+            done
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdk-symbols
+          path: out
