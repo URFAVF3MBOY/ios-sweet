@@ -32,7 +32,7 @@ def main():
     for i in range(ns):
         strx, typ, sect, desc, val = struct.unpack_from('<IBBHQ', d, so + 16 * i)
         n = d[stro + strx:stro + strx + 400].split(b'\0')[0].decode('latin1')
-        if (typ & 0x0e) == 0x0e and val:
+        if (typ & 0x0e) == 0x0e and val and n and not (typ & 0xe0):   # named section symbols, no stabs
             syms[n] = val
             byaddr.setdefault(val, n)
 
