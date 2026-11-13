@@ -22,7 +22,9 @@ from collections import Counter
 
 CI_DXB = '/Users/runner/work/ios-sweet/ios-sweet/dxb'
 CI_SDK_PLATFORM = re.compile(r'/Applications/Xcode[^ ]*?\.sdk/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
-CLANG = os.path.expanduser('~/swift/usr/bin/clang')
+CLANG = os.environ.get('XNU_CC_CLANG') or ('C:/Program Files/LLVM/bin/clang.exe' if os.name == 'nt'
+                                            else os.path.expanduser('~/swift/usr/bin/clang'))
+CLANGXX = CLANG[:-4] + '++.exe' if CLANG.endswith('.exe') else CLANG + '++'
 DROP = {'-c', '-g', '-MD', '-MMD'}
 DROP_WITH_ARG = {'-MF', '-MT', '-o', '-arch'}
 COMPONENTS = ('osfmk', 'bsd', 'iokit', 'libkern', 'pexpert', 'security', 'san', 'libsa')
@@ -53,6 +55,7 @@ def makefile_sources(bt):
     parallel make interleaves them, so some commands cannot be recovered."""
     out = []
     for root, _, files in os.walk(os.path.join(bt, 'build/xnu.obj')):
+        root = root.replace(os.sep, '/')
         if 'Makefile' not in files or 'meta_features.h' not in files:
             continue
         text = open(os.path.join(root, 'Makefile'), errors='replace').read().replace('\\\n', ' ')
@@ -82,6 +85,7 @@ def component_dirs(bt):
     """component -> its config build dir (where meta_features.h lives)."""
     out = {}
     for root, _, files in os.walk(os.path.join(bt, 'build/xnu.obj')):
+        root = root.replace(os.sep, '/')
         if 'meta_features.h' in files:
             for c in COMPONENTS:
                 if f'/{c}/' in root + '/' and c not in out:
@@ -93,7 +97,7 @@ def run(item, bt, cdirs):
     src, (kind, args) = item
     objdir = os.environ.get('XNU_CC_OBJDIR')
     mode = ['-c', '-o', os.path.join(objdir, src.replace(CI_DXB + '/xnu/', '').replace('/', '__') + '.o')] if objdir else ['-fsyntax-only']
-    new = [CLANG if kind == 'clang' else CLANG + '++', '-target', 'arm64-apple-macos14.0', *mode,
+    new = [CLANG if kind == 'clang' else CLANGXX, '-target', 'arm64-apple-macos14.0', *mode,
            # Apple clang-only builtins (kalloc_type); values only matter for codegen
            '-D__builtin_xnu_type_signature(...)=""', '-D__builtin_xnu_type_summary(...)=0',
            '-D__builtin_xnu_types_compatible(...)=1'] + os.environ.get('XNU_CC_EXTRA', '').split()
@@ -107,7 +111,8 @@ def run(item, bt, cdirs):
         if a in DROP_WITH_ARG:
             skip = True
             continue
-        a = CI_SDK_PLATFORM.sub(os.path.join(bt, 'sdk-kernel-platform/platform'), a)
+        plat = bt + '/sdk-kernel-platform/platform'
+        a = CI_SDK_PLATFORM.sub(lambda m: plat, a)
         new.append(a.replace(CI_DXB, bt))
     new += os.environ.get('XNU_CC_POST', '').split()
     comp = next((c for c in COMPONENTS if f'/xnu/{c}/' in src), None) or \
@@ -120,7 +125,7 @@ def run(item, bt, cdirs):
 
 
 def main():
-    log, bt = sys.argv[1], os.path.abspath(sys.argv[2])
+    log, bt = sys.argv[1], os.path.abspath(sys.argv[2]).replace(os.sep, '/')
     per_file = '--per-file' in sys.argv
     filters = [a for a in sys.argv[3:] if a != '--per-file']
     cmds = commands(log)
