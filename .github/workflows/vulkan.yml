@@ -21,6 +21,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Caches: Mesa's source + build tree, and Rust's toolchain, crates and build. A change to one file then
+      # rebuilds that file only. Restored here, saved at the end even when a later step failed.
+      - name: Restore Mesa cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/mesa
+            work/build
+          key: mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}
+          restore-keys: |
+            mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-
+            mesa-${{ env.MESA_COMMIT }}-
+
+      - name: Restore Rust cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/mtl-target
+          key: cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}
+          restore-keys: |
+            cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-
+            cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-
+            cargo-
+
       - name: Toolchain
         run: |
           brew install meson ninja bison flex pkgconf glslang >/dev/null
@@ -33,8 +60,13 @@ jobs:
 
       - name: Sources
         run: |
-          git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
-          git -C work/mesa checkout -q $MESA_COMMIT
+          if [ -d work/mesa/.git ]; then
+            echo "Mesa from the cache"
+            git -C work/mesa reset -q --hard $MESA_COMMIT
+          else
+            git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
+            git -C work/mesa checkout -q $MESA_COMMIT
+          fi
           for p in vulkan/mesa-patches/*.patch; do echo "apply $p"; git -C work/mesa apply --whitespace=nowarn "$PWD/$p"; done
           mkdir -p work/sysroot/include work/sysroot/lib/pkgconfig
           curl -sSfL -o work/sysroot/include/xf86drm.h \
@@ -83,7 +115,7 @@ jobs:
           objc_link_args = [$flags]
           EOF
           export PKG_CONFIG_LIBDIR=$R/work/sysroot/lib/pkgconfig PKG_CONFIG_PATH=
-          meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
+          [ -f work/build/build.ninja ] && echo "build tree from the cache" || meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
             -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dplatforms= \
             -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
             -Dllvm=disabled -Dshader-cache=disabled -Dxmlconfig=disabled -Dzstd=disabled -Dexpat=disabled \
@@ -139,6 +171,26 @@ jobs:
             metal/test/mtltest.m -framework Foundation -framework Metal
           codesign -f -s - out/mtltest
           ls -la $B out/mtltest
+
+      - name: Save Mesa cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/mesa
+            work/build
+          key: mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-${{ github.run_id }}
+
+      - name: Save Rust cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/mtl-target
+          key: cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         if: always()
