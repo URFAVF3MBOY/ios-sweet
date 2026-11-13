@@ -3,6 +3,15 @@
 ## Status / current work (2026-11-09, latest)
 
 ### >>> RESUME HERE (2026-11-12, latest) <<<
+- **SAFARI'S 30 s FIRST PAGE FIXED: 0222 (2026-11-12, checked: "loads instantly, no black").**
+  - **Cause:** a spindump 10 s into the black (`logs/spin0221/`, script: kill Safari/WebKit, wait for MobileSafari, sleep 10, `spindump PID 3 -file` each) showed the WebKit GPU process's "RemoteRenderingBackend work queue" blocked by turnstile on thread "CA::CG::Queue".
+    - Names resolved against `QuartzCore` in the repo root (UUID DC2DD4C1, same as the phone; llvm-nm nearest symbol): `CA::CG::ContextDelegate::operation_` -> `CA::CG::AccelRenderer::acquire` -> `CAMetalContextCreate` -> `___CAMetalContextCreate_block_invoke` (0x1885356b8).
+    - That block (capstone): IOServiceMatching(**"IOAcceleratorES"**) + iterate, up to 300 times with `usleep(100000)` = **30 s**, then gives up on Metal. Our kernel had no such service.
+  - **0222** (`xnu/patches/0222-op7t-ioacceleratores-stand-in.patch`, arm64 CI 43359058599, kernel f33aab57, image `research/kexts/shim-boot-0222-iphone.img`, same recipe as 0219): RedwoodGPU.cpp publishes an empty `IOAcceleratorES` on the platform (no user client, no MetalPluginName; boot-arg `sweetaccstub=0` leaves it out).
+    - ioreg: `IOAcceleratorES <class IOAcceleratorES, registered, matched, active>` next to RedwoodGPU.
+    - **Safari shows pages at once.** sweetsound 7, sweetbt 6 at 16 min uptime; nothing else seen broken.
+    - (`ioreg -c IOAcceleratorES` printed nothing; `ioreg -l | grep` shows it. ioreg is /usr/sbin/ioreg.)
+  - 0221 stays: it removed the NECP delegation refusals (a real problem, just not this one).
 - **2026-11-12 ~19:20 phone time: 0220 and 0221 booted; Safari's first page still ~30 s.**
   - **0220** (CI intel 43353359373, kernel ee78bbd6, image `research/kexts/shim-boot-0220-iphone.img` = kcbuild with the 3 USB kexts + `shim/out/sweet-bt-7g-id.adt` + the 440-byte 0192 line + prep-cores.drop; the recipe was checked first by rebuilding 0219's payload byte-identical): boots (sweetsound 7, sweetbt 6). Safari: commit 30.59 s after the request; the NECP "does not hold the necessary entitlement to delegate" lines were still there (WebKit Networking, nsurlsessiond, dasd, trustd, geod).
   - **Why 0220 missed:** NECP_VERIFY_DELEGATION_ENTITLEMENT(_p, _c) calls priv_check_cred(_c, PRIV_NET_PRIVILEGED_SOCKET_DELEGATE). The priv_grant hook only sees current_proc(), and NECP re-checks clients from its own update thread call, where the current process is the kernel.
