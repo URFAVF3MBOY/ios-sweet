@@ -1,20 +1,19 @@
-0225: GPU buffers from a pool of RAM the kernel does not manage (ADT /chosen sweet-gpu-pool), write-combined, no cache upkeep at submission.
+0225: GPU buffers from a pool of RAM the kernel does not manage (ADT /chosen sweet-gpu-pool), write-combined, no cache upkeep at submission. Zeroed through a mapping made per buffer (mapping the whole GiB at start panicked in kmem_alloc).
 
 diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
-index 671a499..a09449f 100644
+index 671a499..c03499c 100644
 --- a/iokit/Kernel/arm/RedwoodGPU.cpp
 +++ b/iokit/Kernel/arm/RedwoodGPU.cpp
-@@ -77,6 +77,9 @@ uint64_t phystokv(uint64_t pa);                         /* 0146: vm_map_address_
+@@ -77,6 +77,8 @@ uint64_t phystokv(uint64_t pa);                         /* 0146: vm_map_address_
  #include <mach/vm_param.h>
  #include <sys/systm.h>
  #include <pexpert/arm64/board_config.h>
 +#include <pexpert/device_tree.h>                /* 0225: the ADT's sweet-gpu-pool */
-+extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);   /* 0225 */
 +static void poolStart(void);                    /* 0225: the buffer pool, below */
  
  #if defined(SWEET)
  #include "SweetSurface.h"
-@@ -563,6 +566,7 @@ RedwoodGPUStart(void)
+@@ -563,6 +565,7 @@ RedwoodGPUStart(void)
  	(void) PE_parse_boot_argn("sweetgpupush", &gGPUPushAgainMs, sizeof(gGPUPushAgainMs));      /* 0115 */
  	gGPUCached = cached != 0;
  	gGPULock = IOLockAlloc();
@@ -22,7 +21,7 @@ index 671a499..a09449f 100644
  	gpu = OSTypeAlloc(RedwoodGPU);
  	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
  		OSSafeReleaseNULL(gpu);
-@@ -682,6 +686,192 @@ struct gpu_kept {
+@@ -682,6 +685,205 @@ struct gpu_kept {
  #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
  static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
  
@@ -40,9 +39,11 @@ index 671a499..a09449f 100644
 + * the same way (MSM_BO_WC) and keeps no cache upkeep for them either.
 + *
 + * The pool is the ADT's /chosen "sweet-gpu-pool" = <base, size> (tools/adt_gpu_pool.py takes it
-+ * off the top of dram-size, so the kernel never had it). Mapped once into the kernel
-+ * write-combined; a buffer is a run of its pages (a bitmap, 16 KiB a bit), zeroed through that
-+ * view, and mapped write-combined into the program (clientMemoryForType). A run goes back only
++ * off the top of dram-size, so the kernel never had it). A buffer is a run of its pages (a
++ * bitmap, 16 KiB a bit), zeroed through a write-combined kernel mapping made for that and let go
++ * (first boot 2026-11-13 mapped the whole GiB at start: kmem_alloc of 1 GiB in the I/O map
++ * panicked), and mapped write-combined into the program (clientMemoryForType). It has no
++ * kernel view afterwards (b->kernel NULL): nothing here reads or pushes one. A run goes back only
 + * when its descriptor has no other holder (a program's mapping of it holds one): until then it
 + * waits in gPoolGone, looked at again on the next allocation. No property, sweetgpupool=0, or a
 + * full pool: the buffer is made as before. IOSurfaces are not affected.
@@ -51,7 +52,6 @@ index 671a499..a09449f 100644
 +#define GPU_POOL_GONE           256
 +static struct {
 +	uint64_t        base, size;                     /* physical */
-+	uint8_t *       kernel;                         /* the write-combined view of all of it */
 +	uint64_t *      used;                           /* a bit per page */
 +	uint32_t        pages, hint, free_pages;
 +	uint32_t        made, missed;                   /* buffers made from it / that did not fit */
@@ -81,9 +81,8 @@ index 671a499..a09449f 100644
 +	}
 +	gPool.pages = (uint32_t) (size / GPU_POOL_PAGE);
 +	gPool.used = IONewZero(uint64_t, (gPool.pages + 63) / 64);
-+	gPool.kernel = (uint8_t *) ml_io_map_wcomb((vm_offset_t) base, (vm_size_t) size);
-+	if (gPool.used == NULL || gPool.kernel == NULL) {
-+		IOLog("RedwoodGPU: buffer pool %#llx + %#llx cannot be mapped: not used\n", base, size);
++	if (gPool.used == NULL) {
++		IOLog("RedwoodGPU: buffer pool %#llx + %#llx no memory for its bitmap: not used\n", base, size);
 +		gPool.pages = 0;
 +		return;
 +	}
@@ -142,9 +141,9 @@ index 671a499..a09449f 100644
 +	}
 +}
 +
-+/* With the lock held: `size` bytes (whole 16 KiB pages) from the pool, zeroed. NULL: none. */
++/* With the lock held: `size` bytes (whole 16 KiB pages) from the pool, not yet zeroed (poolZero). NULL: none. */
 +static IOMemoryDescriptor *
-+poolTake(uint64_t size, uint8_t ** kernel)
++poolTake(uint64_t size)
 +{
 +	if (gPool.size == 0 || size == 0 || (size & (GPU_POOL_PAGE - 1))) {
 +		return NULL;
@@ -180,12 +179,25 @@ index 671a499..a09449f 100644
 +			poolMark(first, need, true);
 +			gPool.hint = (first + need) % gPool.pages;
 +			gPool.made++;
-+			*kernel = gPool.kernel + first * GPU_POOL_PAGE;
 +			return m;
 +		}
 +	}
 +	gPool.missed++;
 +	return NULL;
++}
++
++/* Without the lock: a pool buffer zeroed through a write-combined kernel mapping made for it. False: no mapping. */
++static bool
++poolZero(IOMemoryDescriptor * m)
++{
++	IOMemoryMap * map = m->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++
++	if (map == NULL) {
++		return false;
++	}
++	bzero((void *) map->getVirtualAddress(), (size_t) m->getLength());
++	map->release();
++	return true;
 +}
 +
 +/* With the lock held: a buffer's memory let go of; a pool run goes back once nobody else holds it. */
@@ -215,7 +227,7 @@ index 671a499..a09449f 100644
  class RedwoodGPUUserClient : public IOUserClient
  {
  	OSDeclareDefaultStructors(RedwoodGPUUserClient);
-@@ -784,7 +974,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+@@ -784,7 +986,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
  			redwood_gpu_address_free(b->address, b->size);
  		}
  		if (b->memory != NULL) {
@@ -224,7 +236,7 @@ index 671a499..a09449f 100644
  		}
  		if (b->surface != NULL) {
  			b->surface->release();
-@@ -815,7 +1005,7 @@ RedwoodGPUUserClient::reap(void)
+@@ -815,7 +1017,7 @@ RedwoodGPUUserClient::reap(void)
  			redwood_gpu_address_free(left->address, left->size);
  		}
  		if (left->memory != NULL) {
@@ -233,7 +245,7 @@ index 671a499..a09449f 100644
  		}
  		if (left->surface != NULL) {
  			left->surface->release();
-@@ -942,7 +1132,7 @@ RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
+@@ -942,7 +1144,7 @@ RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
  		redwood_gpu_unmap(k->address, k->size);
  		redwood_gpu_address_free(k->address, k->size);
  	}
@@ -242,32 +254,54 @@ index 671a499..a09449f 100644
  	k->memory = NULL;
  	fKeptBytes -= k->size;
  }
-@@ -953,6 +1143,9 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
+@@ -953,8 +1155,10 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
  {
  	struct gpu_kept * place = NULL;
  
-+	if (kernel == NULL && poolMemory(memory)) {     /* 0225 */
-+		kernel = gPool.kernel + (memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) - gPool.base);
-+	}
++	bool pooled = poolMemory(memory);               /* 0225: no kernel view, none needed */
++
  	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
- 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
+-	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
++	    (kernel == NULL && !pooled && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
  		return false;
-@@ -1035,7 +1228,26 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	}
+ 	for (;;) {
+@@ -974,7 +1178,7 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
+ 		dropKept(oldest);
+ 	}
+ 	place->memory = memory;
+-	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
++	place->kernel = kernel != NULL || pooled ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
+ 	place->address = address;
+ 	place->size = size;
+ 	place->flags = flags;
+@@ -1029,13 +1233,36 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			fKeptBytes -= size;
+ 			gGPUStat.given_again++;
+ 			IOLockUnlock(gGPULock);
+-			if (gGPUKeep == 2) {
++			if (gGPUKeep == 2 && b->kernel != NULL) {
+ 				bzero(b->kernel, (size_t) b->size);
+ 			}
  			return kIOReturnSuccess;
  		}
  	}
 +	/* 0225: from the pool when there is room (zeroed through its write-combined view, outside the lock) */
-+	uint8_t * pooledKernel = NULL;
-+	IOMemoryDescriptor * pooled = poolTake(size, &pooledKernel);
++	IOMemoryDescriptor * pooled = poolTake(size);
 +
  	IOLockUnlock(gGPULock);
++	if (pooled != NULL && !poolZero(pooled)) {
++		IOLockLock(gGPULock);
++		gpuMemoryRelease(pooled);               /* (no mapping to clear it through: made as before) */
++		IOLockUnlock(gGPULock);
++		pooled = NULL;
++	}
 +	if (pooled != NULL) {
-+		bzero(pooledKernel, (size_t) size);
 +		IOLockLock(gGPULock);
 +		b = newBuffer(pooled, 0, size, request->flags, &request->handle);
 +		if (b != NULL) {
 +			b->memory = pooled;
-+			b->kernel = pooledKernel;
++			b->kernel = NULL;
 +			gGPUStat.made++;
 +			gGPUStat.making += mach_absolute_time() - began;
 +		} else {
@@ -279,7 +313,7 @@ index 671a499..a09449f 100644
  	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
  	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
  	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
-@@ -1255,7 +1467,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -1255,7 +1482,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
  			b->seed = seed;
  			b->pushed = began;
  			b->surface->cleanSeed = seed;  /* 0116: pushed: nothing of the CPU's left in the cache at this seed */
@@ -288,7 +322,7 @@ index 671a499..a09449f 100644
  			continue;
  		} else if (gGPUDirty) {
  			gGPUStat.flushed += pushWritten(b);     /* 0145 */
-@@ -1383,6 +1595,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -1383,6 +1610,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
  			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
  			    largest >> 20, holes, most, lost >> 10, refused);
  		}
@@ -301,7 +335,7 @@ index 671a499..a09449f 100644
  		if (gGPUDirty) {                                /* 0145 */
  			IOLog("RedwoodGPU: pages of mapped buffers: %u touched since and pushed, %u left alone\n",
  			    gGPUStat.written_pages, gGPUStat.unwritten_pages);
-@@ -1424,7 +1642,7 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+@@ -1424,7 +1657,7 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
  		b->memory->retain();
  		b->seen = true;
  		*memory = b->memory;
@@ -310,7 +344,7 @@ index 671a499..a09449f 100644
  		ret = kIOReturnSuccess;
  	}
  	IOLockUnlock(gGPULock);
-@@ -1493,7 +1711,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+@@ -1493,7 +1726,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
  		 * processor holds from before are stale. freedreno asks this before it reads a
  		 * buffer (fd_bo_cpu_prep), as Linux's msm syncs a cached buffer for the CPU here.
  		 */
