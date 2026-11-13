@@ -6,6 +6,12 @@ name: vulkan
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner pool (the arm64 pool queues for long, Nov 2026; Intel cross-builds the same)
+        type: choice
+        options: [macos-15-intel, macos-15]
+        default: macos-15-intel
 
 permissions:
   contents: read
@@ -16,7 +22,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +35,10 @@ jobs:
           path: |
             work/mesa
             work/build
-          key: mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}
+          key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}
           restore-keys: |
-            mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-
-            mesa-${{ env.MESA_COMMIT }}-
+            mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-
+            mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-
 
       - name: Restore Rust cache
         uses: actions/cache/restore@v4
@@ -42,11 +48,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             work/mtl-target
-          key: cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}
+          key: cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}
           restore-keys: |
-            cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-
-            cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-
-            cargo-
+            cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-
+            cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-
+            cargo-${{ runner.arch }}-
 
       - name: Toolchain
         run: |
@@ -181,7 +187,7 @@ jobs:
           path: |
             work/mesa
             work/build
-          key: mesa-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-${{ github.run_id }}
+          key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-${{ github.run_id }}
 
       - name: Save Rust cache
         if: always()
@@ -192,7 +198,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             work/mtl-target
-          key: cargo-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-${{ github.run_id }}
+          key: cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         if: always()
