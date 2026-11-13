@@ -20,6 +20,20 @@ import kc_imports as k
 import kc_symcheck as sc
 
 PAGE = 0x4000
+# 0217: IOUSBDeviceFamily 2.0.0 in the iPhone X iOS 16.5 kernelcache (research/awdl/kc/kernelcache.arm64): the
+# addresses SweetUSBDevice.cpp calls (found by tools/kcsig.py against the macOS 13.5 KDK, and through the iPhone's own
+# AppleSynopsysOTGDevice imports; NOTES.md 2026-11-13). Written relinked into sweet_usbdev_abi, in this order.
+ABI_EMPTY, ABI_FILLED = 0x59544d45495841, 0x44454c4c49465841
+ABI_ORDER = ['vtable', 'meta', 'ctor', 'ready_for_host', 'complete_io', 'cr_input_setup', 'cr_process_setup',
+             'cr_input_data', 'cr_reset', 'cr_stall', 'if_alt_count', 'if_pipe_count', 'if_pipe', 'pipe_dir']
+IOS165_USBDEV = {
+    'vtable': 0xfffffff006e10b80, 'meta': 0xfffffff007a95708, 'ctor': 0xfffffff005cf0598,
+    'ready_for_host': 0xfffffff005cf25d8, 'complete_io': 0xfffffff005cf269c,
+    'cr_input_setup': 0xfffffff005cea854, 'cr_process_setup': 0xfffffff005ceafb4,
+    'cr_input_data': 0xfffffff005ceb4e4, 'cr_reset': 0xfffffff005cea3d0, 'cr_stall': 0xfffffff005cec060,
+    'if_alt_count': 0xfffffff005ce49a4, 'if_pipe_count': 0xfffffff005ce49f0, 'if_pipe': 0xfffffff005ce4a40,
+    'pipe_dir': 0xfffffff005ce89cc,
+}
 KPI = ['com.apple.kpi.bsd', 'com.apple.kpi.dsep', 'com.apple.kpi.iokit', 'com.apple.kpi.libkern',
        'com.apple.kpi.mach', 'com.apple.kpi.private', 'com.apple.kpi.unsupported']
 KIND = {'__TEXT': '__PRELINK_TEXT', '__DATA_CONST': '__PLK_DATA_CONST', '__TEXT_EXEC': '__PLK_TEXT_EXEC',
@@ -327,7 +341,26 @@ def main():
                 so = cmds[kind] + 72 + 80 * i
                 a = struct.unpack_from('<Q', kern, so + 32)[0]
                 struct.pack_into('<Q', kern, so + 32, a + delta)
+    # ---- 0217: the backend's table of IOUSBDeviceFamily addresses (sweet_usbdev_abi in our __DATA) ----
+    abi_note = 'no sweet_usbdev_abi in this kernel'
+    if '_sweet_usbdev_abi' in ours and 'com.apple.iokit.IOUSBDeviceFamily' in bundles:
+        av = ours['_sweet_usbdev_abi']
+        cmds2 = seg_cmds(kern)
+        fo_abi = None
+        for nm, o2 in cmds2.items():
+            vm2, vs2, fo2, fs2 = struct.unpack_from('<QQQQ', kern, o2 + 24)
+            if vm2 <= av < vm2 + fs2:
+                fo_abi = fo2 + (av - vm2)
+        if fo_abi is not None and struct.unpack_from('<Q', kern, fo_abi)[0] == ABI_EMPTY:
+            vals = [ABI_FILLED] + [where(IOS165_USBDEV[n]) for n in ABI_ORDER]
+            if None in vals:
+                raise SystemExit('sweet_usbdev_abi: an address is outside the relinked kexts')
+            struct.pack_into('<%dQ' % len(vals), kern, fo_abi, *vals)
+            abi_note = 'sweet_usbdev_abi filled (%d addresses)' % (len(vals) - 1)
+        else:
+            abi_note = 'sweet_usbdev_abi not in the expected state: left alone'
     open(out, 'wb').write(kern)
+    print(abi_note)
 
     print('kexts: %s' % ', '.join(bundles))
     for kind in ['__PRELINK_TEXT', '__PLK_DATA_CONST', '__PLK_TEXT_EXEC', '__PRELINK_DATA', '__PRELINK_INFO']:
