@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: tools
+      - name: capstone
+        run: pip3 install --break-system-packages capstone || pip3 install capstone
       - name: Dump
         env:
           KEXTS: ${{ inputs.kexts }}
@@ -50,6 +52,7 @@ jobs:
               xcrun dyld_info -arch arm64e -fixups "$bin" > "out/$tag.fixups.txt" 2>/dev/null || xcrun dyld_info -fixups "$bin" > "out/$tag.fixups.txt" || true
               otool -arch arm64e -lv "$bin" > "out/$tag.lc.txt" 2>/dev/null || true
               python3 tools/kdk_vtables.py "$bin" > "out/$tag.vtables.txt" 2> "out/$tag.vtables.err" || true
+              python3 tools/kdk_funcsig.py "$bin" "out/$tag.sig.json" 2> "out/$tag.sig.err" || true
             done
           done
           ls -la out
