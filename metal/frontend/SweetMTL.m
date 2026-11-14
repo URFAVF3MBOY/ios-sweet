@@ -77,6 +77,9 @@ say(NSString *fmt, ...)
 @property (nonatomic, readonly) MTLResourceOptions resourceOptions;
 @property (nonatomic, weak) id<MTLDevice> device;
 @property (nullable, copy, atomic) NSString *label;
+@property (nonatomic, copy) void (^noCopyDeallocator)(void *, NSUInteger);   /* newBufferWithBytesNoCopy: */
+@property (nonatomic) void *noCopyPointer;
+@property (nonatomic) NSUInteger noCopyLength;
 @end
 
 @implementation SweetMTLBuffer
@@ -92,8 +95,13 @@ say(NSString *fmt, ...)
 - (void)dealloc
 {
 	smtl_buffer_release(_b);
+	if (_noCopyDeallocator != nil) {
+		_noCopyDeallocator(_noCopyPointer, _noCopyLength);
+	}
 }
 - (void *)contents { return smtl_buffer_contents(_b); }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { (void)state; return MTLPurgeableStateNonVolatile; }
+- (NSUInteger)protectionOptions { return 0; }
 - (NSUInteger)length { return (NSUInteger)smtl_buffer_length(_b); }
 - (MTLStorageMode)storageMode { return (MTLStorageMode)((_resourceOptions >> MTLResourceStorageModeShift) & 0xf); }
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_resourceOptions & 0xf); }
@@ -111,6 +119,9 @@ SWEET_CATCH_ALL
 @property (nonatomic, readonly) MTLResourceOptions resourceOptions;
 @property (nonatomic) IOSurfaceRef surface;          /* retained; NULL for a texture of its own */
 @property (nonatomic) NSUInteger surfacePlane;
+@property (nonatomic, copy) void (^noCopyDeallocator)(void *, NSUInteger);   /* newTextureWithBytesNoCopy: */
+@property (nonatomic) void *noCopyPointer;
+@property (nonatomic) NSUInteger noCopyLength;
 @end
 
 @implementation SweetMTLTexture {
@@ -132,7 +143,12 @@ SWEET_CATCH_ALL
 	if (_surface != NULL) {
 		CFRelease(_surface);
 	}
+	if (_noCopyDeallocator != nil) {
+		_noCopyDeallocator(_noCopyPointer, _noCopyLength);
+	}
 }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { (void)state; return MTLPurgeableStateNonVolatile; }
+- (NSUInteger)protectionOptions { return 0; }
 - (MTLTextureType)textureType { return (MTLTextureType)_info[0]; }
 - (MTLPixelFormat)pixelFormat { return (MTLPixelFormat)_info[1]; }
 - (NSUInteger)width { return (NSUInteger)_info[2]; }
@@ -827,6 +843,8 @@ SWEET_CATCH_ALL
 	[_scheduled addObject:[block copy]];
 }
 - (void)commitAndWaitUntilSubmitted { [self commit]; }
+- (void)setProtectionOptions:(NSUInteger)o { (void)o; }
+- (NSUInteger)protectionOptions { return 0; }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block
 {
 	[_completed addObject:[block copy]];
@@ -1071,6 +1089,43 @@ process_wanted(void)
 		return nil;
 	}
 	return [[SweetMTLTexture alloc] initWith:x options:o device:self];
+}
+/* No-copy buffers and textures over the caller's memory: copied for now (Turnip refuses host pointers and plain
+ * memory has no dma-buf), so later CPU writes into that memory do not reach the GPU. The deallocator still runs
+ * when the object goes, as Metal runs it. */
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+    deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	SweetMTLBuffer *b = (SweetMTLBuffer *)[self newBufferWithBytes:pointer length:length options:options];
+	if (b != nil && deallocator != nil) {
+		b.noCopyDeallocator = deallocator;
+		b.noCopyPointer = pointer;
+		b.noCopyLength = length;
+	}
+	return b;
+}
+- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)pointer length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)t
+    deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	SweetMTLTexture *x = (SweetMTLTexture *)[self newTextureWithDescriptor:t];
+	if (x == nil) {
+		return nil;
+	}
+	NSUInteger rows = t.height * t.depth;
+	if (rows != 0 && t.mipmapLevelCount <= 1 && t.arrayLength <= 1) {
+		NSUInteger bpr = length / rows;
+		[x replaceRegion:MTLRegionMake3D(0, 0, 0, t.width, t.height, t.depth) mipmapLevel:0 slice:0 withBytes:pointer
+		    bytesPerRow:bpr bytesPerImage:bpr * t.height];
+	} else {
+		say(@"newTextureWithBytesNoCopy: %lux%lu, %lu levels, %lu slices: contents not copied", (unsigned long)t.width,
+		    (unsigned long)t.height, (unsigned long)t.mipmapLevelCount, (unsigned long)t.arrayLength);
+	}
+	if (deallocator != nil) {
+		x.noCopyDeallocator = deallocator;
+		x.noCopyPointer = pointer;
+		x.noCopyLength = length;
+	}
+	return x;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)t iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
