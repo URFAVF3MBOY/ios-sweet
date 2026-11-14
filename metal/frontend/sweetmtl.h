@@ -145,6 +145,17 @@ int smtl_blit_texture_to_texture(smtl_blit *e, const smtl_texture *src, uint64_t
     uint64_t dst_level, uint64_t dx, uint64_t dy, uint64_t dz);
 int smtl_blit_mipmaps(smtl_blit *e, const smtl_texture *t);
 
+/* Function constants: collected from an MTLFunctionConstantValues, then a function specialized with them. */
+typedef struct smtl_constants smtl_constants;
+smtl_constants *smtl_constants_new(void);
+void smtl_constants_release(smtl_constants *c);
+int smtl_constants_index(smtl_constants *c, uint32_t index, uint32_t type, const void *data);
+int smtl_constants_name(smtl_constants *c, const char *name, uint32_t type, const void *data);
+smtl_function *smtl_function_new_constants(const smtl_library *l, const char *name, const smtl_constants *c);
+
+/* newTextureViewWithPixelFormat: */
+smtl_texture *smtl_texture_view(const smtl_texture *t, uint32_t pixel_format);
+
 /* A texture over an IOSurface's plane, the surface's own memory imported (no copy) where possible. */
 smtl_texture *smtl_texture_new_iosurface(const smtl_device *d, uint32_t type, uint32_t pixel_format, uint64_t width,
     uint64_t height, uint64_t mipmaps, uint64_t usage, uint32_t surface, void *base, uint64_t alloc_size,

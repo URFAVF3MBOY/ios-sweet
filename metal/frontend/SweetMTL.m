@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <mach/mach.h>
 #include <os/log.h>
@@ -149,6 +150,21 @@ SWEET_CATCH_ALL
 - (BOOL)isShareable { return NO; }
 - (BOOL)isSparse { return NO; }
 - (id<MTLTexture>)parentTexture { return nil; }
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)f
+{
+	smtl_texture *v = smtl_texture_view(_t, (uint32_t)f);
+	if (v == NULL) {
+		say(@"newTextureViewWithPixelFormat:%lu (of %lu): %s", (unsigned long)f, (unsigned long)_info[1], smtl_last_error());
+		return nil;
+	}
+	SweetMTLTexture *x = [[SweetMTLTexture alloc] initWith:v options:_resourceOptions device:_device];
+	if (_surface != NULL) {
+		CFRetain(_surface);
+		x.surface = _surface;
+		x.surfacePlane = _surfacePlane;
+	}
+	return x;
+}
 - (id<MTLBuffer>)buffer { return nil; }
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return _surfacePlane; }
@@ -359,6 +375,68 @@ SWEET_CATCH_ALL
 		return nil;
 	}
 	return [[SweetMTLFunction alloc] initWith:f name:name device:_device];
+}
+/* MTLFunctionConstantValues has no public getter: its private newNamedConstantArray / newIndexedConstantArray
+ * (Metal 16.5) give MTLNamedConstantValue / MTLIndexedConstantValue objects with name or index, dataType and data. */
+static smtl_constants *
+constants_of(MTLFunctionConstantValues *v)
+{
+	smtl_constants *c = smtl_constants_new();
+	SEL named = NSSelectorFromString(@"newNamedConstantArray"), indexed = NSSelectorFromString(@"newIndexedConstantArray");
+	if (v == nil) {
+		return c;
+	}
+	if (![v respondsToSelector:named] || ![v respondsToSelector:indexed]) {
+		say(@"function constants: %@ has no constant arrays; constants left undefined", [v class]);
+		return c;
+	}
+	NSArray *(*get)(id, SEL) = (NSArray *(*)(id, SEL))objc_msgSend;
+	NSUInteger (*number)(id, SEL) = (NSUInteger (*)(id, SEL))objc_msgSend;
+	const void *(*bytes)(id, SEL) = (const void *(*)(id, SEL))objc_msgSend;
+	NSArray *byName = get(v, named), *byIndex = get(v, indexed);
+	for (id k in byName) {
+		NSString *name = [k valueForKey:@"name"];
+		NSUInteger type = number(k, @selector(dataType));
+		if (smtl_constants_name(c, name.UTF8String, (uint32_t)type, bytes(k, NSSelectorFromString(@"data"))) != 0) {
+			say(@"function constant %@: %s", name, smtl_last_error());
+		}
+	}
+	for (id k in byIndex) {
+		NSUInteger index = number(k, @selector(index));
+		NSUInteger type = number(k, @selector(dataType));
+		if (smtl_constants_index(c, (uint32_t)index, (uint32_t)type, bytes(k, NSSelectorFromString(@"data"))) != 0) {
+			say(@"function constant %lu: %s", (unsigned long)index, smtl_last_error());
+		}
+	}
+	return c;
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error
+{
+	smtl_constants *c = constants_of(values);
+	smtl_function *f = smtl_function_new_constants(_l, name.UTF8String, c);
+	smtl_constants_release(c);
+	if (f == NULL) {
+		say(@"newFunctionWithName:%@ constantValues: %s", name, smtl_last_error());
+		if (error) *error = sweet_error(@"newFunctionWithName:constantValues:");
+		return nil;
+	}
+	return [[SweetMTLFunction alloc] initWith:f name:name device:_device];
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
+    completionHandler:(void (^)(id<MTLFunction>, NSError *))handler
+{
+	NSError *e = nil;
+	id<MTLFunction> f = [self newFunctionWithName:name constantValues:values error:&e];
+	handler(f, e);
+}
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error
+{
+	if (d.constantValues != nil) {
+		return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+	}
+	id<MTLFunction> f = [self newFunctionWithName:d.name];
+	if (f == nil && error) *error = sweet_error(@"newFunctionWithDescriptor:");
+	return f;
 }
 SWEET_CATCH_ALL
 @end
@@ -672,6 +750,7 @@ SWEET_CATCH_ALL
 @property (nonatomic, weak) id<MTLCommandQueue> commandQueue;
 @property (nullable, copy, atomic) NSString *label;
 @property (nonatomic, strong) NSMutableArray *completed;
+@property (nonatomic, strong) NSMutableArray *scheduled;
 @end
 
 @implementation SweetMTLCommandBuffer
@@ -682,6 +761,7 @@ SWEET_CATCH_ALL
 		_device = d;
 		_commandQueue = q;
 		_completed = [NSMutableArray new];
+		_scheduled = [NSMutableArray new];
 	}
 	return self;
 }
@@ -742,6 +822,11 @@ SWEET_CATCH_ALL
 	(void)type;
 	return [self computeCommandEncoder];
 }
+- (void)addScheduledHandler:(MTLCommandBufferHandler)block
+{
+	[_scheduled addObject:[block copy]];
+}
+- (void)commitAndWaitUntilSubmitted { [self commit]; }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block
 {
 	[_completed addObject:[block copy]];
@@ -751,6 +836,11 @@ SWEET_CATCH_ALL
 	if (smtl_cmdbuf_commit(_c) != 0) {
 		say(@"commit: %s", smtl_last_error());
 	}
+	/* scheduled = handed to the GPU, which the commit has done by now */
+	for (MTLCommandBufferHandler h in _scheduled) {
+		h(self);
+	}
+	[_scheduled removeAllObjects];
 	if (_completed.count != 0) {
 		/* M1: completion handlers from a waiting thread (the runtime's own Handler comes later) */
 		NSArray *handlers = [_completed copy];
@@ -809,6 +899,11 @@ SWEET_CATCH_ALL
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
 - (void)insertDebugCaptureBoundary { }
+/* private setters the window server uses (QuartzCore new_metal_context): dispatch queues and GPU priorities */
+- (void)setSubmissionQueue:(dispatch_queue_t)q { (void)q; }
+- (void)setCompletionQueue:(dispatch_queue_t)q { (void)q; }
+- (void)setGPUPriority:(NSUInteger)p { (void)p; }
+- (void)setBackgroundGPUPriority:(NSUInteger)p { (void)p; }
 SWEET_CATCH_ALL
 @end
 
@@ -1085,6 +1180,50 @@ stencil_of(MTLStencilDescriptor *s)
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)f { (void)f; return 64; }
 - (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier1; }
 - (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier1; }
+/* Private device getters QuartzCore's Metal renderer reads (zero from the catch-all would mean "no textures") */
+- (NSUInteger)maxTextureWidth2D { return 16384; }
+- (NSUInteger)maxTextureHeight2D { return 16384; }
+- (NSUInteger)maxColorAttachments { return 8; }
+- (NSUInteger)maxFragmentTextures { return 31; }
+- (NSUInteger)maxFragmentSamplers { return 16; }
+- (NSUInteger)minConstantBufferAlignmentBytes { return 256; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
+- (BOOL)supportsMemorylessRenderTargets { return NO; }
+- (BOOL)supportsNativeHardwareFP16 { return NO; }
+- (BOOL)supportsRasterOrderGroups { return NO; }
+- (BOOL)supportsSIMDGroup { return NO; }
+- (BOOL)supportsTileShaders { return NO; }
+- (BOOL)supportsYCBCRFormats12 { return NO; }
+- (BOOL)supportsYCBCRPackedFormats12 { return NO; }
+- (BOOL)supportsExtendedXR10Formats { return NO; }
+- (NSString *)vendorName { return @"Qualcomm"; }
+- (BOOL)supportsFeatureSet:(MTLFeatureSet)f
+{
+	return f == MTLFeatureSet_iOS_GPUFamily1_v1 || f == MTLFeatureSet_iOS_GPUFamily1_v2 ||
+	    f == MTLFeatureSet_iOS_GPUFamily1_v3 || f == MTLFeatureSet_iOS_GPUFamily1_v4 ||
+	    f == MTLFeatureSet_iOS_GPUFamily2_v1 || f == MTLFeatureSet_iOS_GPUFamily2_v2 ||
+	    f == MTLFeatureSet_iOS_GPUFamily2_v3 || f == MTLFeatureSet_iOS_GPUFamily2_v4 ||
+	    f == MTLFeatureSet_iOS_GPUFamily3_v1 || f == MTLFeatureSet_iOS_GPUFamily3_v2 ||
+	    f == MTLFeatureSet_iOS_GPUFamily3_v3;
+}
+/* Apple's precompiled pipelines (QuartzCore's default.pipelinelib) are AGX binaries: none here. _MTLDevice's own
+ * method crashed in MTLPipelineLibraryBuilder (seen 2026-11-13, backboardd with camtl=1); nil makes CA compile
+ * its pipelines from default.metallib. */
+- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
+{
+	say(@"newPipelineLibraryWithFilePath:%@: none (no AGX binaries)", path.lastPathComponent);
+	if (error) *error = sweet_error(@"newPipelineLibraryWithFilePath:");
+	return nil;
+}
+- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error
+{
+	NSURL *u = [bundle URLForResource:@"default" withExtension:@"metallib"];
+	if (u == nil) {
+		if (error) *error = sweet_error(@"newDefaultLibraryWithBundle:");
+		return nil;
+	}
+	return [self newLibraryWithURL:u error:error];
+}
 - (BOOL)supportsFamily:(MTLGPUFamily)family
 {
 	return family == MTLGPUFamilyApple1 || family == MTLGPUFamilyApple2 || family == MTLGPUFamilyApple3 ||

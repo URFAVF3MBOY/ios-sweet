@@ -56,6 +56,37 @@ pub(crate) fn trace(line: &str) {
     }
 }
 
+/// The caller's stack into the trace file, one frame a line as image + offset (who asked for the device).
+fn trace_stack() {
+    extern "C" {
+        fn backtrace(frames: *mut *mut c_void, size: i32) -> i32;
+        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+    }
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const c_char,
+        fbase: *mut c_void,
+        sname: *const c_char,
+        saddr: *mut c_void,
+    }
+    let mut frames = [ptr::null_mut::<c_void>(); 48];
+    // SAFETY: backtrace fills at most `size` entries of the array.
+    let n = unsafe { backtrace(frames.as_mut_ptr(), frames.len() as i32) }.max(0) as usize;
+    for (i, &f) in frames[..n].iter().enumerate() {
+        let mut info = DlInfo { fname: ptr::null(), fbase: ptr::null_mut(), sname: ptr::null(), saddr: ptr::null_mut() };
+        // SAFETY: dladdr writes `info` for an address; the strings it gives live as long as the image.
+        let line = if unsafe { dladdr(f, &mut info) } != 0 && !info.fname.is_null() {
+            let file = unsafe { CStr::from_ptr(info.fname) }.to_string_lossy();
+            let file = file.rsplit('/').next().unwrap_or("").to_string();
+            let sym = if info.sname.is_null() { String::new() } else { unsafe { CStr::from_ptr(info.sname) }.to_string_lossy().into_owned() };
+            format!("  #{i} {file} +{:#x} {sym}", f as usize - info.fbase as usize)
+        } else {
+            format!("  #{i} {f:p}")
+        };
+        trace(&line);
+    }
+}
+
 /// A line of the Objective-C side into the trace file (see `trace`).
 #[no_mangle]
 pub unsafe extern "C" fn smtl_trace(line: *const c_char) {
@@ -152,6 +183,7 @@ pub unsafe extern "C" fn smtl_device_new(turnip: *const c_char, cache: *const c_
     match Device::system_default_with(&options) {
         Ok(d) => {
             trace("device made");
+            trace_stack();
             Box::into_raw(Box::new(d))
         }
         Err(e) => {

@@ -635,3 +635,93 @@ pub unsafe extern "C" fn smtl_texture_new_iosurface(
     let plane = IoSurfacePlane::new(plane_offset, bytes_per_row, planar);
     boxed("new_texture_with_iosurface_plane", timed("iosurface_texture", || buffer.new_texture_with_iosurface_plane(&t, plane)))
 }
+
+// ---- function constants (newFunctionWithName:constantValues:error:, newFunctionWithDescriptor:error:) ----
+
+/// The bytes of one value of Metal's data type `ty` (scalars and their vectors; `None` for any other type).
+fn constant_size(ty: u32) -> Option<usize> {
+    let (elem, first) = match ty {
+        3..=6 => (4, 3),     // Float .. Float4
+        16..=19 => (2, 16),  // Half .. Half4
+        29..=32 => (4, 29),  // Int .. Int4
+        33..=36 => (4, 33),  // UInt .. UInt4
+        37..=40 => (2, 37),  // Short .. Short4
+        41..=44 => (2, 41),  // UShort .. UShort4
+        45..=48 => (1, 45),  // Char .. Char4
+        49..=52 => (1, 49),  // UChar .. UChar4
+        53..=56 => (1, 53),  // Bool .. Bool4
+        81..=84 => (8, 81),  // Long .. Long4
+        85..=88 => (8, 85),  // ULong .. ULong4
+        _ => return None,
+    };
+    Some(elem * (ty - first + 1) as usize)
+}
+
+/// Function constant values being collected from an MTLFunctionConstantValues.
+pub struct SmtlConstants(metal2vulkan::library::FunctionConstantValues);
+
+#[no_mangle]
+pub extern "C" fn smtl_constants_new() -> *mut SmtlConstants {
+    Box::into_raw(Box::new(SmtlConstants(metal2vulkan::library::FunctionConstantValues::defaults())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_constants_release(c: *mut SmtlConstants) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+
+unsafe fn constant_value(ty: u32, data: *const c_void) -> Result<metal2vulkan::library::FunctionConstantValue, String> {
+    let size = constant_size(ty).ok_or_else(|| format!("constant of data type {ty}"))?;
+    if data.is_null() {
+        return Err("constant without data".into());
+    }
+    let t = metal2vulkan::metal::DataType::try_from(ty).map_err(|e| e.to_string())?;
+    let bytes = std::slice::from_raw_parts(data as *const u8, size).to_vec();
+    Ok(metal2vulkan::library::FunctionConstantValue::new(t, bytes))
+}
+
+/// One value by index; 0 or -1 (the type is not one Metal's constants take, see smtl_last_error).
+#[no_mangle]
+pub unsafe extern "C" fn smtl_constants_index(c: *mut SmtlConstants, index: u32, ty: u32, data: *const c_void) -> i32 {
+    match constant_value(ty, data) {
+        Ok(v) => {
+            let values = std::mem::take(&mut (*c).0);
+            (*c).0 = values.with_index(index, v);
+            0
+        }
+        Err(e) => fail("function constant", e),
+    }
+}
+
+/// One value by name; as smtl_constants_index.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_constants_name(c: *mut SmtlConstants, name: *const std::ffi::c_char, ty: u32,
+    data: *const c_void) -> i32 {
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+    match constant_value(ty, data) {
+        Ok(v) => {
+            let values = std::mem::take(&mut (*c).0);
+            (*c).0 = values.with_name(name, v);
+            0
+        }
+        Err(e) => fail("function constant", e),
+    }
+}
+
+/// The library's function `name` specialized with `c`.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_function_new_constants(l: *const metal2vulkan_runtime::Library,
+    name: *const std::ffi::c_char, c: *const SmtlConstants) -> *mut Function {
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
+    boxed("new_function_with_name_constant_values",
+        timed("function_constants", || (*l).new_function_with_name_constant_values(&name, &(*c).0)))
+}
+
+/// newTextureViewWithPixelFormat:
+#[no_mangle]
+pub unsafe extern "C" fn smtl_texture_view(t: *const Texture, pixel_format: u32) -> *mut Texture {
+    let f = raw_p!(PixelFormat, pixel_format, "pixel format");
+    boxed("new_texture_view", (*t).new_texture_view(f))
+}
