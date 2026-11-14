@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
-index 86f42373..ba46bd46 100644
+index 86f42373..05f2436f 100644
 --- a/crates/metal2vulkan-runtime/src/in_place.rs
 +++ b/crates/metal2vulkan-runtime/src/in_place.rs
-@@ -251,7 +251,11 @@ pub(crate) fn in_place(
+@@ -251,12 +251,22 @@ pub(crate) fn in_place(
      if policy == HostPageTexturePolicy::Shadow {
          return Err(ShadowCause::Exact);
      }
@@ -15,3 +15,14 @@ index 86f42373..ba46bd46 100644
          return Err(ShadowCause::RenderTarget);
      }
      if usage.intersects(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC) {
+         return Err(ShadowCause::ShaderWrite);
+     }
++    // ios-sweet: the check makes its dma-bufs of host pages of its own, which sweetdrm cannot (its dma-bufs are
++    // IOSurfaces): no verdict for the class ever. Turnip's linear image over an IOSurface was checked by hand
++    // (metal/test/mtlrender's IOSurface round trip: GPU writes and CPU writes meet, 2026-11-13).
++    if class == PagesClass::DmaBuf {
++        return Ok(());
++    }
+     match verdict(class) {
+         Verdict::Passed => Ok(()),
+         Verdict::Pending => Err(ShadowCause::CheckPending(class)),

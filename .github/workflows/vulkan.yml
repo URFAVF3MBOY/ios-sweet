@@ -177,6 +177,8 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --target aarch64-apple-ios
           export IPHONEOS_DEPLOYMENT_TARGET=16.0
+          # the OnePlus 7T's cores: Kryo 485 (Cortex-A76 and A55, both ARMv8.2 with dotprod)
+          export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a76"
           # metal2vulkan at the bridge's rev with metal/m2v-patches applied, in place of the git source
           M2V_REV=$(sed -n 's/^metal2vulkan-runtime = .*rev = "\([0-9a-f]*\)".*/\1/p' metal/bridge/Cargo.toml)
           rm -rf work/m2v && git init -q work/m2v

@@ -22,3 +22,6 @@ libc = "0.2"
 panic = "abort"
 opt-level = 3
 debug = 1
+# the runtime's per-draw work is spread over many small functions across its crates: inlined across them
+lto = "fat"
+codegen-units = 1
