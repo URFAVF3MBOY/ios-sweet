@@ -725,3 +725,19 @@ pub unsafe extern "C" fn smtl_texture_view(t: *const Texture, pixel_format: u32)
     let f = raw_p!(PixelFormat, pixel_format, "pixel format");
     boxed("new_texture_view", (*t).new_texture_view(f))
 }
+
+/// newTextureWithDescriptor:offset:bytesPerRow: on a buffer (and the private newLinearTextureWithDescriptor:...,
+/// which CoreAnimation uses for layer images): a texture whose texels are the buffer's bytes.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_buffer_texture(b: *const Buffer, texture_type: u32, pixel_format: u32, width: u64,
+    height: u64, mipmaps: u64, usage: u64, offset: u64, bytes_per_row: u64) -> *mut Texture {
+    let mut t = TextureDescriptor::default();
+    t.texture_type = raw_p!(TextureType, texture_type, "texture type");
+    t.pixel_format = raw_p!(PixelFormat, pixel_format, "pixel format");
+    t.width = width.max(1);
+    t.height = height.max(1);
+    t.mipmap_level_count = mipmaps.max(1);
+    t.usage = raw_p!(TextureUsage, usage & 0x37, "texture usage");
+    t.resource_options = (*b).resource_options();
+    boxed("buffer new_texture", (*b).new_texture(&t, offset, bytes_per_row))
+}

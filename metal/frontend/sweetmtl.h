@@ -155,6 +155,9 @@ smtl_function *smtl_function_new_constants(const smtl_library *l, const char *na
 
 /* newTextureViewWithPixelFormat: */
 smtl_texture *smtl_texture_view(const smtl_texture *t, uint32_t pixel_format);
+/* A texture over a buffer's bytes (newTextureWithDescriptor:offset:bytesPerRow:). */
+smtl_texture *smtl_buffer_texture(const smtl_buffer *b, uint32_t type, uint32_t pixel_format, uint64_t width,
+    uint64_t height, uint64_t mipmaps, uint64_t usage, uint64_t offset, uint64_t bytes_per_row);
 
 /* A texture over an IOSurface's plane, the surface's own memory imported (no copy) where possible. */
 smtl_texture *smtl_texture_new_iosurface(const smtl_device *d, uint32_t type, uint32_t pixel_format, uint64_t width,

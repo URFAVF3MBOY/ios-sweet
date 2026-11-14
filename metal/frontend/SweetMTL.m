@@ -122,6 +122,8 @@ SWEET_CATCH_ALL
 @property (nonatomic, copy) void (^noCopyDeallocator)(void *, NSUInteger);   /* newTextureWithBytesNoCopy: */
 @property (nonatomic) void *noCopyPointer;
 @property (nonatomic) NSUInteger noCopyLength;
+@property (nonatomic, strong) id<MTLBuffer> overBuffer;      /* a texture over a buffer's bytes keeps it */
+@property (nonatomic) NSUInteger overOffset, overBytesPerRow;
 @end
 
 @implementation SweetMTLTexture {
@@ -181,7 +183,9 @@ SWEET_CATCH_ALL
 	}
 	return x;
 }
-- (id<MTLBuffer>)buffer { return nil; }
+- (id<MTLBuffer>)buffer { return _overBuffer; }
+- (NSUInteger)bufferOffset { return _overOffset; }
+- (NSUInteger)bufferBytesPerRow { return _overBytesPerRow; }
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return _surfacePlane; }
 - (id<MTLResource>)rootResource { return self; }
@@ -210,6 +214,34 @@ SWEET_CATCH_ALL
 	[self getBytes:out bytesPerRow:bpr bytesPerImage:0 fromRegion:r mipmapLevel:level slice:0];
 }
 SWEET_CATCH_ALL
+@end
+
+/* Textures over a buffer's bytes: newTextureWithDescriptor:offset:bytesPerRow:, and the private
+ * newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: CoreAnimation makes its layer images with (nil
+ * from the catch-all left those layers undrawn: holes in the home screen during swipes, 2026-11-13). */
+@implementation SweetMTLBuffer (Textures)
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)t offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
+{
+	smtl_texture *x = smtl_buffer_texture(self.b, (uint32_t)t.textureType, (uint32_t)t.pixelFormat, t.width, t.height,
+	    t.mipmapLevelCount, t.usage, offset, bpr);
+	if (x == NULL) {
+		say(@"buffer newTextureWithDescriptor: %lux%lu format %lu at %lu, %lu a row: %s", (unsigned long)t.width,
+		    (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)offset, (unsigned long)bpr,
+		    smtl_last_error());
+		return nil;
+	}
+	SweetMTLTexture *tx = [[SweetMTLTexture alloc] initWith:x options:self.resourceOptions device:self.device];
+	tx.overBuffer = self;
+	tx.overOffset = offset;
+	tx.overBytesPerRow = bpr;
+	return tx;
+}
+- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)t offset:(NSUInteger)offset
+    bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+	(void)bpi;
+	return [self newTextureWithDescriptor:t offset:offset bytesPerRow:bpr];
+}
 @end
 
 static smtl_texture *
