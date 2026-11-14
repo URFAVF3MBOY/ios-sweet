@@ -1,0 +1,107 @@
+0229: the flip on a thread call: SwapEnd hands the swap over and returns, the call presents it once the GPU finished the surface (0227 presented in SwapEnd, so the window server's display thread waited for the GPU every frame: 44 % of its samples). SwapWait (0226) still guards buffer reuse. sweetflipnow=2: as 0227, 0: at the vsync tick.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cc3e6b0..30dbfa4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>                   /* 0229 */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -159,6 +160,16 @@ public:
+ 	 */
+ 	uint32_t      fFlipNow;
+ 	IOLock       *fPresentLock;   /* present() from SwapEnd and from the vsync tick, one at a time */
++	/*
++	 * 0229: the flip on a thread of its own. 0227's SwapEnd presented in the caller, and present() waits for
++	 * the GPU to finish the surface: the window server's display thread sat idle for the GPU every frame
++	 * (44 % of its samples in SwapEnd during swipes), so its CPU work and the GPU's took turns. Now SwapEnd
++	 * hands the swap to fFlipCall and returns; the call presents it as soon as the GPU is done (newer swaps
++	 * that came meanwhile replace it). SwapWait (0226) still holds a buffer back until its swap is shown.
++	 * Boot-arg sweetflipnow=2: in SwapEnd as 0227; 0: at the vsync tick.
++	 */
++	thread_call_t fFlipCall;
++	static void flipCalled(thread_call_param_t owner, thread_call_param_t unused);
+ 
+ 	/*
+ 	 * 0198 scaled scanout (boot-arg sweetscale, default 1; 0 = crop as before): each pipe's QSEED3
+@@ -325,6 +336,7 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();                   /* 0227 */
++	fFlipCall = thread_call_allocate_with_options(&AppleCLCD::flipCalled, this, THREAD_CALL_PRIORITY_KERNEL_HIGH, 0);
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -450,7 +462,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->rearmVsync(sender);         /* 0141 */
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	/* 0229: with the flip call, the tick presents nothing (it would wait for the GPU and hold the vsync back) */
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !(fb->fFlipNow == 1 && fb->fFlipCall != NULL);
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -522,6 +535,32 @@ AppleCLCD::swapShown(uint32_t id)
+ 	IOLockUnlock(fLock);
+ }
+ 
++/* 0229: the newest swap not yet presented, presented (present() waits for the GPU to finish its surface). */
++void
++AppleCLCD::flipCalled(thread_call_param_t owner, thread_call_param_t unused)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++
++	(void)unused;
++	if (rec == NULL) {
++		return;                                 /* (the vsync tick presents it) */
++	}
++	IOLockLock(fb->fPresentLock);
++	IOLockLock(fb->fLock);
++	bool take = fb->fDirty && !fb->fPowerOff;
++	if (take) {
++		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		fb->fDirty = false;
++	}
++	IOLockUnlock(fb->fLock);
++	if (take) {
++		fb->present(rec);
++	}
++	IOLockUnlock(fb->fPresentLock);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
+ /* 0226: sel 6. kIOReturnSuccess once swap `id` is on the panel, the display is off, or after 50 ms. */
+ void
+ AppleCLCD::swapWait(uint32_t id)
+@@ -553,9 +592,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	bool now = fFlipNow != 0 && fScanMode != 0 && !fPowerOff && fPresentLock != NULL;
+-	fDirty = !now;
++	bool called = now && fFlipNow != 2 && fFlipCall != NULL;
++	fDirty = !now || called;                        /* 0229: the call takes it (or the tick, if it is first) */
+ 	IOLockUnlock(fLock);
+-	if (now) {                                      /* 0227: on the panel before SwapEnd returns */
++	if (called) {
++		thread_call_enter(fFlipCall);           /* 0229: flipped once the GPU is done, off this thread */
++	} else if (now) {                               /* 0227: on the panel before SwapEnd returns */
+ 		IOLockLock(fPresentLock);
+ 		present(rec);
+ 		IOLockUnlock(fPresentLock);
+@@ -1348,6 +1390,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (!off && fFB->fFlipNow == 1 && fFB->fFlipCall != NULL) {
++				thread_call_enter(fFB->fFlipCall);      /* 0229: the redraw (the tick presents nothing) */
++			}
+ 			IOLog("HOTDOGB FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
