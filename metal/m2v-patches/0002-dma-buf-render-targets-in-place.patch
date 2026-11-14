@@ -1,0 +1,17 @@
+diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
+index 86f42373..ba46bd46 100644
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -251,7 +251,11 @@ pub(crate) fn in_place(
+     if policy == HostPageTexturePolicy::Shadow {
+         return Err(ShadowCause::Exact);
+     }
+-    if usage.contains(TextureUsage::RENDER_TARGET) {
++    // ios-sweet: over dma-buf pages (IOSurfaces on the OnePlus 7T, imported through sweetdrm) a render target is
++    // taken in place too: Turnip's linear images (DRM_FORMAT_MOD_LINEAR) render and resolve their texels alone,
++    // and the image's first move is the acquire from VK_QUEUE_FAMILY_FOREIGN_EXT into GENERAL, which keeps the
++    // contents; the shadow's copy in, render and merge back cost ~30 ms a frame of CoreAnimation's window server.
++    if usage.contains(TextureUsage::RENDER_TARGET) && class != PagesClass::DmaBuf {
+         return Err(ShadowCause::RenderTarget);
+     }
+     if usage.intersects(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC) {
