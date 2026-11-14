@@ -1,0 +1,71 @@
+0231: the vsync tick re-anchored to the panel's refreshes: when 0230 sees a flush taken, a refresh began; the tick follows sweetvsync_lead us (500) after it instead of running free, so the window server's frames start right after a refresh. sweetvsync_lock=0: free-running as before.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index af0647d..36868d1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,6 +170,16 @@ public:
+ 	 */
+ 	thread_call_t fFlipCall;
+ 	uint64_t      fFlushWaitNs;   /* 0230: time spent waiting for the hardware to take flips */
++	/*
++	 * 0231: the vsync tick in step with the panel. The tick was a free-running 60 Hz timer, out of step with the
++	 * panel's refreshes: the window server began a frame at a tick, finished it, and the flip then waited for
++	 * the next refresh anywhere up to a period later (0230: 7 ms on average), with two buffers often a frame
++	 * lost. A flush seen taken (its bits clearing while 0230 waits) marks the start of a refresh: fTaken; the
++	 * tick is re-anchored there each time (sweetvsync_lead microseconds after it, default 500). Boot-arg
++	 * sweetvsync_lock=0: free-running as before.
++	 */
++	volatile uint64_t fTaken;     /* when a flush was last seen taken (mach absolute time), 0: never */
++	uint32_t      fVsyncLock, fVsyncLeadUs;
+ 	uint32_t      fFlushTimeouts;
+ 	static void flipCalled(thread_call_param_t owner, thread_call_param_t unused);
+ 
+@@ -252,10 +262,26 @@ AppleCLCD::rearmVsync(IOTimerEventSource *sender)
+ {
+ 	uint64_t period = sweet_vsync_period, now = mach_absolute_time();
+ 
++	uint64_t last = fNextVsync;
++
+ 	fNextVsync += period;
+ 	if (fNextVsync <= now) {                /* late: the next deadline still ahead, in step */
+ 		fNextVsync += ((now - fNextVsync) / period + 1) * period;
+ 	}
++	/* 0231: re-anchored to the last refresh seen begin, if seen within the last half second */
++	uint64_t taken = fTaken, lead, half;
++	nanoseconds_to_absolutetime((uint64_t)fVsyncLeadUs * 1000, &lead);
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half);
++	if (fVsyncLock != 0 && taken != 0 && now - taken < half) {
++		uint64_t anchor = taken + lead, next = anchor;
++		if (next <= now) {
++			next += ((now - next) / period + 1) * period;
++		}
++		if (next < last + period / 2) {         /* never two ticks within half a period */
++			next += period;
++		}
++		fNextVsync = next;
++	}
+ 	sender->wakeAtTime(fNextVsync);
+ }
+ 
+@@ -1108,6 +1134,10 @@ AppleCLCD::scanSetup(void)
+ 	PE_parse_boot_argn("sweetscan", &fScanMode, sizeof(fScanMode));
+ 	fSwapWait = 1;                                  /* 0226 */
+ 	fFlipNow = 1;                                   /* 0227 */
++	fVsyncLock = 1;                                 /* 0231 */
++	fVsyncLeadUs = 500;
++	PE_parse_boot_argn("sweetvsync_lock", &fVsyncLock, sizeof(fVsyncLock));
++	PE_parse_boot_argn("sweetvsync_lead", &fVsyncLeadUs, sizeof(fVsyncLeadUs));
+ 	PE_parse_boot_argn("sweetflipnow", &fFlipNow, sizeof(fFlipNow));
+ 	PE_parse_boot_argn("sweetswapwait", &fSwapWait, sizeof(fSwapWait));
+ 	if (fScanMode == 0) {
+@@ -1322,6 +1352,9 @@ AppleCLCD::scanPresent(const uint8_t *rec)
+ 			IOSleep(1);
+ 			waited++;
+ 		}
++		if (waited > 0 && waited < 34) {
++			fTaken = mach_absolute_time();  /* 0231: a refresh began within the last millisecond */
++		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 		fFlushWaitNs += ns;
+ 		if (waited >= 34 && fFlushTimeouts++ < 4) {
