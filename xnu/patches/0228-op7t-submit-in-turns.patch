@@ -1,0 +1,101 @@
+0228: submissions of up to 1024 command buffers, given to the ring in turns of 128 (its limit), the last turn's fence the submission's; the arrays from the heap. Control Center's first Metal frame was 130 command buffers in one submission: refused, which Turnip took for a lost device.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index c03499c..1ecae92 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -234,7 +234,14 @@ struct redwood_worked {
+ 
+ #define GPU_BUFFERS             8192            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (256u << 20)
+-#define GPU_SUBMIT_CMDS         128
++/*
++ * 0228: a submission of more command buffers than the ring takes at once (redwood_gpu_submit: 128) is given
++ * to it in turns of 128, in order; its fence is the last turn's. Control Center's first frame on CoreAnimation's
++ * Metal renderer was 130 command buffers in one submission (metal2vulkan groups a frame's): refused, and Turnip
++ * took the refusal for a lost device. Up to 1024 now, the arrays from the heap instead of the stack.
++ */
++#define GPU_SUBMIT_CMDS         1024
++#define GPU_RING_CMDS           128
+ #define GPU_SUBMIT_BOS          8192
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+@@ -1410,13 +1417,34 @@ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ 	return ret;
+ }
+ 
++/* 0228: `count` command buffers to the ring in turns of GPU_RING_CMDS; the last turn's fence, 0 if one did not fit. */
++static uint32_t
++ringSubmit(const uint64_t * addresses, const uint32_t * words, uint32_t count)
++{
++	uint32_t fence = 0;
++	static uint32_t told;
++
++	if (count > GPU_RING_CMDS && told < 4) {
++		told++;
++		IOLog("RedwoodGPU: a submission of %u command buffers, given to the ring in turns of %u\n", count, GPU_RING_CMDS);
++	}
++	for (uint32_t at = 0; at < count; at += GPU_RING_CMDS) {
++		uint32_t n = count - at < GPU_RING_CMDS ? count - at : GPU_RING_CMDS;
++		fence = redwood_gpu_submit(addresses + at, words + at, n);
++		if (fence == 0) {
++			return 0;
++		}
++	}
++	return fence;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ {
+ 	struct msm_gem_submit_bo * bos = NULL;
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+-	uint64_t addresses[GPU_SUBMIT_CMDS];
+-	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint64_t * addresses = NULL;                    /* 0228: from the heap, nr_cmds of them */
++	uint32_t * words = NULL, count = 0;
+ 	uint64_t began, nanos, again;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -1426,7 +1454,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	}
+ 	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
+ 	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
+-	if (bos == NULL || cmds == NULL) {
++	addresses = IONew(uint64_t, request->nr_cmds);
++	words = IONew(uint32_t, request->nr_cmds);
++	if (bos == NULL || cmds == NULL || addresses == NULL || words == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 		goto out;
+ 	}
+@@ -1510,7 +1540,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
+-	request->fence = redwood_gpu_submit(addresses, words, count);
++	request->fence = ringSubmit(addresses, words, count);         /* 0228 */
+ 	/*
+ 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
+ 	 * reset and given this submission again -- after a reset the ring is empty, so there is
+@@ -1521,7 +1551,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		redwood_gpu_report("the ring is full");
+ 		gGPUReported = !redwood_gpu_recover();
+ 		if (!gGPUReported) {
+-			request->fence = redwood_gpu_submit(addresses, words, count);
++			request->fence = ringSubmit(addresses, words, count);         /* 0228 */
+ 		}
+ 	}
+ 	if (gpu_log && request->fence != 0) {
+@@ -1642,6 +1672,12 @@ out:
+ 	if (cmds != NULL) {
+ 		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
+ 	}
++	if (addresses != NULL) {
++		IODelete(addresses, uint64_t, request->nr_cmds);
++	}
++	if (words != NULL) {
++		IODelete(words, uint32_t, request->nr_cmds);
++	}
+ 	return ret;
+ }
+ 

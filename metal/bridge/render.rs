@@ -606,12 +606,15 @@ pub unsafe extern "C" fn smtl_texture_new_iosurface(
     let base_addr = base as usize;
     let source: DmaBufSource = Arc::new(move |req: DmaBufRequest| {
         if req.start.as_ptr() as usize != base_addr {
+            crate::trace(&format!("IOSurface {surface}: pages asked from {:#x} ({} bytes, granule {}), the surface at {base_addr:#x}                 ({alloc_size} bytes): refused", req.start.as_ptr() as usize, req.length, req.granule));
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "pages not at the surface's start"));
         }
         // SAFETY: sweetdrm's C function; a new descriptor or -1.
         let fd = unsafe { make_fd(surface, req.length) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            crate::trace(&format!("IOSurface {surface}: no descriptor for {} bytes: {e}", req.length));
+            return Err(e);
         }
         // SAFETY: a descriptor just made for this, owned from here on.
         Ok(vec![DmaBufChunk { fd: unsafe { OwnedFd::from_raw_fd(fd) }, length: req.length }])
