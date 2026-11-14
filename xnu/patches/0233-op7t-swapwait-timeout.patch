@@ -1,7 +1,7 @@
 0233: SwapWait answers as CoreAnimation asks: the timeout in milliseconds (top bit CA's mark; 0x80000000 = answer now), success once the swap is shown, kIOReturnTimeout otherwise. 0226 blocked every call, so IOMFBDisplay::finish_update's look at its three pages waited for the last swap each frame and the window server never used its third page.
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 4800185..a5fffe1 100644
+index 4800185..3d539ce 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -207,7 +207,7 @@ public:
@@ -13,11 +13,13 @@ index 4800185..a5fffe1 100644
  	void present(const uint8_t *rec);
  };
  
-@@ -591,27 +591,45 @@ AppleCLCD::flipCalled(thread_call_param_t owner, thread_call_param_t unused)
+@@ -590,28 +590,46 @@ AppleCLCD::flipCalled(thread_call_param_t owner, thread_call_param_t unused)
+ }
  
  /* 0226: sel 6. kIOReturnSuccess once swap `id` is on the panel, the display is off, or after 50 ms. */
- void
+-void
 -AppleCLCD::swapWait(uint32_t id)
++IOReturn
 +AppleCLCD::swapWait(uint32_t id, uint32_t timeout)
  {
 +	/*
