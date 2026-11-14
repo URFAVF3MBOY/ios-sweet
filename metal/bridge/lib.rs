@@ -304,10 +304,19 @@ pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
     if n.is_power_of_two() {
         trace(&format!("{n} command buffers committed"));
     }
-    match timed("commit", || (*c).commit()) {
-        Ok(()) => 0,
-        Err(e) => fail("commit", e),
+    if let Err(e) = timed("commit", || (*c).commit()) {
+        return fail("commit", e);
     }
+    // While /var/local/sweetmtl-sync exists: the commit returns once the GPU is done. The window server presents a
+    // frame right after committing it (its scheduled handlers, then the swap); Apple's driver holds the display
+    // back until the GPU has written the surface, my scanout does not, so half-drawn frames reached the panel.
+    static SYNC: OnceLock<bool> = OnceLock::new();
+    if *SYNC.get_or_init(|| std::path::Path::new("/var/local/sweetmtl-sync").exists()) {
+        if let Err(e) = (*c).wait_until_completed() {
+            return fail("commit (waiting for the GPU)", e);
+        }
+    }
+    0
 }
 
 #[no_mangle]
