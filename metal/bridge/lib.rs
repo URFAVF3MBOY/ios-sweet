@@ -304,6 +304,10 @@ pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
     if n.is_power_of_two() {
         trace(&format!("{n} command buffers committed"));
     }
+    if n % 256 == 0 {
+        // the runtime's counters of what its commits did (passes, copies, shadows, barriers), for the trace
+        trace(&format!("after {n} command buffers: {:?}", (*c).device().work_counts()));
+    }
     if let Err(e) = timed("commit", || (*c).commit()) {
         return fail("commit", e);
     }
