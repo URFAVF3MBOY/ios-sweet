@@ -1,0 +1,47 @@
+0230: a flip is reported shown (SwapWait releases the old buffer) only once the hardware took its CTL_FLUSH at the next refresh; until then the refresh under way still reads the old surface, and the window server drew into it again (glitches at the bottom of the screen opening and closing App Library).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 30dbfa4..af0647d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -169,6 +169,8 @@ public:
+ 	 * Boot-arg sweetflipnow=2: in SwapEnd as 0227; 0: at the vsync tick.
+ 	 */
+ 	thread_call_t fFlipCall;
++	uint64_t      fFlushWaitNs;   /* 0230: time spent waiting for the hardware to take flips */
++	uint32_t      fFlushTimeouts;
+ 	static void flipCalled(thread_call_param_t owner, thread_call_param_t unused);
+ 
+ 	/*
+@@ -1306,8 +1308,30 @@ AppleCLCD::scanPresent(const uint8_t *rec)
+ 	} else {
+ 		scanTo(row0, s->bytesPerRow, fBootXY0 + (uint32_t)fOffX, fBootXY1 + (uint32_t)fOffX);
+ 	}
++	/*
++	 * 0230: the flip is taken at the panel's next refresh (CTL_FLUSH, double-buffered registers); until then the
++	 * refresh under way still reads the surface shown before. Reported shown (SwapWait lets the window server
++	 * draw into the old buffer again) only once the hardware took the flush: its bits read back clear. Before,
++	 * the window server could draw into the buffer the panel was still reading: glitches in the lower part of
++	 * the screen (rows read last). At most 34 ms (two refreshes); on the flip thread (0229), not the caller's.
++	 */
++	{
++		uint64_t began = mach_absolute_time(), ns;
++		uint32_t waited = 0;
++		while ((fCtl0[CTL_FLUSH / 4] & CTL_FLUSH_VIGS) != 0 && waited < 34) {
++			IOSleep(1);
++			waited++;
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		fFlushWaitNs += ns;
++		if (waited >= 34 && fFlushTimeouts++ < 4) {
++			IOLog("HOTDOGB SCAN: the flush of flip %u still pending after 34 ms (0x%x)\n", fScanFlips,
++			    fCtl0[CTL_FLUSH / 4]);
++		}
++	}
+ 	if (fScanFlips++ < 8 || (fScanFlips % 1000) == 0) {
+-		IOLog("HOTDOGB SCAN: flip %u: surface %u at 0x%llx (mode %u)\n", fScanFlips, s->id, pa, fScanMode);
++		IOLog("HOTDOGB SCAN: flip %u: surface %u at 0x%llx (mode %u), %llu us waited for flushes so far\n",
++		    fScanFlips, s->id, pa, fScanMode, fFlushWaitNs / 1000);
+ 	}
+ 	if (fScanned != NULL) {
+ 		fScanned->release();            /* (the display may fetch it one more refresh: a slot is
