@@ -23,6 +23,7 @@ thread_local! {
 
 pub(crate) fn fail<E: std::fmt::Display>(what: &str, e: E) -> i32 {
     let text = format!("{what}: {e}");
+    trace(&format!("failed: {text}"));
     LAST_ERROR.with(|l| *l.borrow_mut() = CString::new(text.replace('\0', " ")).unwrap_or_default());
     -1
 }
@@ -31,6 +32,36 @@ pub(crate) fn fail<E: std::fmt::Display>(what: &str, e: E) -> i32 {
 #[no_mangle]
 pub extern "C" fn smtl_last_error() -> *const c_char {
     LAST_ERROR.with(|l| l.borrow().as_ptr())
+}
+
+/// While /var/local/sweetmtl-trace exists: a line into /var/tmp/sweetmtl-PROGRAM-PID.log (for processes whose
+/// stderr and os_log nobody reads, such as the window server). Decided once per process.
+pub(crate) fn trace(line: &str) {
+    use std::io::Write;
+    static FILE: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        if !std::path::Path::new("/var/local/sweetmtl-trace").exists() {
+            return None;
+        }
+        // SAFETY: getprogname returns this process's NUL-terminated name.
+        let me = unsafe { CStr::from_ptr(getprogname()) }.to_string_lossy().into_owned();
+        let path = format!("/var/tmp/sweetmtl-{me}-{}.log", std::process::id());
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
+    });
+    if let Some(f) = file {
+        if let Ok(mut f) = f.lock() {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let _ = writeln!(f, "{t:.3} {line}");
+        }
+    }
+}
+
+/// A line of the Objective-C side into the trace file (see `trace`).
+#[no_mangle]
+pub unsafe extern "C" fn smtl_trace(line: *const c_char) {
+    if !line.is_null() {
+        trace(&CStr::from_ptr(line).to_string_lossy());
+    }
 }
 
 /// SWEETMTL_TIME=1: each timed bridge call prints how long it took (stderr).
@@ -119,7 +150,10 @@ pub unsafe extern "C" fn smtl_device_new(turnip: *const c_char, cache: *const c_
         options.shader_cache.directory = Some(PathBuf::from(CStr::from_ptr(cache).to_string_lossy().into_owned()));
     }
     match Device::system_default_with(&options) {
-        Ok(d) => Box::into_raw(Box::new(d)),
+        Ok(d) => {
+            trace("device made");
+            Box::into_raw(Box::new(d))
+        }
         Err(e) => {
             fail("Device::system_default_with", e);
             ptr::null_mut()
@@ -233,6 +267,11 @@ pub unsafe extern "C" fn smtl_cmdbuf_release(c: *mut CommandBuffer) {
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *const CommandBuffer) -> i32 {
+    static COMMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COMMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        trace(&format!("{n} command buffers committed"));
+    }
     match timed("commit", || (*c).commit()) {
         Ok(()) => 0,
         Err(e) => fail("commit", e),

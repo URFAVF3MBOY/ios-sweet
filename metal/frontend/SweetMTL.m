@@ -35,6 +35,7 @@ say(NSString *fmt, ...)
 		sm_log = os_log_create("com.sweet.mtl", "SweetMTL");
 	}
 	os_log(sm_log, "SweetMTL: %{public}s", s.UTF8String);
+	smtl_trace(s.UTF8String);
 	if (getenv("SWEETMTL_STDERR") != NULL) {
 		fprintf(stderr, "SweetMTL: %s\n", s.UTF8String);
 	}

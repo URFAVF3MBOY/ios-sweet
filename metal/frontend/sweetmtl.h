@@ -12,6 +12,8 @@ typedef struct smtl_cmdbuf smtl_cmdbuf;
 typedef struct smtl_blit smtl_blit;
 
 const char *smtl_last_error(void);
+/* A line into /var/tmp/sweetmtl-PROGRAM-PID.log while /var/local/sweetmtl-trace exists. */
+void smtl_trace(const char *line);
 
 smtl_device *smtl_device_new(const char *turnip_path, const char *shader_cache_dir);
 void smtl_device_release(smtl_device *d);
