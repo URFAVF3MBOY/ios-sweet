@@ -1,0 +1,162 @@
+0236: continuous camera capture (the write master's address queue refilled on every frame, polled) and
+kern.sweetcamframe, the newest frame for any user.
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -26,6 +26,7 @@
+ #include <sys/errno.h>
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -887,6 +888,19 @@
+ 
+ #define CAM_CSIPHY1_PA          0x0ac66000u
+ #define CAM_LIVE_SIZE           0x200000u
++/*
++ * 0236: continuous capture. The IFE write master takes its frame addresses from a queue: Linux's camss-vfe-170
++ * queues two (IMAGE_ADDR written twice) before the register update and one more on every WM buffer-done
++ * (BUS_IRQ_STATUS(1) bit n). 0205 queued one, so WM0 wrote one frame and stopped. Here a thread call polls WM0's
++ * buffer-done every CAM_FRAME_POLL_MS while armed and queues the same buffer again (one 2 MiB window holds one
++ * frame; a reader may see a frame being overwritten). kern.sweetcamframe gives the newest frame to any user.
++ * The frame is the sensor mode of table 15/4: 1296x736 RAW10, 1632 bytes a line.
++ */
++#define CAM_FRAME_WIDTH         1296u
++#define CAM_FRAME_HEIGHT        736u
++#define CAM_FRAME_STRIDE        1632u
++#define CAM_FRAME_BYTES         (CAM_FRAME_STRIDE * CAM_FRAME_HEIGHT)
++#define CAM_FRAME_POLL_MS       4u
+ #define PHY_CMN(n)              (0x800 + 4 * (n))
+ #define PHY_STATUS(n)           (0x8b0 + 4 * (n))
+ 
+@@ -895,6 +909,9 @@
+ #define CAM_ARM_STAGE(n, what) do { cam_say("[stage %d done: %s]", (n), (what)); \
+ 	if (cam_arm_stop <= (n)) { cam_say("stopping after stage %d (kern.sweetcamstop)", (n)); return; } } while (0)
+ static uint64_t cam_live_pa;
++static thread_call_t cam_frame_call;            /* 0236 */
++static volatile int cam_streaming;
++static volatile uint32_t cam_frame_seq;
+ static int cam_live_bank = -1;
+ static uint32_t cam_buf_off;
+ 
+@@ -982,6 +999,57 @@
+ 	{0x0844, 0xFF}, {0x0848, 0xEF}, {0x084c, 0xFF}, {0x0850, 0xFF}, {0x0854, 0xFF},
+ };
+ 
++/*
++ * 0236: the frame loop. While armed, WM0's buffer-done (bus status 1 bit 0) is polled; on it the IFE and bus
++ * interrupt statuses are cleared (as Linux's vfe_isr does) and the buffer is queued again for the next frame.
++ */
++static void
++cam_frame_poll(thread_call_param_t p0, thread_call_param_t p1)
++{
++#pragma unused(p0, p1)
++	uint64_t deadline;
++
++	if (!cam_streaming || cam_stage != 10) {
++		return;
++	}
++	uint32_t done = rd32(cam_ife, VFE_BUS_IRQ_STATUS(1));
++
++	if (done & 1u) {
++		uint32_t s0 = rd32(cam_ife, VFE_IRQ_STATUS_0), s1 = rd32(cam_ife, VFE_IRQ_STATUS_1);
++
++		wr32(cam_ife, VFE_IRQ_CLEAR_0, s0);
++		wr32(cam_ife, VFE_IRQ_CLEAR_1, s1);
++		for (unsigned n = 0; n < 3; n++) {
++			wr32(cam_ife, VFE_BUS_IRQ_CLEAR(n), rd32(cam_ife, VFE_BUS_IRQ_STATUS(n)));
++		}
++		wr32(cam_ife, VFE_IRQ_CMD, 1u);
++		wr32(cam_ife, VFE_BUS_IRQ_CLEAR_GLOBAL, 1u);
++		wr32(cam_ife, VFE_BUS_WM_IMAGE_ADDR(0), (uint32_t)cam_live_pa);   /* next frame, same buffer */
++		cam_frame_seq++;
++	}
++	clock_interval_to_deadline(CAM_FRAME_POLL_MS, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(cam_frame_call, deadline);
++}
++
++static void
++cam_frame_start(void)
++{
++	uint64_t deadline;
++
++	if (cam_frame_call == NULL) {
++		cam_frame_call = thread_call_allocate(cam_frame_poll, NULL);
++		if (cam_frame_call == NULL) {
++			cam_say("frame loop: no thread call");
++			return;
++		}
++	}
++	cam_frame_seq = 0;
++	cam_streaming = 1;
++	clock_interval_to_deadline(CAM_FRAME_POLL_MS, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(cam_frame_call, deadline);
++	cam_say("frame loop: polling WM0 every %u ms (kern.sweetcamframe)", CAM_FRAME_POLL_MS);
++}
++
+ static void
+ cam_live_arm(void)
+ {
+@@ -1127,6 +1195,7 @@
+ 	wr32(cam_ife, VFE_BUS_WM_PACKER_CFG(0), 0);
+ 	wr32(cam_ife, VFE_BUS_WM_STRIDE(0), 0xff01u);
+ 	wr32(cam_ife, VFE_BUS_WM_IMAGE_ADDR(0), (uint32_t)cam_live_pa);
++	wr32(cam_ife, VFE_BUS_WM_IMAGE_ADDR(0), (uint32_t)cam_live_pa);   /* 0236: two in the address queue */
+ 	wr32(cam_ife, VFE_BUS_WM_FRAME_INC(0), 0);
+ 	wr32(cam_ife, VFE_BUS_WM_CFG(0), 1u | (1u << 1));
+ 	wr32(cam_ife, VFE_REG_UPDATE_CMD, 1u << 1);
+@@ -1164,11 +1233,13 @@
+ 	wr32(cam_csid, CSID_RDI0_CTRL, 1u);
+ 	cam_say("armed: start the sensor stream now (camio.py), then kern.sweetcam=5");
+ 	cam_stage = 10;
++	cam_frame_start();      /* 0236 */
+ }
+ 
+ static void
+ cam_live_stop(void)
+ {
++	cam_streaming = 0;      /* 0236: the frame poll stops at its next run */
+ 	uint32_t fsr = 0, changed = 0;
+ 	uint64_t far = 0;
+ 
+@@ -1210,6 +1281,37 @@
+ 	cam_stage = 8;          /* (=4 may run again) */
+ }
+ 
++/*
++ * 0236: kern.sweetcamframe (read-only, any user): a header {u32 sequence, width, height, stride} and the newest
++ * frame (CAM_FRAME_BYTES of RAW10). The sequence counts the frames written since kern.sweetcam=4.
++ */
++static int
++sysctl_sweetcamframe SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t header[4] = { cam_frame_seq, CAM_FRAME_WIDTH, CAM_FRAME_HEIGHT, CAM_FRAME_STRIDE };
++	int error;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, sizeof(header) + CAM_FRAME_BYTES);
++	}
++	if (cam_live_va == 0) {
++		return ENXIO;
++	}
++	error = SYSCTL_OUT(req, header, sizeof(header));
++	if (error == 0) {
++		flush_dcache64((addr64_t)cam_live_va, CAM_FRAME_BYTES, FALSE);   /* the IFE wrote around the cache */
++		error = SYSCTL_OUT(req, (void *)cam_live_va, CAM_FRAME_BYTES);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcamframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, 0, 0,
++    sysctl_sweetcamframe, "S", "0236: the newest camera frame: u32 sequence, width, height, stride, then RAW10");
++
+ static int
+ sysctl_sweetcambuf SYSCTL_HANDLER_ARGS
+ {

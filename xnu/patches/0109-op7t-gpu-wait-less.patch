@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index c3bd087..134ba84 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1034,6 +1034,14 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		if (b->surface != NULL) {
+ 			uint32_t seed = surfaceSeed(b->surface);
+ 
++			/*
++			 * 0109: a surface on memory the kernel does not manage (the splash buffer, 0108's
++			 * scanout pool) is mapped write-combined everywhere: nothing of it is in a cache,
++			 * and walking its 13 MB line by line cost about a millisecond a submission.
++			 */
++			if (!b->surface->wrapped && OSDynamicCast(IOBufferMemoryDescriptor, b->surface->memory) == NULL) {
++				continue;
++			}
+ 			if (b->kernel == NULL || (seed == b->seed && !b->seen && began - b->pushed < again)) {
+ 				continue;
+ 			}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e7dd010..94dfff0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -263,6 +263,18 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0109: present() waits for the GPU's last submission that names a surface before it shows
++	 * it (RedwoodGPUSurfaceReady, both for 0108's flip and the copy), so eagl.c need not glFinish
++	 * every frame in backboardd: with this property it only pushes Mesa's held-back work to the
++	 * kernel and goes on to the next frame (eagl.c display_waits(); topaz sets it too).
++	 * Boot-arg sweetgpuwait=0 leaves it out (backboardd waits as before).
++	 */
++	uint32_t gpuwait = 1;
++	PE_parse_boot_argn("sweetgpuwait", &gpuwait, sizeof(gpuwait));
++	if (gpuwait != 0) {
++		setProperty("RedwoodWaitsForGPU", true);
++	}
+ 	registerService();
+ 	IOLog("HOTDOGB FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);

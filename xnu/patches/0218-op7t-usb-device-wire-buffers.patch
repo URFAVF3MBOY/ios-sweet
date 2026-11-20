@@ -1,0 +1,2241 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Fri, 13 Nov 2026 04:30:00 -0500
+Subject: [PATCH] op7t-0218: USB device backend wires request buffers before copying
+
+0217's first iPhone-mode boot with the kexts executable: the PC enumerated
+the phone as Apple 05AC:12A8 (descriptors, BOS, address, configuration all
+answered by Apple's IOUSBDeviceFamily), then the first bulk OUT data
+(usbmux from the PC, event 0x0000e044 = EP1 OUT XferComplete) panicked:
+"IOGMD: not wired for the IODMACommand @IOMemoryDescriptor.cpp:3248".
+writeBytes/readBytes on a request's buffer need it prepared. Now each
+data request's buffer is prepared when it reaches the head of its
+endpoint queue and completed when it finishes or is cancelled; EP0 IN
+copies prepare/complete around readBytes; createIOBuffer returns
+non-pageable buffers.
+
+Apply after 0217.
+---
+diff --git a/iokit/Kernel/arm/SweetUSBDevice.cpp b/iokit/Kernel/arm/SweetUSBDevice.cpp
+--- a/iokit/Kernel/arm/SweetUSBDevice.cpp
++++ b/iokit/Kernel/arm/SweetUSBDevice.cpp
+@@ -1,1087 +1,1133 @@
+-/*
+- * OnePlus 7T (0217): the phone's DWC3 (USB 2.0 device mode) as a backend of Apple's own IOUSBDeviceController
+- * (com.apple.iokit.IOUSBDeviceFamily 2.0.0 from the iPhone X iOS 16.5 kernelcache, prelinked into this kernel by
+- * tools/kcbuild.py together with AppleUSBCommon and AppleUSBDeviceMux). Apple's family does everything above the
+- * controller: descriptors, the EP0 request state machine (IOUSBDeviceControlRequest), the functions' interfaces
+- * (AppleUSBDeviceMux = usbmux for lockdownd / iTunes / Finder), the serial number from /chosen unique-chip-id.
+- *
+- * The family is not part of this build, so the subclass is made by hand: an object laid out as Apple's
+- * IOUSBDeviceController (its constructor runs on it), then its vtable pointer set to a copy of Apple's vtable with
+- * our methods in the slots below. Slots, offsets and addresses: tools/abi-IOUSBDeviceController-ios16.5.txt and
+- * NOTES.md (2026-11-13); the addresses are written by kcbuild.py into sweet_usbdev_abi after linking (no Apple
+- * address is in this source). If the table is empty (an image without the kexts) nothing here runs.
+- *
+- * Contract (Apple's DWC3 backend AppleUSBXDCI and SwitchXUDC in brunostjohn/ios-on-switch-lmao implement the same):
+- * - setup packets go to controlRequest->inputSetupPacket() + processSetupPacket();
+- * - io() requests reach ioGated() inside the family's command gate on our work loop; completion = status (+0x28)
+- *   and actual (+0x48) into the request, then completeEndpointIO();
+- * - EP0: IN data and the device's IN status come as io(0x80) (a zero-length one in state 7 is the status stage); the
+- *   OUT data stage (state 5/6) and the host's OUT status (state 8) are announced by handleControlRequestStateChange()
+- *   and both end in inputDataPacket();
+- * - once the functions are ready the family's startUSBStack asks getConnectionSpeed(): anything but -1 means a cable,
+- *   so handleUSBCableConnect() -> goOnBus(true).
+- * DWC3 side as bsd/dev/sweet_usb.c (Synopsys databook, Linux drivers/usb/dwc3): events polled every millisecond by a
+- * thread that hands them to the work loop (runAction holds the gate the family's command gate uses), one TRB per
+- * transfer, bounce buffers below 4 GiB (the SMMU identity window for SID 0x140), cache cleaned/invalidated by hand.
+- */
+-#include <IOKit/IOService.h>
+-#include <IOKit/IOPlatformExpert.h>
+-#include <IOKit/IOLib.h>
+-#include <IOKit/IOWorkLoop.h>
+-#include <IOKit/IOBufferMemoryDescriptor.h>
+-#include <IOKit/IOMemoryDescriptor.h>
+-#include <libkern/c++/OSKext.h>
+-#include <libkern/c++/OSArray.h>
+-#include <libkern/c++/OSString.h>
+-#include <libkern/c++/OSDictionary.h>
+-#include <kern/thread.h>
+-#include <pexpert/pexpert.h>
+-
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-
+-extern "C" {
+-/* filled by tools/kcbuild.py (Apple kernelcache addresses relinked to this kernel); magic says so */
+-struct sweet_usbdev_abi {
+-	uint64_t magic;
+-	uint64_t vtable;                /* IOUSBDeviceController's vtable symbol (slots at +16) */
+-	uint64_t meta;                  /* IOUSBDeviceController::gMetaClass */
+-	uint64_t ctor;                  /* IOUSBDeviceController::IOUSBDeviceController(const OSMetaClass *) */
+-	uint64_t ready_for_host;        /* IOUSBDeviceController::readyForHost() */
+-	uint64_t complete_io;           /* IOUSBDeviceController::completeEndpointIO(_IOUSBDeviceIORequestTag *) */
+-	uint64_t cr_input_setup;        /* IOUSBDeviceControlRequest::inputSetupPacket(uint8_t *) */
+-	uint64_t cr_process_setup;      /* IOUSBDeviceControlRequest::processSetupPacket() */
+-	uint64_t cr_input_data;         /* IOUSBDeviceControlRequest::inputDataPacket(uint8_t *, uint64_t) */
+-	uint64_t cr_reset;              /* IOUSBDeviceControlRequest::reset() */
+-	uint64_t cr_stall;              /* IOUSBDeviceControlRequest::stallSetupRequest() */
+-	uint64_t if_alt_count;          /* IOUSBDeviceInterface::getAlternateSettingCount() const */
+-	uint64_t if_pipe_count;         /* IOUSBDeviceInterface::getPipeCountForAlternateSetting(uint8_t) */
+-	uint64_t if_pipe;               /* IOUSBDeviceInterface::getPipeForAlternateSetting(int, uint8_t) */
+-	uint64_t pipe_dir;              /* IOUSBDevicePipe::getDirection() */
+-	uint64_t reserved[9];
+-};
+-#define SWEET_USBDEV_ABI_EMPTY  0x59544d45495841ull     /* "AXIEMTY": as built */
+-#define SWEET_USBDEV_ABI_FILLED 0x44454c4c49465841ull   /* "AXFILLED": kcbuild.py wrote it */
+-__attribute__((used, section("__DATA,__sweetusbabi")))
+-struct sweet_usbdev_abi sweet_usbdev_abi = { SWEET_USBDEV_ABI_EMPTY, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 } };
+-
+-bool sweet_usbdev_available(void);
+-bool sweet_usbdev_start(vm_offset_t dwc, vm_offset_t qscratch);
+-extern void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+-extern int sweet_usb_dma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa);    /* sweet_usb.c */
+-}
+-
+-/* ---- Apple's class: slots (from the first virtual) and fields, iOS 16.5 ---- */
+-enum {
+-	kSlotStart = 86, kSlotGetWorkLoop = 111,
+-	kSlotSoftDisconnect = 175, kSlotGoOnBus = 177, kSlotAccessoryCable = 179, kSlotStall = 180, kSlotAbort = 181,
+-	kSlotSetAddressPre = 182, kSlotSetAddressPost = 183, kSlotSpeed = 184, kSlotEndpointIDs = 185,
+-	kSlotPrepareConfig = 186, kSlotActivate = 187, kSlotDeactivate = 188, kSlotCreateBuffer = 189,
+-	kSlotIsStalled = 192, kSlotResetToggle = 193, kSlotUSBSuspend = 195, kSlotUSBReset = 196, kSlotUSBResume = 197,
+-	kSlotReEnumerate = 198, kSlotRemoteWake = 201, kSlotCRStateChange = 213, kSlotIOGated = 225,
+-	kSlotBufferOptions = 231,
+-	kSlots = 232,
+-};
+-#define CTRL_SIZE               504             /* sizeof(IOUSBDeviceController) */
+-#define CTRL_CONTROL_REQUEST    0x1b8           /* IOUSBDeviceControlRequest *, made by readyForHost */
+-#define CR_STATE                12              /* IOUSBDeviceControlRequest: int state */
+-/* _IOUSBDeviceIORequestTag */
+-#define REQ_ENDPOINT            0x00            /* int */
+-#define REQ_BUFFER              0x08            /* IOMemoryDescriptor * */
+-#define REQ_STATUS              0x28            /* IOReturn */
+-#define REQ_ISOC                0x30            /* uint8_t */
+-#define REQ_LENGTH              0x40            /* uint64_t */
+-#define REQ_ACTUAL              0x48            /* uint64_t */
+-enum { kStateOutData = 5, kStateOutDataLong = 6, kStateInStatus = 7, kStateOutStatus = 8 };
+-enum { kTypeIsoc = 1, kTypeBulk = 2, kTypeInterrupt = 3 };
+-enum { kSpeedFull = 1, kSpeedHigh = 2 };
+-
+-/* ---- DWC3 ---- */
+-#define GEVNTADRLO      0xc400
+-#define GEVNTADRHI      0xc404
+-#define GEVNTSIZ        0xc408
+-#define GEVNTCOUNT      0xc40c
+-#define DCFG            0xc700
+-#define DCTL            0xc704
+-#define DEVTEN          0xc708
+-#define DSTS            0xc70c
+-#define DALEPENA        0xc720
+-#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
+-#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
+-#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
+-#define DEPCMD(n)       (0xc80c + 0x10 * (n))
+-#define DCTL_RUN_STOP   (1u << 31)
+-#define DCTL_CSFTRST    (1u << 30)
+-#define DSTS_DEVCTRLHLT (1u << 22)
+-#define DEPCMD_SETEPCONFIG      1
+-#define DEPCMD_SETTRANSFRESOURCE 2
+-#define DEPCMD_CLEARSTALL       5
+-#define DEPCMD_SETSTALL         4
+-#define DEPCMD_STARTTRANSFER    6
+-#define DEPCMD_ENDTRANSFER      8
+-#define DEPCMD_DEPSTARTCFG      9
+-#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+-#define DEPCMD_CMDACT           (1u << 10)
+-#define TRB_HWO         (1u << 0)
+-#define TRB_LST         (1u << 1)
+-#define TRB_ISP_IMI     (1u << 10)
+-#define TRB_IOC         (1u << 11)
+-#define TRBCTL_NORMAL   (1u << 4)
+-#define TRBCTL_SETUP    (2u << 4)
+-#define TRBCTL_STATUS2  (3u << 4)
+-#define TRBCTL_STATUS3  (4u << 4)
+-#define TRBCTL_DATA     (5u << 4)
+-#define QS_HS_PHY_CTRL  0x10
+-#define QS_SS_PHY_CTRL  0x30
+-
+-/* DMA area: event buffer, one TRB per physical endpoint, setup packet, EP0 buffer, then the bounce buffers */
+-#define D_EVT           0x00000
+-#define D_EVT_SIZE      0x1000
+-#define D_TRB(ep)       (0x01000 + 64 * (ep))   /* own cache line each: a clean must not overwrite another's */
+-#define D_SETUP         0x01800
+-#define D_EP0           0x02000
+-#define D_EP0_SIZE      0x4000
+-#define D_BOUNCE(ep)    (0x08000 + (uint32_t)((ep) - 2) * D_BOUNCE_SIZE)
+-#define D_BOUNCE_SIZE   0x8000
+-#define NPEP            16                              /* physical endpoints used: EP0..EP7 both ways */
+-#define D_SIZE          (0x08000 + (NPEP - 2) * D_BOUNCE_SIZE)
+-#define QDEPTH          32
+-
+-typedef void (*fn_v)(void *);
+-typedef void (*fn_vp)(void *, void *);
+-typedef void (*fn_data)(void *, uint8_t *, uint64_t);
+-typedef int (*fn_i)(void *);
+-typedef int (*fn_iu8)(void *, uint8_t);
+-typedef void *(*fn_pipe)(void *, int, uint8_t);
+-typedef bool (*fn_start)(void *, IOService *);
+-
+-enum Ep0Stage { E_IDLE, E_DATA_IN, E_DATA_OUT, E_STATUS_IN, E_STATUS_OUT };
+-
+-struct Pep {                    /* one physical endpoint (2n = OUT, 2n+1 = IN) */
+-	bool active, in, stalled, busy;
+-	int type, mps;
+-	uint32_t res;                   /* transfer resource index after STARTTRANSFER */
+-	void *q[QDEPTH];
+-	unsigned head, count;
+-	uint64_t offset;                /* bytes of the head request done */
+-	uint32_t trb_len;
+-};
+-
+-static struct {
+-	void *obj;                      /* the controller (Apple's layout, our vtable) */
+-	void **base;                    /* Apple's IOUSBDeviceController slots */
+-	vm_offset_t dwc, qs, dma;
+-	uint64_t dma_pa;
+-	uint32_t evt_pos;
+-	IOWorkLoop *loop;
+-	bool on_bus, need_startcfg, data_stage;
+-	int speed;
+-	Ep0Stage stage;
+-	void *ep0_req;                  /* the family's IN request in flight on EP0 */
+-	void *ep0_q[8];
+-	unsigned ep0_head, ep0_count;
+-	bool status_ready[2];           /* XferNotReady (control status) seen on physical EP0 / EP1 */
+-	bool status_out_wanted;
+-	uint32_t ep0_len;
+-	struct Pep pep[NPEP];
+-	uint32_t events, logged;
+-} u;
+-
+-static void *sw_vt[2 + kSlots] __attribute__((aligned(16)));
+-
+-#define LOG(fmt, ...) printf("HOTDOGB USBDEV: " fmt "\n", ##__VA_ARGS__)
+-#define LOGN(fmt, ...) do { if (u.logged++ < 400) LOG(fmt, ##__VA_ARGS__); } while (0)
+-
+-/* ---- small helpers ---- */
+-static inline void
+-wr(uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(u.dwc + off) = v;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-static inline uint32_t
+-rd(uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(u.dwc + off);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-dsync(uint32_t off, uint32_t len)
+-{
+-	flush_dcache64((addr64_t)(u.dma + off), len ? len : 1, FALSE);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-template <typename T> static inline T
+-rget(void *req, size_t off)
+-{
+-	return *(T *)((uint8_t *)req + off);
+-}
+-
+-template <typename T> static inline void
+-rput(void *req, size_t off, T v)
+-{
+-	*(T *)((uint8_t *)req + off) = v;
+-}
+-
+-static void *
+-control_request(void)
+-{
+-	return *(void **)((uint8_t *)u.obj + CTRL_CONTROL_REQUEST);
+-}
+-
+-static int
+-cr_state(void)
+-{
+-	void *cr = control_request();
+-	return cr ? *(volatile int *)((uint8_t *)cr + CR_STATE) : -1;
+-}
+-
+-static unsigned
+-pep_of(int address)
+-{
+-	return ((unsigned)address & 0xfu) * 2 + (((unsigned)address & 0x80u) ? 1 : 0);
+-}
+-
+-static int
+-epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+-{
+-	wr(DEPCMDPAR0(ep), p0);
+-	wr(DEPCMDPAR1(ep), p1);
+-	wr(DEPCMDPAR2(ep), p2);
+-	wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
+-		uint32_t v = rd(DEPCMD(ep));
+-		if (!(v & DEPCMD_CMDACT)) {
+-			uint32_t status = (v >> 12) & 0xf;
+-			if (status) {
+-				LOGN("ep%u cmd 0x%x status %u", ep, cmd & 0xf, status);
+-				return -1;
+-			}
+-			return 0;
+-		}
+-		IODelay(1);
+-	}
+-	LOGN("ep%u cmd 0x%x timeout", ep, cmd & 0xf);
+-	return -1;
+-}
+-
+-static void
+-start_trb(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
+-{
+-	volatile uint32_t *t = (volatile uint32_t *)(u.dma + D_TRB(ep));
+-	uint64_t bpa = u.dma_pa + buf;
+-
+-	t[0] = (uint32_t)bpa;
+-	t[1] = (uint32_t)(bpa >> 32);
+-	t[2] = len;
+-	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
+-	dsync(D_TRB(ep), 16);
+-	uint64_t tpa = u.dma_pa + D_TRB(ep);
+-	if (epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0) {
+-		u.pep[ep].res = (rd(DEPCMD(ep)) >> 16) & 0x7fu;
+-		u.pep[ep].busy = true;
+-	}
+-}
+-
+-static uint32_t
+-trb_residue(unsigned ep)
+-{
+-	dsync(D_TRB(ep), 16);
+-	return *(volatile uint32_t *)(u.dma + D_TRB(ep) + 8) & 0xffffff;
+-}
+-
+-static void
+-end_transfer(unsigned ep)
+-{
+-	if (u.pep[ep].busy) {
+-		epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | (u.pep[ep].res << 16), 0, 0, 0);
+-		u.pep[ep].busy = false;
+-	}
+-}
+-
+-static void
+-finish(void *req, IOReturn status, uint64_t actual)
+-{
+-	rput<int32_t>(req, REQ_STATUS, status);
+-	rput<uint64_t>(req, REQ_ACTUAL, actual);
+-	((fn_vp)sweet_usbdev_abi.complete_io)(u.obj, req);
+-}
+-
+-static void
+-call_base(int slot)
+-{
+-	((fn_v)u.base[slot])(u.obj);
+-}
+-
+-/* ---- EP0 ---- */
+-static void
+-ep0_arm_setup(void)
+-{
+-	u.stage = E_IDLE;
+-	u.status_ready[0] = u.status_ready[1] = false;
+-	u.status_out_wanted = false;
+-	start_trb(0, D_SETUP, 8, TRBCTL_SETUP);
+-}
+-
+-static void
+-ep0_cancel(IOReturn status)
+-{
+-	end_transfer(0);
+-	end_transfer(1);
+-	void *pending[9];
+-	unsigned n = 0;
+-	if (u.ep0_req) {
+-		pending[n++] = u.ep0_req;
+-	}
+-	u.ep0_req = NULL;
+-	while (u.ep0_count) {
+-		pending[n++] = u.ep0_q[u.ep0_head];
+-		u.ep0_head = (u.ep0_head + 1) % 8;
+-		u.ep0_count--;
+-	}
+-	u.stage = E_IDLE;
+-	for (unsigned i = 0; i < n; i++) {
+-		finish(pending[i], kIOReturnAborted, 0);
+-	}
+-}
+-
+-/* the family's EP0 IN requests: data stages, or the device's status (zero length in state 7) */
+-static void
+-ep0_kick(void)
+-{
+-	while (u.stage == E_IDLE && u.ep0_count && !u.ep0_req) {
+-		void *req = u.ep0_q[u.ep0_head];
+-		uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
+-		if (len == 0 && cr_state() == kStateInStatus) {
+-			if (!u.status_ready[1]) {
+-				return;                 /* status stage starts on XferNotReady (control status) */
+-			}
+-			u.ep0_head = (u.ep0_head + 1) % 8;
+-			u.ep0_count--;
+-			u.ep0_req = req;
+-			u.stage = E_STATUS_IN;
+-			start_trb(1, D_EP0, 0, u.data_stage ? TRBCTL_STATUS3 : TRBCTL_STATUS2);
+-			return;
+-		}
+-		u.ep0_head = (u.ep0_head + 1) % 8;
+-		u.ep0_count--;
+-		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
+-		if (len > D_EP0_SIZE || (len && (!md || md->readBytes(0, (void *)(u.dma + D_EP0), len) != len))) {
+-			finish(req, kIOReturnNoResources, 0);
+-			continue;
+-		}
+-		dsync(D_EP0, (uint32_t)len);
+-		u.ep0_req = req;
+-		u.ep0_len = (uint32_t)len;
+-		u.stage = E_DATA_IN;
+-		start_trb(1, D_EP0, (uint32_t)len, TRBCTL_DATA);
+-	}
+-}
+-
+-static void
+-ep0_try_status_out(void)
+-{
+-	if (u.status_out_wanted && u.status_ready[0] && u.stage == E_IDLE) {
+-		u.status_out_wanted = false;
+-		u.stage = E_STATUS_OUT;
+-		start_trb(0, D_EP0, 0, TRBCTL_STATUS3);
+-	}
+-}
+-
+-static void
+-ep0_setup_done(void)
+-{
+-	uint8_t pkt[8];
+-	dsync(D_SETUP, 8);
+-	memcpy(pkt, (void *)(u.dma + D_SETUP), 8);
+-	uint16_t wlength = (uint16_t)(pkt[6] | pkt[7] << 8);
+-	LOGN("setup %02x %02x %02x%02x %02x%02x len %u", pkt[0], pkt[1], pkt[3], pkt[2], pkt[5], pkt[4], wlength);
+-	u.data_stage = wlength != 0;
+-	u.stage = E_IDLE;
+-	void *cr = control_request();
+-	if (!cr) {
+-		epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
+-		ep0_arm_setup();
+-		return;
+-	}
+-	((fn_vp)sweet_usbdev_abi.cr_input_setup)(cr, pkt);
+-	((fn_v)sweet_usbdev_abi.cr_process_setup)(cr);
+-	ep0_kick();
+-}
+-
+-static void
+-ep0_complete(unsigned ep)
+-{
+-	Ep0Stage done = u.stage;
+-	void *cr = control_request();
+-	u.stage = E_IDLE;
+-	switch (done) {
+-	case E_DATA_IN: {
+-		void *req = u.ep0_req;
+-		u.ep0_req = NULL;
+-		uint32_t res = trb_residue(1);
+-		if (req) {
+-			finish(req, kIOReturnSuccess, u.ep0_len - (res <= u.ep0_len ? res : u.ep0_len));     /* -> state 8 */
+-		}
+-		ep0_try_status_out();
+-		ep0_kick();
+-		break;
+-	}
+-	case E_DATA_OUT: {
+-		uint32_t res = trb_residue(0);
+-		uint32_t got = u.ep0_len - (res <= u.ep0_len ? res : u.ep0_len);
+-		dsync(D_EP0, got);
+-		if (cr) {
+-			((fn_data)sweet_usbdev_abi.cr_input_data)(cr, (uint8_t *)(u.dma + D_EP0), got);    /* -> state 7 */
+-		}
+-		ep0_kick();
+-		break;
+-	}
+-	case E_STATUS_IN: {
+-		void *req = u.ep0_req;
+-		u.ep0_req = NULL;
+-		if (req) {
+-			finish(req, kIOReturnSuccess, 0);       /* -> state 1 */
+-		}
+-		ep0_arm_setup();
+-		break;
+-	}
+-	case E_STATUS_OUT:
+-		if (cr) {
+-			((fn_data)sweet_usbdev_abi.cr_input_data)(cr, (uint8_t *)(u.dma + D_EP0), 0);
+-		}
+-		ep0_arm_setup();
+-		break;
+-	default:                        /* E_IDLE: the SETUP TRB */
+-		if (ep == 0) {
+-			ep0_setup_done();
+-		}
+-		break;
+-	}
+-}
+-
+-/* ---- data endpoints: one request at a time per endpoint, through its bounce buffer ---- */
+-static void
+-data_kick(unsigned ep)
+-{
+-	struct Pep *p = &u.pep[ep];
+-	while (p->active && !p->busy && !p->stalled && p->count) {
+-		void *req = p->q[p->head];
+-		uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
+-		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
+-		uint64_t left = len - p->offset;
+-		uint32_t chunk = (uint32_t)(left > D_BOUNCE_SIZE ? D_BOUNCE_SIZE : left);
+-		if (p->in) {
+-			if (chunk && (!md || md->readBytes(p->offset, (void *)(u.dma + D_BOUNCE(ep)), chunk) != chunk)) {
+-				p->head = (p->head + 1) % QDEPTH;
+-				p->count--;
+-				p->offset = 0;
+-				finish(req, kIOReturnDMAError, 0);
+-				continue;
+-			}
+-			dsync(D_BOUNCE(ep), chunk);
+-			p->trb_len = chunk;
+-		} else {
+-			uint32_t mps = (uint32_t)(p->mps > 0 ? p->mps : 512);
+-			uint32_t n = ((chunk ? chunk : 1) + mps - 1) / mps * mps;       /* OUT TRBs: whole packets */
+-			if (n > D_BOUNCE_SIZE) {
+-				n = D_BOUNCE_SIZE;
+-			}
+-			dsync(D_BOUNCE(ep), n);
+-			p->trb_len = n;
+-		}
+-		start_trb(ep, D_BOUNCE(ep), p->trb_len, TRBCTL_NORMAL);
+-		if (!p->busy) {                 /* the controller refused it */
+-			p->head = (p->head + 1) % QDEPTH;
+-			p->count--;
+-			p->offset = 0;
+-			finish(req, kIOReturnNotResponding, 0);
+-		}
+-		return;
+-	}
+-}
+-
+-static void
+-data_complete(unsigned ep)
+-{
+-	struct Pep *p = &u.pep[ep];
+-	p->busy = false;
+-	if (!p->count) {
+-		return;
+-	}
+-	void *req = p->q[p->head];
+-	uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
+-	uint32_t res = trb_residue(ep);
+-	uint32_t got = p->trb_len - (res <= p->trb_len ? res : p->trb_len);
+-	bool done;
+-	if (p->in) {
+-		p->offset += got;
+-		done = p->offset >= len || got < p->trb_len;
+-	} else {
+-		uint64_t room = len - p->offset;
+-		uint32_t take = (uint32_t)(got > room ? room : got);
+-		dsync(D_BOUNCE(ep), got);
+-		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
+-		if (take && md) {
+-			md->writeBytes(p->offset, (void *)(u.dma + D_BOUNCE(ep)), take);
+-		}
+-		p->offset += take;
+-		done = p->offset >= len || got < p->trb_len;    /* short packet ends the transfer */
+-	}
+-	if (done) {
+-		p->head = (p->head + 1) % QDEPTH;
+-		p->count--;
+-		uint64_t actual = p->offset;
+-		p->offset = 0;
+-		finish(req, kIOReturnSuccess, actual);
+-	}
+-	data_kick(ep);
+-}
+-
+-static void
+-data_cancel(unsigned ep, IOReturn status)
+-{
+-	struct Pep *p = &u.pep[ep];
+-	end_transfer(ep);
+-	p->offset = 0;
+-	while (p->count) {
+-		void *req = p->q[p->head];
+-		p->head = (p->head + 1) % QDEPTH;
+-		p->count--;
+-		finish(req, status, 0);
+-	}
+-}
+-
+-/* ---- port events ---- */
+-static void
+-port_reset(const char *why)
+-{
+-	ep0_cancel(kIOReturnAborted);
+-	for (unsigned ep = 2; ep < NPEP; ep++) {
+-		data_cancel(ep, kIOReturnAborted);
+-	}
+-	wr(DCFG, rd(DCFG) & ~(0x7fu << 3));
+-	u.need_startcfg = true;
+-	LOG("%s", why);
+-	call_base(kSlotUSBReset);       /* the family drops the configuration (deactivateEndpoint for every pipe) */
+-	ep0_arm_setup();
+-}
+-
+-static void
+-handle_event(uint32_t ev)
+-{
+-	if (ev & 1) {                   /* device event */
+-		uint32_t type = (ev >> 8) & 0xf;
+-		if (type == 1) {
+-			port_reset("bus reset");
+-		} else if (type == 2) {
+-			uint32_t sp = rd(DSTS) & 7;
+-			u.speed = sp == 0 ? kSpeedHigh : kSpeedFull;     /* DSTS.CONNECTSPD: 0 high, 1/3 full */
+-			epcmd(0, DEPCMD_SETEPCONFIG, (64u << 3) | (2u << 30), (1u << 8) | (1u << 10) | (0u << 25), 0);
+-			epcmd(1, DEPCMD_SETEPCONFIG, (64u << 3) | (2u << 30), (1u << 8) | (1u << 10) | (1u << 25), 0);
+-			LOG("connected, speed field %u", sp);
+-		} else if (type == 0) {
+-			ep0_cancel(kIOReturnAborted);
+-			LOG("disconnect");
+-			call_base(kSlotUSBReset);
+-		}
+-		return;
+-	}
+-	unsigned ep = (ev >> 1) & 0x1f;
+-	unsigned type = (ev >> 6) & 0xf;
+-	unsigned status = (ev >> 12) & 0xf;
+-	if (ep >= NPEP) {
+-		return;
+-	}
+-	if (ep <= 1) {
+-		if (type == 1) {                /* XferComplete */
+-			u.pep[ep].busy = false;
+-			ep0_complete(ep);
+-		} else if (type == 3 && status == 2) {  /* XferNotReady, control status phase */
+-			u.status_ready[ep] = true;
+-			if (ep == 1) {
+-				ep0_kick();
+-			} else {
+-				ep0_try_status_out();
+-			}
+-		}
+-		return;
+-	}
+-	if (type == 1) {
+-		data_complete(ep);
+-	}
+-}
+-
+-static IOReturn
+-process_events(OSObject *, void *, void *, void *, void *)
+-{
+-	uint32_t count = rd(GEVNTCOUNT) & 0xffff;
+-	if (!count) {
+-		return kIOReturnSuccess;
+-	}
+-	dsync(D_EVT, D_EVT_SIZE);
+-	for (uint32_t done = 0; done < count; done += 4) {
+-		uint32_t ev = *(volatile uint32_t *)(u.dma + D_EVT + u.evt_pos);
+-		u.evt_pos = (u.evt_pos + 4) % D_EVT_SIZE;
+-		if (u.events++ < 300) {
+-			LOG("event 0x%08x", ev);
+-		}
+-		handle_event(ev);
+-	}
+-	wr(GEVNTCOUNT, count);
+-	return kIOReturnSuccess;
+-}
+-
+-static void
+-poll_thread(void *, wait_result_t)
+-{
+-	for (;;) {
+-		if (rd(GEVNTCOUNT) & 0xffff) {
+-			u.loop->runAction(process_events, (OSObject *)u.obj);
+-		}
+-		IOSleep(1);
+-	}
+-}
+-
+-/* ---- the controller's methods (C++ member calling convention: this first) ---- */
+-static bool
+-m_start(void *self, IOService *provider)
+-{
+-	if (!((fn_start)u.base[kSlotStart])(self, provider)) {
+-		LOG("IOUSBDeviceController::start failed");
+-		return false;
+-	}
+-	LOG("IOUSBDeviceController::start ok; readyForHost");
+-	((fn_v)sweet_usbdev_abi.ready_for_host)(self);
+-	LOG("readyForHost done (control request %p)", control_request());
+-	return true;
+-}
+-
+-static IOWorkLoop *
+-m_get_work_loop(const void *)
+-{
+-	return u.loop;
+-}
+-
+-static void
+-set_bus(bool on)
+-{
+-	if (on) {
+-		if (u.qs) {
+-			*(volatile uint32_t *)(u.qs + QS_HS_PHY_CTRL) |= (1u << 20) | (1u << 28);    /* VBUS valid, session */
+-			*(volatile uint32_t *)(u.qs + QS_SS_PHY_CTRL) |= (1u << 24);
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-		}
+-		wr(DCTL, rd(DCTL) | DCTL_RUN_STOP);
+-	} else {
+-		wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+-	}
+-	for (int i = 0; i < 500 && ((rd(DSTS) & DSTS_DEVCTRLHLT) != 0) == on; i++) {
+-		IODelay(1000);
+-	}
+-	u.on_bus = on;
+-	LOG("bus %s (DSTS 0x%08x)", on ? "on" : "off", rd(DSTS));
+-}
+-
+-static void m_soft_disconnect(void *, uint32_t) { set_bus(false); }
+-static void m_go_on_bus(void *, bool on) { LOG("goOnBus(%d)", on); set_bus(on); }
+-static bool m_accessory_cable(void *) { return false; }
+-
+-static IOReturn
+-m_stall(void *, int address, bool stall)
+-{
+-	unsigned ep = pep_of(address);
+-	if (ep >= NPEP) {
+-		return kIOReturnBadArgument;
+-	}
+-	if (ep <= 1) {
+-		if (stall) {
+-			ep0_cancel(kIOReturnAborted);
+-			epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
+-			ep0_arm_setup();
+-		}
+-		return kIOReturnSuccess;
+-	}
+-	if (stall) {
+-		end_transfer(ep);
+-		epcmd(ep, DEPCMD_SETSTALL, 0, 0, 0);
+-		u.pep[ep].stalled = true;
+-	} else {
+-		epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
+-		u.pep[ep].stalled = false;
+-		data_kick(ep);
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_abort(void *, int address)
+-{
+-	unsigned ep = pep_of(address);
+-	if (ep >= NPEP) {
+-		return kIOReturnBadArgument;
+-	}
+-	if (ep <= 1) {
+-		ep0_cancel(kIOReturnAborted);
+-		if (u.stage == E_IDLE && !u.pep[0].busy) {
+-			ep0_arm_setup();
+-		}
+-	} else {
+-		data_cancel(ep, kIOReturnAborted);
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_set_address_pre(void *, int address)
+-{
+-	wr(DCFG, (rd(DCFG) & ~(0x7fu << 3)) | (((uint32_t)address & 0x7fu) << 3));
+-	LOG("address %d", address & 0x7f);
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn m_set_address_post(void *, int) { return kIOReturnSuccess; }
+-static int m_speed(void *) { return u.speed ? u.speed : kSpeedHigh; }      /* no cable detector: always a cable */
+-
+-static IOReturn
+-m_endpoint_ids(void *, OSArray *interfaces, uint8_t *ids)
+-{
+-	if (!interfaces || !ids) {
+-		return kIOReturnBadArgument;
+-	}
+-	unsigned next_in = 1, next_out = 1, written = 0;
+-	for (unsigned i = 0; i < interfaces->getCount(); i++) {
+-		void *intf = interfaces->getObject(i);
+-		if (!intf) {
+-			continue;
+-		}
+-		unsigned widest_in = 0, widest_out = 0;
+-		int alts = ((fn_i)sweet_usbdev_abi.if_alt_count)(intf);
+-		for (int alt = 0; alt < alts; alt++) {
+-			unsigned in = 0, out = 0;
+-			int pipes = ((fn_iu8)sweet_usbdev_abi.if_pipe_count)(intf, (uint8_t)alt);
+-			for (int p = 0; p < pipes; p++) {
+-				void *pipe = ((fn_pipe)sweet_usbdev_abi.if_pipe)(intf, p, (uint8_t)alt);
+-				int dir = pipe ? ((fn_i)sweet_usbdev_abi.pipe_dir)(pipe) : -1;
+-				if (dir == 1) {
+-					if (next_in + in > NPEP / 2 - 1) {
+-						return kIOReturnNoResources;
+-					}
+-					ids[written++] = (uint8_t)(0x80 | (next_in + in++));
+-				} else if (dir == 0) {
+-					if (next_out + out > NPEP / 2 - 1) {
+-						return kIOReturnNoResources;
+-					}
+-					ids[written++] = (uint8_t)(next_out + out++);
+-				}
+-			}
+-			widest_in = in > widest_in ? in : widest_in;
+-			widest_out = out > widest_out ? out : widest_out;
+-		}
+-		next_in += widest_in;
+-		next_out += widest_out;
+-	}
+-	LOG("endpoint ids for %u interfaces: %u numbers", interfaces->getCount(), written);
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_prepare(void *, OSArray *)
+-{
+-	u.need_startcfg = true;
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_activate(void *, int address, int type, int mps, int interval, int)
+-{
+-	unsigned ep = pep_of(address);
+-	if (ep <= 1) {
+-		return kIOReturnSuccess;
+-	}
+-	if (ep >= NPEP || mps <= 0) {
+-		return kIOReturnBadArgument;
+-	}
+-	if (type == kTypeIsoc) {
+-		LOG("isochronous endpoint 0x%x refused", address);
+-		return kIOReturnUnsupported;
+-	}
+-	if (u.need_startcfg) {          /* new configuration: transfer resources handed out again (Linux, sweet_usb.c) */
+-		epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0);
+-		u.need_startcfg = false;
+-	}
+-	struct Pep *p = &u.pep[ep];
+-	bool in = (address & 0x80) != 0;
+-	uint32_t p0 = ((uint32_t)type << 1) | ((uint32_t)mps << 3);
+-	if (in) {
+-		p0 |= ((uint32_t)address & 0xfu) << 17;         /* TX FIFO = endpoint number */
+-	}
+-	uint32_t p1 = (1u << 8) | ((uint32_t)ep << 25);    /* XferComplete event */
+-	if (type == kTypeInterrupt) {
+-		uint32_t iv = interval < 1 ? 1 : (uint32_t)interval;
+-		uint32_t m1 = u.speed == kSpeedFull ? 3 : (iv > 16 ? 15 : iv - 1);
+-		p1 |= m1 << 16;
+-	}
+-	if (epcmd(ep, DEPCMD_SETEPCONFIG, p0, p1, 0) || epcmd(ep, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		return kIOReturnError;
+-	}
+-	wr(DALEPENA, rd(DALEPENA) | (1u << ep));
+-	p->active = true;
+-	p->in = in;
+-	p->type = type;
+-	p->mps = mps;
+-	p->stalled = false;
+-	LOG("endpoint 0x%x on (type %d, %d bytes)", address, type, mps);
+-	data_kick(ep);
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_deactivate(void *, int address)
+-{
+-	unsigned ep = pep_of(address);
+-	if (ep <= 1 || ep >= NPEP) {
+-		return kIOReturnSuccess;
+-	}
+-	data_cancel(ep, kIOReturnAborted);
+-	u.pep[ep].active = false;
+-	wr(DALEPENA, rd(DALEPENA) & ~(1u << ep));
+-	return kIOReturnSuccess;
+-}
+-
+-static IOBufferMemoryDescriptor *
+-m_create_buffer(void *, IOOptionBits options, uint64_t capacity)
+-{
+-	return IOBufferMemoryDescriptor::withOptions(options, (vm_size_t)capacity, 64);
+-}
+-
+-static bool
+-m_is_stalled(void *, int address)
+-{
+-	unsigned ep = pep_of(address);
+-	return ep < NPEP && u.pep[ep].stalled;
+-}
+-
+-static IOReturn
+-m_reset_toggle(void *, int address)
+-{
+-	unsigned ep = pep_of(address);
+-	if (ep > 1 && ep < NPEP && u.pep[ep].active) {
+-		epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);          /* clears the data sequence too */
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-static void
+-m_reenumerate(void *)
+-{
+-	set_bus(false);
+-	IOSleep(100);
+-	set_bus(true);
+-}
+-
+-static IOReturn m_remote_wake(void *) { return kIOReturnUnsupported; }
+-
+-static void
+-m_cr_state_change(void *, int old_state, int new_state)
+-{
+-	LOGN("control request state %d -> %d", old_state, new_state);
+-	if (new_state == kStateOutData || new_state == kStateOutDataLong) {
+-		void *cr = control_request();
+-		uint16_t wlength = 0;
+-		if (cr) {
+-			const uint8_t *setup = (const uint8_t *)cr + 16;
+-			wlength = (uint16_t)(setup[6] | setup[7] << 8);
+-		}
+-		uint32_t n = wlength > D_EP0_SIZE ? D_EP0_SIZE : wlength;
+-		u.ep0_len = (n + 63u) & ~63u;
+-		dsync(D_EP0, u.ep0_len);
+-		u.stage = E_DATA_OUT;
+-		start_trb(0, D_EP0, u.ep0_len, TRBCTL_DATA);
+-	} else if (new_state == kStateOutStatus) {
+-		u.status_out_wanted = true;
+-		ep0_try_status_out();
+-	}
+-}
+-
+-static IOReturn
+-m_io_gated(void *, void *req)
+-{
+-	int address = rget<int32_t>(req, REQ_ENDPOINT);
+-	if (!((unsigned)address & 0x7fu)) {
+-		if (!((unsigned)address & 0x80u)) {
+-			return kIOReturnUnsupported;    /* OUT data arrives through inputDataPacket */
+-		}
+-		if (u.ep0_count == 8) {
+-			return kIOReturnNoResources;
+-		}
+-		u.ep0_q[(u.ep0_head + u.ep0_count++) % 8] = req;
+-		ep0_kick();
+-		return kIOReturnSuccess;
+-	}
+-	unsigned ep = pep_of(address);
+-	if (ep >= NPEP || !u.pep[ep].active) {
+-		return kIOReturnNotReady;
+-	}
+-	if (rget<uint8_t>(req, REQ_ISOC)) {
+-		return kIOReturnUnsupported;
+-	}
+-	struct Pep *p = &u.pep[ep];
+-	if (p->count == QDEPTH) {
+-		return kIOReturnNoResources;
+-	}
+-	p->q[(p->head + p->count++) % QDEPTH] = req;
+-	data_kick(ep);
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-m_buffer_options(void *, uint32_t *options)
+-{
+-	*options = 0;
+-	return kIOReturnSuccess;
+-}
+-
+-/* ---- start-up ---- */
+-bool
+-sweet_usbdev_available(void)
+-{
+-	return sweet_usbdev_abi.magic == SWEET_USBDEV_ABI_FILLED && sweet_usbdev_abi.vtable && sweet_usbdev_abi.ctor &&
+-	       sweet_usbdev_abi.ready_for_host && sweet_usbdev_abi.complete_io && sweet_usbdev_abi.cr_input_setup;
+-}
+-
+-static bool
+-hw_init(void)
+-{
+-	wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (rd(DCTL) & DCTL_CSFTRST); i++) {
+-		IODelay(1000);
+-	}
+-	if (rd(DCTL) & DCTL_CSFTRST) {
+-		LOG("soft reset stuck");
+-		return false;
+-	}
+-	wr(GEVNTADRLO, (uint32_t)(u.dma_pa + D_EVT));
+-	wr(GEVNTADRHI, (uint32_t)((u.dma_pa + D_EVT) >> 32));
+-	wr(GEVNTSIZ, (1u << 31) | D_EVT_SIZE);           /* interrupt masked: polled */
+-	wr(GEVNTCOUNT, rd(GEVNTCOUNT) & 0xffff);
+-	u.evt_pos = 0;
+-	wr(DCFG, rd(DCFG) & ~(7u | (0x7fu << 3)));      /* high speed, address 0 */
+-	wr(DEVTEN, 0x7);                                /* disconnect, reset, connect done */
+-	if (epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    epcmd(0, DEPCMD_SETEPCONFIG, (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    epcmd(1, DEPCMD_SETEPCONFIG, (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		LOG("endpoint 0 setup failed");
+-		return false;
+-	}
+-	wr(DALEPENA, 0x3);
+-	ep0_arm_setup();
+-	return true;
+-}
+-
+-bool
+-sweet_usbdev_start(vm_offset_t dwc, vm_offset_t qscratch)
+-{
+-	const char *why = NULL;
+-	if (!sweet_usbdev_available()) {
+-		LOG("no IOUSBDeviceFamily address table (image without the prelinked kexts)");
+-		return false;
+-	}
+-	u.dwc = dwc;
+-	u.qs = qscratch;
+-	if (OSKext::loadKextWithIdentifier("com.apple.iokit.IOUSBDeviceFamily", false) != kOSReturnSuccess) {
+-		LOG("IOUSBDeviceFamily did not load");
+-		return false;
+-	}
+-	OSKext::loadKextWithIdentifier("com.apple.driver.AppleUSBDeviceMux", false);
+-	const OSMetaClass *meta = (const OSMetaClass *)sweet_usbdev_abi.meta;
+-	LOG("IOUSBDeviceFamily loaded; IOUSBDeviceController metaclass size %u", meta ? meta->getClassSize() : 0);
+-	if (!meta || meta->getClassSize() != CTRL_SIZE) {
+-		LOG("IOUSBDeviceController is not the iOS 16.5 one: not starting");
+-		return false;
+-	}
+-	if (sweet_usb_dma_alloc(D_SIZE, &u.dma, &u.dma_pa) != 0) {
+-		LOG("no DMA memory below 4 GiB");
+-		return false;
+-	}
+-	LOG("DMA area 0x%llx (%u KiB)", u.dma_pa, D_SIZE / 1024);
+-
+-	/* the subclass: Apple's vtable with our methods */
+-	memcpy(sw_vt, (const void *)sweet_usbdev_abi.vtable, sizeof(sw_vt));
+-	u.base = (void **)(sweet_usbdev_abi.vtable + 16);
+-	void **vt = &sw_vt[2];
+-	vt[kSlotStart] = (void *)&m_start;
+-	vt[kSlotGetWorkLoop] = (void *)&m_get_work_loop;
+-	vt[kSlotSoftDisconnect] = (void *)&m_soft_disconnect;
+-	vt[kSlotGoOnBus] = (void *)&m_go_on_bus;
+-	vt[kSlotAccessoryCable] = (void *)&m_accessory_cable;
+-	vt[kSlotStall] = (void *)&m_stall;
+-	vt[kSlotAbort] = (void *)&m_abort;
+-	vt[kSlotSetAddressPre] = (void *)&m_set_address_pre;
+-	vt[kSlotSetAddressPost] = (void *)&m_set_address_post;
+-	vt[kSlotSpeed] = (void *)&m_speed;
+-	vt[kSlotEndpointIDs] = (void *)&m_endpoint_ids;
+-	vt[kSlotPrepareConfig] = (void *)&m_prepare;
+-	vt[kSlotActivate] = (void *)&m_activate;
+-	vt[kSlotDeactivate] = (void *)&m_deactivate;
+-	vt[kSlotCreateBuffer] = (void *)&m_create_buffer;
+-	vt[kSlotIsStalled] = (void *)&m_is_stalled;
+-	vt[kSlotResetToggle] = (void *)&m_reset_toggle;
+-	vt[kSlotReEnumerate] = (void *)&m_reenumerate;
+-	vt[kSlotRemoteWake] = (void *)&m_remote_wake;
+-	vt[kSlotCRStateChange] = (void *)&m_cr_state_change;
+-	vt[kSlotIOGated] = (void *)&m_io_gated;
+-	vt[kSlotBufferOptions] = (void *)&m_buffer_options;
+-
+-	u.obj = IOMallocZero(1024);
+-	u.loop = IOWorkLoop::workLoop();
+-	if (!u.obj || !u.loop) {
+-		LOG("out of memory");
+-		return false;
+-	}
+-	((fn_vp)sweet_usbdev_abi.ctor)(u.obj, (void *)meta);
+-	*(void ***)u.obj = vt;
+-	IOService *svc = (IOService *)u.obj;
+-
+-	/* provider: a nub with the configuration the family's start looks up ("configuration-string", parents too) */
+-	char config[64] = "standardBringup";
+-	PE_parse_boot_argn("sweetusbconfig", config, sizeof(config));
+-	IOService *nub = new IOService;
+-	if (!nub || !nub->init()) {
+-		LOG("no provider nub");
+-		return false;
+-	}
+-	nub->setName("usb-device");
+-	nub->setProperty("configuration-string", config);
+-	if (!nub->attach(IOService::getPlatform() ? (IOService *)IOService::getPlatform() : IOService::getServiceRoot())) {
+-		LOG("nub attach failed");
+-		return false;
+-	}
+-	if (!svc->init()) {
+-		why = "init";
+-	} else if (!hw_init()) {
+-		why = "DWC3 set-up";
+-	} else if (!svc->attach(nub)) {
+-		why = "attach";
+-	} else if (!svc->start(nub)) {
+-		why = "start";
+-	}
+-	if (why) {
+-		LOG("controller %s failed", why);
+-		return false;
+-	}
+-	thread_t th;
+-	if (kernel_thread_start(poll_thread, NULL, &th) == KERN_SUCCESS) {
+-		thread_deallocate(th);
+-	}
+-	LOG("controller up (configuration %s): waiting for the family's goOnBus", config);
+-	return true;
+-}
+-
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++/*
++ * OnePlus 7T (0217): the phone's DWC3 (USB 2.0 device mode) as a backend of Apple's own IOUSBDeviceController
++ * (com.apple.iokit.IOUSBDeviceFamily 2.0.0 from the iPhone X iOS 16.5 kernelcache, prelinked into this kernel by
++ * tools/kcbuild.py together with AppleUSBCommon and AppleUSBDeviceMux). Apple's family does everything above the
++ * controller: descriptors, the EP0 request state machine (IOUSBDeviceControlRequest), the functions' interfaces
++ * (AppleUSBDeviceMux = usbmux for lockdownd / iTunes / Finder), the serial number from /chosen unique-chip-id.
++ *
++ * The family is not part of this build, so the subclass is made by hand: an object laid out as Apple's
++ * IOUSBDeviceController (its constructor runs on it), then its vtable pointer set to a copy of Apple's vtable with
++ * our methods in the slots below. Slots, offsets and addresses: tools/abi-IOUSBDeviceController-ios16.5.txt and
++ * NOTES.md (2026-11-13); the addresses are written by kcbuild.py into sweet_usbdev_abi after linking (no Apple
++ * address is in this source). If the table is empty (an image without the kexts) nothing here runs.
++ *
++ * Contract (Apple's DWC3 backend AppleUSBXDCI and SwitchXUDC in brunostjohn/ios-on-switch-lmao implement the same):
++ * - setup packets go to controlRequest->inputSetupPacket() + processSetupPacket();
++ * - io() requests reach ioGated() inside the family's command gate on our work loop; completion = status (+0x28)
++ *   and actual (+0x48) into the request, then completeEndpointIO();
++ * - EP0: IN data and the device's IN status come as io(0x80) (a zero-length one in state 7 is the status stage); the
++ *   OUT data stage (state 5/6) and the host's OUT status (state 8) are announced by handleControlRequestStateChange()
++ *   and both end in inputDataPacket();
++ * - once the functions are ready the family's startUSBStack asks getConnectionSpeed(): anything but -1 means a cable,
++ *   so handleUSBCableConnect() -> goOnBus(true).
++ * DWC3 side as bsd/dev/sweet_usb.c (Synopsys databook, Linux drivers/usb/dwc3): events polled every millisecond by a
++ * thread that hands them to the work loop (runAction holds the gate the family's command gate uses), one TRB per
++ * transfer, bounce buffers below 4 GiB (the SMMU identity window for SID 0x140), cache cleaned/invalidated by hand.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSKext.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSDictionary.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern "C" {
++/* filled by tools/kcbuild.py (Apple kernelcache addresses relinked to this kernel); magic says so */
++struct sweet_usbdev_abi {
++	uint64_t magic;
++	uint64_t vtable;                /* IOUSBDeviceController's vtable symbol (slots at +16) */
++	uint64_t meta;                  /* IOUSBDeviceController::gMetaClass */
++	uint64_t ctor;                  /* IOUSBDeviceController::IOUSBDeviceController(const OSMetaClass *) */
++	uint64_t ready_for_host;        /* IOUSBDeviceController::readyForHost() */
++	uint64_t complete_io;           /* IOUSBDeviceController::completeEndpointIO(_IOUSBDeviceIORequestTag *) */
++	uint64_t cr_input_setup;        /* IOUSBDeviceControlRequest::inputSetupPacket(uint8_t *) */
++	uint64_t cr_process_setup;      /* IOUSBDeviceControlRequest::processSetupPacket() */
++	uint64_t cr_input_data;         /* IOUSBDeviceControlRequest::inputDataPacket(uint8_t *, uint64_t) */
++	uint64_t cr_reset;              /* IOUSBDeviceControlRequest::reset() */
++	uint64_t cr_stall;              /* IOUSBDeviceControlRequest::stallSetupRequest() */
++	uint64_t if_alt_count;          /* IOUSBDeviceInterface::getAlternateSettingCount() const */
++	uint64_t if_pipe_count;         /* IOUSBDeviceInterface::getPipeCountForAlternateSetting(uint8_t) */
++	uint64_t if_pipe;               /* IOUSBDeviceInterface::getPipeForAlternateSetting(int, uint8_t) */
++	uint64_t pipe_dir;              /* IOUSBDevicePipe::getDirection() */
++	uint64_t reserved[9];
++};
++#define SWEET_USBDEV_ABI_EMPTY  0x59544d45495841ull     /* "AXIEMTY": as built */
++#define SWEET_USBDEV_ABI_FILLED 0x44454c4c49465841ull   /* "AXFILLED": kcbuild.py wrote it */
++__attribute__((used, section("__DATA,__sweetusbabi")))
++struct sweet_usbdev_abi sweet_usbdev_abi = { SWEET_USBDEV_ABI_EMPTY, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 } };
++
++bool sweet_usbdev_available(void);
++bool sweet_usbdev_start(vm_offset_t dwc, vm_offset_t qscratch);
++extern void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
++extern int sweet_usb_dma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa);    /* sweet_usb.c */
++}
++
++/* ---- Apple's class: slots (from the first virtual) and fields, iOS 16.5 ---- */
++enum {
++	kSlotStart = 86, kSlotGetWorkLoop = 111,
++	kSlotSoftDisconnect = 175, kSlotGoOnBus = 177, kSlotAccessoryCable = 179, kSlotStall = 180, kSlotAbort = 181,
++	kSlotSetAddressPre = 182, kSlotSetAddressPost = 183, kSlotSpeed = 184, kSlotEndpointIDs = 185,
++	kSlotPrepareConfig = 186, kSlotActivate = 187, kSlotDeactivate = 188, kSlotCreateBuffer = 189,
++	kSlotIsStalled = 192, kSlotResetToggle = 193, kSlotUSBSuspend = 195, kSlotUSBReset = 196, kSlotUSBResume = 197,
++	kSlotReEnumerate = 198, kSlotRemoteWake = 201, kSlotCRStateChange = 213, kSlotIOGated = 225,
++	kSlotBufferOptions = 231,
++	kSlots = 232,
++};
++#define CTRL_SIZE               504             /* sizeof(IOUSBDeviceController) */
++#define CTRL_CONTROL_REQUEST    0x1b8           /* IOUSBDeviceControlRequest *, made by readyForHost */
++#define CR_STATE                12              /* IOUSBDeviceControlRequest: int state */
++/* _IOUSBDeviceIORequestTag */
++#define REQ_ENDPOINT            0x00            /* int */
++#define REQ_BUFFER              0x08            /* IOMemoryDescriptor * */
++#define REQ_STATUS              0x28            /* IOReturn */
++#define REQ_ISOC                0x30            /* uint8_t */
++#define REQ_LENGTH              0x40            /* uint64_t */
++#define REQ_ACTUAL              0x48            /* uint64_t */
++enum { kStateOutData = 5, kStateOutDataLong = 6, kStateInStatus = 7, kStateOutStatus = 8 };
++enum { kTypeIsoc = 1, kTypeBulk = 2, kTypeInterrupt = 3 };
++enum { kSpeedFull = 1, kSpeedHigh = 2 };
++
++/* ---- DWC3 ---- */
++#define GEVNTADRLO      0xc400
++#define GEVNTADRHI      0xc404
++#define GEVNTSIZ        0xc408
++#define GEVNTCOUNT      0xc40c
++#define DCFG            0xc700
++#define DCTL            0xc704
++#define DEVTEN          0xc708
++#define DSTS            0xc70c
++#define DALEPENA        0xc720
++#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
++#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
++#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
++#define DEPCMD(n)       (0xc80c + 0x10 * (n))
++#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_CSFTRST    (1u << 30)
++#define DSTS_DEVCTRLHLT (1u << 22)
++#define DEPCMD_SETEPCONFIG      1
++#define DEPCMD_SETTRANSFRESOURCE 2
++#define DEPCMD_CLEARSTALL       5
++#define DEPCMD_SETSTALL         4
++#define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
++#define DEPCMD_CMDACT           (1u << 10)
++#define TRB_HWO         (1u << 0)
++#define TRB_LST         (1u << 1)
++#define TRB_ISP_IMI     (1u << 10)
++#define TRB_IOC         (1u << 11)
++#define TRBCTL_NORMAL   (1u << 4)
++#define TRBCTL_SETUP    (2u << 4)
++#define TRBCTL_STATUS2  (3u << 4)
++#define TRBCTL_STATUS3  (4u << 4)
++#define TRBCTL_DATA     (5u << 4)
++#define QS_HS_PHY_CTRL  0x10
++#define QS_SS_PHY_CTRL  0x30
++
++/* DMA area: event buffer, one TRB per physical endpoint, setup packet, EP0 buffer, then the bounce buffers */
++#define D_EVT           0x00000
++#define D_EVT_SIZE      0x1000
++#define D_TRB(ep)       (0x01000 + 64 * (ep))   /* own cache line each: a clean must not overwrite another's */
++#define D_SETUP         0x01800
++#define D_EP0           0x02000
++#define D_EP0_SIZE      0x4000
++#define D_BOUNCE(ep)    (0x08000 + (uint32_t)((ep) - 2) * D_BOUNCE_SIZE)
++#define D_BOUNCE_SIZE   0x8000
++#define NPEP            16                              /* physical endpoints used: EP0..EP7 both ways */
++#define D_SIZE          (0x08000 + (NPEP - 2) * D_BOUNCE_SIZE)
++#define QDEPTH          32
++
++typedef void (*fn_v)(void *);
++typedef void (*fn_vp)(void *, void *);
++typedef void (*fn_data)(void *, uint8_t *, uint64_t);
++typedef int (*fn_i)(void *);
++typedef int (*fn_iu8)(void *, uint8_t);
++typedef void *(*fn_pipe)(void *, int, uint8_t);
++typedef bool (*fn_start)(void *, IOService *);
++
++enum Ep0Stage { E_IDLE, E_DATA_IN, E_DATA_OUT, E_STATUS_IN, E_STATUS_OUT };
++
++struct Pep {                    /* one physical endpoint (2n = OUT, 2n+1 = IN) */
++	bool active, in, stalled, busy, prepared;      /* prepared: the head request's buffer is wired */
++	int type, mps;
++	uint32_t res;                   /* transfer resource index after STARTTRANSFER */
++	void *q[QDEPTH];
++	unsigned head, count;
++	uint64_t offset;                /* bytes of the head request done */
++	uint32_t trb_len;
++};
++
++static struct {
++	void *obj;                      /* the controller (Apple's layout, our vtable) */
++	void **base;                    /* Apple's IOUSBDeviceController slots */
++	vm_offset_t dwc, qs, dma;
++	uint64_t dma_pa;
++	uint32_t evt_pos;
++	IOWorkLoop *loop;
++	bool on_bus, need_startcfg, data_stage;
++	int speed;
++	Ep0Stage stage;
++	void *ep0_req;                  /* the family's IN request in flight on EP0 */
++	void *ep0_q[8];
++	unsigned ep0_head, ep0_count;
++	bool status_ready[2];           /* XferNotReady (control status) seen on physical EP0 / EP1 */
++	bool status_out_wanted;
++	uint32_t ep0_len;
++	struct Pep pep[NPEP];
++	uint32_t events, logged;
++} u;
++
++static void *sw_vt[2 + kSlots] __attribute__((aligned(16)));
++
++#define LOG(fmt, ...) printf("HOTDOGB USBDEV: " fmt "\n", ##__VA_ARGS__)
++#define LOGN(fmt, ...) do { if (u.logged++ < 400) LOG(fmt, ##__VA_ARGS__); } while (0)
++
++/* ---- small helpers ---- */
++static inline void
++wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(u.dwc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(u.dwc + off);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return v;
++}
++
++static void
++dsync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(u.dma + off), len ? len : 1, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++template <typename T> static inline T
++rget(void *req, size_t off)
++{
++	return *(T *)((uint8_t *)req + off);
++}
++
++template <typename T> static inline void
++rput(void *req, size_t off, T v)
++{
++	*(T *)((uint8_t *)req + off) = v;
++}
++
++static void *
++control_request(void)
++{
++	return *(void **)((uint8_t *)u.obj + CTRL_CONTROL_REQUEST);
++}
++
++static int
++cr_state(void)
++{
++	void *cr = control_request();
++	return cr ? *(volatile int *)((uint8_t *)cr + CR_STATE) : -1;
++}
++
++static unsigned
++pep_of(int address)
++{
++	return ((unsigned)address & 0xfu) * 2 + (((unsigned)address & 0x80u) ? 1 : 0);
++}
++
++static int
++epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	wr(DEPCMDPAR0(ep), p0);
++	wr(DEPCMDPAR1(ep), p1);
++	wr(DEPCMDPAR2(ep), p2);
++	wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = rd(DEPCMD(ep));
++		if (!(v & DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				LOGN("ep%u cmd 0x%x status %u", ep, cmd & 0xf, status);
++				return -1;
++			}
++			return 0;
++		}
++		IODelay(1);
++	}
++	LOGN("ep%u cmd 0x%x timeout", ep, cmd & 0xf);
++	return -1;
++}
++
++static void
++start_trb(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(u.dma + D_TRB(ep));
++	uint64_t bpa = u.dma_pa + buf;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	dsync(D_TRB(ep), 16);
++	uint64_t tpa = u.dma_pa + D_TRB(ep);
++	if (epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0) {
++		u.pep[ep].res = (rd(DEPCMD(ep)) >> 16) & 0x7fu;
++		u.pep[ep].busy = true;
++	}
++}
++
++static uint32_t
++trb_residue(unsigned ep)
++{
++	dsync(D_TRB(ep), 16);
++	return *(volatile uint32_t *)(u.dma + D_TRB(ep) + 8) & 0xffffff;
++}
++
++static void
++end_transfer(unsigned ep)
++{
++	if (u.pep[ep].busy) {
++		epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | (u.pep[ep].res << 16), 0, 0, 0);
++		u.pep[ep].busy = false;
++	}
++}
++
++static void
++finish(void *req, IOReturn status, uint64_t actual)
++{
++	rput<int32_t>(req, REQ_STATUS, status);
++	rput<uint64_t>(req, REQ_ACTUAL, actual);
++	((fn_vp)sweet_usbdev_abi.complete_io)(u.obj, req);
++}
++
++/* readBytes/writeBytes need the descriptor wired (development kernels panic "IOGMD: not wired for the
++ * IODMACommand" otherwise): prepare() before, complete() after */
++static bool
++buf_prepare(void *req)
++{
++	IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
++	return !md || md->prepare() == kIOReturnSuccess;
++}
++
++static void
++buf_complete(void *req)
++{
++	IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
++	if (md) {
++		md->complete();
++	}
++}
++
++static void
++call_base(int slot)
++{
++	((fn_v)u.base[slot])(u.obj);
++}
++
++/* ---- EP0 ---- */
++static void
++ep0_arm_setup(void)
++{
++	u.stage = E_IDLE;
++	u.status_ready[0] = u.status_ready[1] = false;
++	u.status_out_wanted = false;
++	start_trb(0, D_SETUP, 8, TRBCTL_SETUP);
++}
++
++static void
++ep0_cancel(IOReturn status)
++{
++	end_transfer(0);
++	end_transfer(1);
++	void *pending[9];
++	unsigned n = 0;
++	if (u.ep0_req) {
++		pending[n++] = u.ep0_req;
++	}
++	u.ep0_req = NULL;
++	while (u.ep0_count) {
++		pending[n++] = u.ep0_q[u.ep0_head];
++		u.ep0_head = (u.ep0_head + 1) % 8;
++		u.ep0_count--;
++	}
++	u.stage = E_IDLE;
++	for (unsigned i = 0; i < n; i++) {
++		finish(pending[i], kIOReturnAborted, 0);
++	}
++}
++
++/* the family's EP0 IN requests: data stages, or the device's status (zero length in state 7) */
++static void
++ep0_kick(void)
++{
++	while (u.stage == E_IDLE && u.ep0_count && !u.ep0_req) {
++		void *req = u.ep0_q[u.ep0_head];
++		uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
++		if (len == 0 && cr_state() == kStateInStatus) {
++			if (!u.status_ready[1]) {
++				return;                 /* status stage starts on XferNotReady (control status) */
++			}
++			u.ep0_head = (u.ep0_head + 1) % 8;
++			u.ep0_count--;
++			u.ep0_req = req;
++			u.stage = E_STATUS_IN;
++			start_trb(1, D_EP0, 0, u.data_stage ? TRBCTL_STATUS3 : TRBCTL_STATUS2);
++			return;
++		}
++		u.ep0_head = (u.ep0_head + 1) % 8;
++		u.ep0_count--;
++		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
++		bool ok = len <= D_EP0_SIZE;
++		if (ok && len) {
++			ok = md && md->prepare() == kIOReturnSuccess;
++			if (ok) {
++				ok = md->readBytes(0, (void *)(u.dma + D_EP0), len) == len;
++				md->complete();
++			}
++		}
++		if (!ok) {
++			finish(req, kIOReturnNoResources, 0);
++			continue;
++		}
++		dsync(D_EP0, (uint32_t)len);
++		u.ep0_req = req;
++		u.ep0_len = (uint32_t)len;
++		u.stage = E_DATA_IN;
++		start_trb(1, D_EP0, (uint32_t)len, TRBCTL_DATA);
++	}
++}
++
++static void
++ep0_try_status_out(void)
++{
++	if (u.status_out_wanted && u.status_ready[0] && u.stage == E_IDLE) {
++		u.status_out_wanted = false;
++		u.stage = E_STATUS_OUT;
++		start_trb(0, D_EP0, 0, TRBCTL_STATUS3);
++	}
++}
++
++static void
++ep0_setup_done(void)
++{
++	uint8_t pkt[8];
++	dsync(D_SETUP, 8);
++	memcpy(pkt, (void *)(u.dma + D_SETUP), 8);
++	uint16_t wlength = (uint16_t)(pkt[6] | pkt[7] << 8);
++	LOGN("setup %02x %02x %02x%02x %02x%02x len %u", pkt[0], pkt[1], pkt[3], pkt[2], pkt[5], pkt[4], wlength);
++	u.data_stage = wlength != 0;
++	u.stage = E_IDLE;
++	void *cr = control_request();
++	if (!cr) {
++		epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++		ep0_arm_setup();
++		return;
++	}
++	((fn_vp)sweet_usbdev_abi.cr_input_setup)(cr, pkt);
++	((fn_v)sweet_usbdev_abi.cr_process_setup)(cr);
++	ep0_kick();
++}
++
++static void
++ep0_complete(unsigned ep)
++{
++	Ep0Stage done = u.stage;
++	void *cr = control_request();
++	u.stage = E_IDLE;
++	switch (done) {
++	case E_DATA_IN: {
++		void *req = u.ep0_req;
++		u.ep0_req = NULL;
++		uint32_t res = trb_residue(1);
++		if (req) {
++			finish(req, kIOReturnSuccess, u.ep0_len - (res <= u.ep0_len ? res : u.ep0_len));     /* -> state 8 */
++		}
++		ep0_try_status_out();
++		ep0_kick();
++		break;
++	}
++	case E_DATA_OUT: {
++		uint32_t res = trb_residue(0);
++		uint32_t got = u.ep0_len - (res <= u.ep0_len ? res : u.ep0_len);
++		dsync(D_EP0, got);
++		if (cr) {
++			((fn_data)sweet_usbdev_abi.cr_input_data)(cr, (uint8_t *)(u.dma + D_EP0), got);    /* -> state 7 */
++		}
++		ep0_kick();
++		break;
++	}
++	case E_STATUS_IN: {
++		void *req = u.ep0_req;
++		u.ep0_req = NULL;
++		if (req) {
++			finish(req, kIOReturnSuccess, 0);       /* -> state 1 */
++		}
++		ep0_arm_setup();
++		break;
++	}
++	case E_STATUS_OUT:
++		if (cr) {
++			((fn_data)sweet_usbdev_abi.cr_input_data)(cr, (uint8_t *)(u.dma + D_EP0), 0);
++		}
++		ep0_arm_setup();
++		break;
++	default:                        /* E_IDLE: the SETUP TRB */
++		if (ep == 0) {
++			ep0_setup_done();
++		}
++		break;
++	}
++}
++
++/* ---- data endpoints: one request at a time per endpoint, through its bounce buffer ---- */
++static void
++data_kick(unsigned ep)
++{
++	struct Pep *p = &u.pep[ep];
++	while (p->active && !p->busy && !p->stalled && p->count) {
++		void *req = p->q[p->head];
++		uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
++		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
++		uint64_t left = len - p->offset;
++		uint32_t chunk = (uint32_t)(left > D_BOUNCE_SIZE ? D_BOUNCE_SIZE : left);
++		if (!p->prepared) {
++			if (!buf_prepare(req)) {
++				p->head = (p->head + 1) % QDEPTH;
++				p->count--;
++				p->offset = 0;
++				finish(req, kIOReturnNoMemory, 0);
++				continue;
++			}
++			p->prepared = true;
++		}
++		if (p->in) {
++			if (chunk && (!md || md->readBytes(p->offset, (void *)(u.dma + D_BOUNCE(ep)), chunk) != chunk)) {
++				p->head = (p->head + 1) % QDEPTH;
++				p->count--;
++				p->offset = 0;
++				buf_complete(req);
++				p->prepared = false;
++				finish(req, kIOReturnDMAError, 0);
++				continue;
++			}
++			dsync(D_BOUNCE(ep), chunk);
++			p->trb_len = chunk;
++		} else {
++			uint32_t mps = (uint32_t)(p->mps > 0 ? p->mps : 512);
++			uint32_t n = ((chunk ? chunk : 1) + mps - 1) / mps * mps;       /* OUT TRBs: whole packets */
++			if (n > D_BOUNCE_SIZE) {
++				n = D_BOUNCE_SIZE;
++			}
++			dsync(D_BOUNCE(ep), n);
++			p->trb_len = n;
++		}
++		start_trb(ep, D_BOUNCE(ep), p->trb_len, TRBCTL_NORMAL);
++		if (!p->busy) {                 /* the controller refused it */
++			p->head = (p->head + 1) % QDEPTH;
++			p->count--;
++			p->offset = 0;
++			buf_complete(req);
++			p->prepared = false;
++			finish(req, kIOReturnNotResponding, 0);
++		}
++		return;
++	}
++}
++
++static void
++data_complete(unsigned ep)
++{
++	struct Pep *p = &u.pep[ep];
++	p->busy = false;
++	if (!p->count) {
++		return;
++	}
++	void *req = p->q[p->head];
++	uint64_t len = rget<uint64_t>(req, REQ_LENGTH);
++	uint32_t res = trb_residue(ep);
++	uint32_t got = p->trb_len - (res <= p->trb_len ? res : p->trb_len);
++	bool done;
++	if (p->in) {
++		p->offset += got;
++		done = p->offset >= len || got < p->trb_len;
++	} else {
++		uint64_t room = len - p->offset;
++		uint32_t take = (uint32_t)(got > room ? room : got);
++		dsync(D_BOUNCE(ep), got);
++		IOMemoryDescriptor *md = rget<IOMemoryDescriptor *>(req, REQ_BUFFER);
++		if (take && md) {
++			md->writeBytes(p->offset, (void *)(u.dma + D_BOUNCE(ep)), take);
++		}
++		p->offset += take;
++		done = p->offset >= len || got < p->trb_len;    /* short packet ends the transfer */
++	}
++	if (done) {
++		p->head = (p->head + 1) % QDEPTH;
++		p->count--;
++		uint64_t actual = p->offset;
++		p->offset = 0;
++		buf_complete(req);
++		p->prepared = false;
++		finish(req, kIOReturnSuccess, actual);
++	}
++	data_kick(ep);
++}
++
++static void
++data_cancel(unsigned ep, IOReturn status)
++{
++	struct Pep *p = &u.pep[ep];
++	end_transfer(ep);
++	p->offset = 0;
++	if (p->prepared && p->count) {
++		buf_complete(p->q[p->head]);
++	}
++	p->prepared = false;
++	while (p->count) {
++		void *req = p->q[p->head];
++		p->head = (p->head + 1) % QDEPTH;
++		p->count--;
++		finish(req, status, 0);
++	}
++}
++
++/* ---- port events ---- */
++static void
++port_reset(const char *why)
++{
++	ep0_cancel(kIOReturnAborted);
++	for (unsigned ep = 2; ep < NPEP; ep++) {
++		data_cancel(ep, kIOReturnAborted);
++	}
++	wr(DCFG, rd(DCFG) & ~(0x7fu << 3));
++	u.need_startcfg = true;
++	LOG("%s", why);
++	call_base(kSlotUSBReset);       /* the family drops the configuration (deactivateEndpoint for every pipe) */
++	ep0_arm_setup();
++}
++
++static void
++handle_event(uint32_t ev)
++{
++	if (ev & 1) {                   /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {
++			port_reset("bus reset");
++		} else if (type == 2) {
++			uint32_t sp = rd(DSTS) & 7;
++			u.speed = sp == 0 ? kSpeedHigh : kSpeedFull;     /* DSTS.CONNECTSPD: 0 high, 1/3 full */
++			epcmd(0, DEPCMD_SETEPCONFIG, (64u << 3) | (2u << 30), (1u << 8) | (1u << 10) | (0u << 25), 0);
++			epcmd(1, DEPCMD_SETEPCONFIG, (64u << 3) | (2u << 30), (1u << 8) | (1u << 10) | (1u << 25), 0);
++			LOG("connected, speed field %u", sp);
++		} else if (type == 0) {
++			ep0_cancel(kIOReturnAborted);
++			LOG("disconnect");
++			call_base(kSlotUSBReset);
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++	if (ep >= NPEP) {
++		return;
++	}
++	if (ep <= 1) {
++		if (type == 1) {                /* XferComplete */
++			u.pep[ep].busy = false;
++			ep0_complete(ep);
++		} else if (type == 3 && status == 2) {  /* XferNotReady, control status phase */
++			u.status_ready[ep] = true;
++			if (ep == 1) {
++				ep0_kick();
++			} else {
++				ep0_try_status_out();
++			}
++		}
++		return;
++	}
++	if (type == 1) {
++		data_complete(ep);
++	}
++}
++
++static IOReturn
++process_events(OSObject *, void *, void *, void *, void *)
++{
++	uint32_t count = rd(GEVNTCOUNT) & 0xffff;
++	if (!count) {
++		return kIOReturnSuccess;
++	}
++	dsync(D_EVT, D_EVT_SIZE);
++	for (uint32_t done = 0; done < count; done += 4) {
++		uint32_t ev = *(volatile uint32_t *)(u.dma + D_EVT + u.evt_pos);
++		u.evt_pos = (u.evt_pos + 4) % D_EVT_SIZE;
++		if (u.events++ < 300) {
++			LOG("event 0x%08x", ev);
++		}
++		handle_event(ev);
++	}
++	wr(GEVNTCOUNT, count);
++	return kIOReturnSuccess;
++}
++
++static void
++poll_thread(void *, wait_result_t)
++{
++	for (;;) {
++		if (rd(GEVNTCOUNT) & 0xffff) {
++			u.loop->runAction(process_events, (OSObject *)u.obj);
++		}
++		IOSleep(1);
++	}
++}
++
++/* ---- the controller's methods (C++ member calling convention: this first) ---- */
++static bool
++m_start(void *self, IOService *provider)
++{
++	if (!((fn_start)u.base[kSlotStart])(self, provider)) {
++		LOG("IOUSBDeviceController::start failed");
++		return false;
++	}
++	LOG("IOUSBDeviceController::start ok; readyForHost");
++	((fn_v)sweet_usbdev_abi.ready_for_host)(self);
++	LOG("readyForHost done (control request %p)", control_request());
++	return true;
++}
++
++static IOWorkLoop *
++m_get_work_loop(const void *)
++{
++	return u.loop;
++}
++
++static void
++set_bus(bool on)
++{
++	if (on) {
++		if (u.qs) {
++			*(volatile uint32_t *)(u.qs + QS_HS_PHY_CTRL) |= (1u << 20) | (1u << 28);    /* VBUS valid, session */
++			*(volatile uint32_t *)(u.qs + QS_SS_PHY_CTRL) |= (1u << 24);
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		wr(DCTL, rd(DCTL) | DCTL_RUN_STOP);
++	} else {
++		wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
++	}
++	for (int i = 0; i < 500 && ((rd(DSTS) & DSTS_DEVCTRLHLT) != 0) == on; i++) {
++		IODelay(1000);
++	}
++	u.on_bus = on;
++	LOG("bus %s (DSTS 0x%08x)", on ? "on" : "off", rd(DSTS));
++}
++
++static void m_soft_disconnect(void *, uint32_t) { set_bus(false); }
++static void m_go_on_bus(void *, bool on) { LOG("goOnBus(%d)", on); set_bus(on); }
++static bool m_accessory_cable(void *) { return false; }
++
++static IOReturn
++m_stall(void *, int address, bool stall)
++{
++	unsigned ep = pep_of(address);
++	if (ep >= NPEP) {
++		return kIOReturnBadArgument;
++	}
++	if (ep <= 1) {
++		if (stall) {
++			ep0_cancel(kIOReturnAborted);
++			epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++			ep0_arm_setup();
++		}
++		return kIOReturnSuccess;
++	}
++	if (stall) {
++		end_transfer(ep);
++		epcmd(ep, DEPCMD_SETSTALL, 0, 0, 0);
++		u.pep[ep].stalled = true;
++	} else {
++		epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
++		u.pep[ep].stalled = false;
++		data_kick(ep);
++	}
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_abort(void *, int address)
++{
++	unsigned ep = pep_of(address);
++	if (ep >= NPEP) {
++		return kIOReturnBadArgument;
++	}
++	if (ep <= 1) {
++		ep0_cancel(kIOReturnAborted);
++		if (u.stage == E_IDLE && !u.pep[0].busy) {
++			ep0_arm_setup();
++		}
++	} else {
++		data_cancel(ep, kIOReturnAborted);
++	}
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_set_address_pre(void *, int address)
++{
++	wr(DCFG, (rd(DCFG) & ~(0x7fu << 3)) | (((uint32_t)address & 0x7fu) << 3));
++	LOG("address %d", address & 0x7f);
++	return kIOReturnSuccess;
++}
++
++static IOReturn m_set_address_post(void *, int) { return kIOReturnSuccess; }
++static int m_speed(void *) { return u.speed ? u.speed : kSpeedHigh; }      /* no cable detector: always a cable */
++
++static IOReturn
++m_endpoint_ids(void *, OSArray *interfaces, uint8_t *ids)
++{
++	if (!interfaces || !ids) {
++		return kIOReturnBadArgument;
++	}
++	unsigned next_in = 1, next_out = 1, written = 0;
++	for (unsigned i = 0; i < interfaces->getCount(); i++) {
++		void *intf = interfaces->getObject(i);
++		if (!intf) {
++			continue;
++		}
++		unsigned widest_in = 0, widest_out = 0;
++		int alts = ((fn_i)sweet_usbdev_abi.if_alt_count)(intf);
++		for (int alt = 0; alt < alts; alt++) {
++			unsigned in = 0, out = 0;
++			int pipes = ((fn_iu8)sweet_usbdev_abi.if_pipe_count)(intf, (uint8_t)alt);
++			for (int p = 0; p < pipes; p++) {
++				void *pipe = ((fn_pipe)sweet_usbdev_abi.if_pipe)(intf, p, (uint8_t)alt);
++				int dir = pipe ? ((fn_i)sweet_usbdev_abi.pipe_dir)(pipe) : -1;
++				if (dir == 1) {
++					if (next_in + in > NPEP / 2 - 1) {
++						return kIOReturnNoResources;
++					}
++					ids[written++] = (uint8_t)(0x80 | (next_in + in++));
++				} else if (dir == 0) {
++					if (next_out + out > NPEP / 2 - 1) {
++						return kIOReturnNoResources;
++					}
++					ids[written++] = (uint8_t)(next_out + out++);
++				}
++			}
++			widest_in = in > widest_in ? in : widest_in;
++			widest_out = out > widest_out ? out : widest_out;
++		}
++		next_in += widest_in;
++		next_out += widest_out;
++	}
++	LOG("endpoint ids for %u interfaces: %u numbers", interfaces->getCount(), written);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_prepare(void *, OSArray *)
++{
++	u.need_startcfg = true;
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_activate(void *, int address, int type, int mps, int interval, int)
++{
++	unsigned ep = pep_of(address);
++	if (ep <= 1) {
++		return kIOReturnSuccess;
++	}
++	if (ep >= NPEP || mps <= 0) {
++		return kIOReturnBadArgument;
++	}
++	if (type == kTypeIsoc) {
++		LOG("isochronous endpoint 0x%x refused", address);
++		return kIOReturnUnsupported;
++	}
++	if (u.need_startcfg) {          /* new configuration: transfer resources handed out again (Linux, sweet_usb.c) */
++		epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0);
++		u.need_startcfg = false;
++	}
++	struct Pep *p = &u.pep[ep];
++	bool in = (address & 0x80) != 0;
++	uint32_t p0 = ((uint32_t)type << 1) | ((uint32_t)mps << 3);
++	if (in) {
++		p0 |= ((uint32_t)address & 0xfu) << 17;         /* TX FIFO = endpoint number */
++	}
++	uint32_t p1 = (1u << 8) | ((uint32_t)ep << 25);    /* XferComplete event */
++	if (type == kTypeInterrupt) {
++		uint32_t iv = interval < 1 ? 1 : (uint32_t)interval;
++		uint32_t m1 = u.speed == kSpeedFull ? 3 : (iv > 16 ? 15 : iv - 1);
++		p1 |= m1 << 16;
++	}
++	if (epcmd(ep, DEPCMD_SETEPCONFIG, p0, p1, 0) || epcmd(ep, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		return kIOReturnError;
++	}
++	wr(DALEPENA, rd(DALEPENA) | (1u << ep));
++	p->active = true;
++	p->in = in;
++	p->type = type;
++	p->mps = mps;
++	p->stalled = false;
++	LOG("endpoint 0x%x on (type %d, %d bytes)", address, type, mps);
++	data_kick(ep);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_deactivate(void *, int address)
++{
++	unsigned ep = pep_of(address);
++	if (ep <= 1 || ep >= NPEP) {
++		return kIOReturnSuccess;
++	}
++	data_cancel(ep, kIOReturnAborted);
++	u.pep[ep].active = false;
++	wr(DALEPENA, rd(DALEPENA) & ~(1u << ep));
++	return kIOReturnSuccess;
++}
++
++static IOBufferMemoryDescriptor *
++m_create_buffer(void *, IOOptionBits options, uint64_t capacity)
++{
++	return IOBufferMemoryDescriptor::withOptions(options & ~(IOOptionBits)kIOMemoryPageable, (vm_size_t)capacity, 64);
++}
++
++static bool
++m_is_stalled(void *, int address)
++{
++	unsigned ep = pep_of(address);
++	return ep < NPEP && u.pep[ep].stalled;
++}
++
++static IOReturn
++m_reset_toggle(void *, int address)
++{
++	unsigned ep = pep_of(address);
++	if (ep > 1 && ep < NPEP && u.pep[ep].active) {
++		epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);          /* clears the data sequence too */
++	}
++	return kIOReturnSuccess;
++}
++
++static void
++m_reenumerate(void *)
++{
++	set_bus(false);
++	IOSleep(100);
++	set_bus(true);
++}
++
++static IOReturn m_remote_wake(void *) { return kIOReturnUnsupported; }
++
++static void
++m_cr_state_change(void *, int old_state, int new_state)
++{
++	LOGN("control request state %d -> %d", old_state, new_state);
++	if (new_state == kStateOutData || new_state == kStateOutDataLong) {
++		void *cr = control_request();
++		uint16_t wlength = 0;
++		if (cr) {
++			const uint8_t *setup = (const uint8_t *)cr + 16;
++			wlength = (uint16_t)(setup[6] | setup[7] << 8);
++		}
++		uint32_t n = wlength > D_EP0_SIZE ? D_EP0_SIZE : wlength;
++		u.ep0_len = (n + 63u) & ~63u;
++		dsync(D_EP0, u.ep0_len);
++		u.stage = E_DATA_OUT;
++		start_trb(0, D_EP0, u.ep0_len, TRBCTL_DATA);
++	} else if (new_state == kStateOutStatus) {
++		u.status_out_wanted = true;
++		ep0_try_status_out();
++	}
++}
++
++static IOReturn
++m_io_gated(void *, void *req)
++{
++	int address = rget<int32_t>(req, REQ_ENDPOINT);
++	if (!((unsigned)address & 0x7fu)) {
++		if (!((unsigned)address & 0x80u)) {
++			return kIOReturnUnsupported;    /* OUT data arrives through inputDataPacket */
++		}
++		if (u.ep0_count == 8) {
++			return kIOReturnNoResources;
++		}
++		u.ep0_q[(u.ep0_head + u.ep0_count++) % 8] = req;
++		ep0_kick();
++		return kIOReturnSuccess;
++	}
++	unsigned ep = pep_of(address);
++	if (ep >= NPEP || !u.pep[ep].active) {
++		return kIOReturnNotReady;
++	}
++	if (rget<uint8_t>(req, REQ_ISOC)) {
++		return kIOReturnUnsupported;
++	}
++	struct Pep *p = &u.pep[ep];
++	if (p->count == QDEPTH) {
++		return kIOReturnNoResources;
++	}
++	p->q[(p->head + p->count++) % QDEPTH] = req;
++	data_kick(ep);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++m_buffer_options(void *, uint32_t *options)
++{
++	*options = 0;
++	return kIOReturnSuccess;
++}
++
++/* ---- start-up ---- */
++bool
++sweet_usbdev_available(void)
++{
++	return sweet_usbdev_abi.magic == SWEET_USBDEV_ABI_FILLED && sweet_usbdev_abi.vtable && sweet_usbdev_abi.ctor &&
++	       sweet_usbdev_abi.ready_for_host && sweet_usbdev_abi.complete_io && sweet_usbdev_abi.cr_input_setup;
++}
++
++static bool
++hw_init(void)
++{
++	wr(DCTL, DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 500 && (rd(DCTL) & DCTL_CSFTRST); i++) {
++		IODelay(1000);
++	}
++	if (rd(DCTL) & DCTL_CSFTRST) {
++		LOG("soft reset stuck");
++		return false;
++	}
++	wr(GEVNTADRLO, (uint32_t)(u.dma_pa + D_EVT));
++	wr(GEVNTADRHI, (uint32_t)((u.dma_pa + D_EVT) >> 32));
++	wr(GEVNTSIZ, (1u << 31) | D_EVT_SIZE);           /* interrupt masked: polled */
++	wr(GEVNTCOUNT, rd(GEVNTCOUNT) & 0xffff);
++	u.evt_pos = 0;
++	wr(DCFG, rd(DCFG) & ~(7u | (0x7fu << 3)));      /* high speed, address 0 */
++	wr(DEVTEN, 0x7);                                /* disconnect, reset, connect done */
++	if (epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    epcmd(0, DEPCMD_SETEPCONFIG, (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    epcmd(1, DEPCMD_SETEPCONFIG, (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		LOG("endpoint 0 setup failed");
++		return false;
++	}
++	wr(DALEPENA, 0x3);
++	ep0_arm_setup();
++	return true;
++}
++
++bool
++sweet_usbdev_start(vm_offset_t dwc, vm_offset_t qscratch)
++{
++	const char *why = NULL;
++	if (!sweet_usbdev_available()) {
++		LOG("no IOUSBDeviceFamily address table (image without the prelinked kexts)");
++		return false;
++	}
++	u.dwc = dwc;
++	u.qs = qscratch;
++	if (OSKext::loadKextWithIdentifier("com.apple.iokit.IOUSBDeviceFamily", false) != kOSReturnSuccess) {
++		LOG("IOUSBDeviceFamily did not load");
++		return false;
++	}
++	OSKext::loadKextWithIdentifier("com.apple.driver.AppleUSBDeviceMux", false);
++	const OSMetaClass *meta = (const OSMetaClass *)sweet_usbdev_abi.meta;
++	LOG("IOUSBDeviceFamily loaded; IOUSBDeviceController metaclass size %u", meta ? meta->getClassSize() : 0);
++	if (!meta || meta->getClassSize() != CTRL_SIZE) {
++		LOG("IOUSBDeviceController is not the iOS 16.5 one: not starting");
++		return false;
++	}
++	if (sweet_usb_dma_alloc(D_SIZE, &u.dma, &u.dma_pa) != 0) {
++		LOG("no DMA memory below 4 GiB");
++		return false;
++	}
++	LOG("DMA area 0x%llx (%u KiB)", u.dma_pa, D_SIZE / 1024);
++
++	/* the subclass: Apple's vtable with our methods */
++	memcpy(sw_vt, (const void *)sweet_usbdev_abi.vtable, sizeof(sw_vt));
++	u.base = (void **)(sweet_usbdev_abi.vtable + 16);
++	void **vt = &sw_vt[2];
++	vt[kSlotStart] = (void *)&m_start;
++	vt[kSlotGetWorkLoop] = (void *)&m_get_work_loop;
++	vt[kSlotSoftDisconnect] = (void *)&m_soft_disconnect;
++	vt[kSlotGoOnBus] = (void *)&m_go_on_bus;
++	vt[kSlotAccessoryCable] = (void *)&m_accessory_cable;
++	vt[kSlotStall] = (void *)&m_stall;
++	vt[kSlotAbort] = (void *)&m_abort;
++	vt[kSlotSetAddressPre] = (void *)&m_set_address_pre;
++	vt[kSlotSetAddressPost] = (void *)&m_set_address_post;
++	vt[kSlotSpeed] = (void *)&m_speed;
++	vt[kSlotEndpointIDs] = (void *)&m_endpoint_ids;
++	vt[kSlotPrepareConfig] = (void *)&m_prepare;
++	vt[kSlotActivate] = (void *)&m_activate;
++	vt[kSlotDeactivate] = (void *)&m_deactivate;
++	vt[kSlotCreateBuffer] = (void *)&m_create_buffer;
++	vt[kSlotIsStalled] = (void *)&m_is_stalled;
++	vt[kSlotResetToggle] = (void *)&m_reset_toggle;
++	vt[kSlotReEnumerate] = (void *)&m_reenumerate;
++	vt[kSlotRemoteWake] = (void *)&m_remote_wake;
++	vt[kSlotCRStateChange] = (void *)&m_cr_state_change;
++	vt[kSlotIOGated] = (void *)&m_io_gated;
++	vt[kSlotBufferOptions] = (void *)&m_buffer_options;
++
++	u.obj = IOMallocZero(1024);
++	u.loop = IOWorkLoop::workLoop();
++	if (!u.obj || !u.loop) {
++		LOG("out of memory");
++		return false;
++	}
++	((fn_vp)sweet_usbdev_abi.ctor)(u.obj, (void *)meta);
++	*(void ***)u.obj = vt;
++	IOService *svc = (IOService *)u.obj;
++
++	/* provider: a nub with the configuration the family's start looks up ("configuration-string", parents too) */
++	char config[64] = "standardBringup";
++	PE_parse_boot_argn("sweetusbconfig", config, sizeof(config));
++	IOService *nub = new IOService;
++	if (!nub || !nub->init()) {
++		LOG("no provider nub");
++		return false;
++	}
++	nub->setName("usb-device");
++	nub->setProperty("configuration-string", config);
++	if (!nub->attach(IOService::getPlatform() ? (IOService *)IOService::getPlatform() : IOService::getServiceRoot())) {
++		LOG("nub attach failed");
++		return false;
++	}
++	if (!svc->init()) {
++		why = "init";
++	} else if (!hw_init()) {
++		why = "DWC3 set-up";
++	} else if (!svc->attach(nub)) {
++		why = "attach";
++	} else if (!svc->start(nub)) {
++		why = "start";
++	}
++	if (why) {
++		LOG("controller %s failed", why);
++		return false;
++	}
++	thread_t th;
++	if (kernel_thread_start(poll_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	LOG("controller up (configuration %s): waiting for the family's goOnBus", config);
++	return true;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */

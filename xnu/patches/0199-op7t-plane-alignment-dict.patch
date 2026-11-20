@@ -1,0 +1,47 @@
+op7t-0199: DisplayPipePlaneBaseAlignment as a dictionary (mediaserverd crashed on every video)
+
+2026-11-12: Safari stays black ~20 s on pages with video, and videos never
+play. mediaserverd aborts every few seconds:
+  -[__NSCFNumber objectForKey:]: unrecognized selector
+  ... VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService
+  <- MediaToolbox FPSupport_CopyDestinationPixelBufferAttributesWithIOSurfaceSupport
+  <- itemfig_createRenderTriplesForVideo (video playback being prepared)
+That function (disassembled from the phone's VideoToolbox) reads the display
+service's DisplayPipePlaneBaseAlignment and does CFDictionaryGetValue(..,
+"PlaneBaseAlignmentLinear") on it (and DisplayPipeStrideRequirements ->
+"StrideLinearHorizontal", skipped when absent). 0046 made the first a plain
+number 64. Now { PlaneBaseAlignmentLinear = 64 }: same value, the type every
+reader in the shared cache expects. DisplayPipeStrideRequirements stays
+absent (no change to how surfaces are allocated).
+
+Apply after 0198.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4b8573d..56e3113 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -340,7 +340,23 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0199: a dictionary, as on Apple's AppleCLCD. VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
++	 * does CFDictionaryGetValue(DisplayPipePlaneBaseAlignment, "PlaneBaseAlignmentLinear"); the plain number 64 this
++	 * was made it throw "-[__NSCFNumber objectForKey:]", killing mediaserverd every time a video was prepared
++	 * (Safari pages with video, 2026-11-12). The other reader in the shared cache pairs it with the same key.
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++
++		if (align != NULL && linear != NULL) {
++			align->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	/*
+ 	 * 0109: present() waits for the GPU's last submission that names a surface before it shows
+ 	 * it (RedwoodGPUSurfaceReady, both for 0108's flip and the copy), so eagl.c need not glFinish

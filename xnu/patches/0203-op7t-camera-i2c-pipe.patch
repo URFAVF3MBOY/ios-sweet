@@ -1,0 +1,132 @@
+op7t-0203: kern.sweetcami2c, the camera bus for user space
+
+0202 (2026-11-12): the rear main sensor answers on CCI0 master 1: IMX586 at
+0x1a (reg 0x0016 = 0x0586), the module EEPROM at 0x51, a third device at
+0x59. To explore them (EEPROM contents, sensor registers, test pattern,
+streaming setup) from a root shell without a kernel build per try, as
+kern.sweetbtio did for Bluetooth: write a 16-byte request (op read/write,
+7-bit address, 0..2 register bytes, up to 8 data bytes), read the 16-byte
+reply (result, last IRQ status, read bytes). Master 1 only, after
+kern.sweetcam=2. Writes use the same polled queue path as 0202's reads
+(cci_write: CCI_WRITE with the register and data bytes packed 4 per word).
+
+Apply after 0202.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index f69cac2..d3ae8ac 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -619,4 +619,113 @@ sysctl_sweetcamlog SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetcamlog, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweetcamlog, "A", "the last kern.sweetcam report");
++/*
++ * ---- 0203: kern.sweetcami2c, the camera bus for user space (after kern.sweetcam=2 reached the scan) ----
++ *
++ * So the sensor (IMX586 at 0x1a), the module EEPROM (0x51) and the actuator (0x59) can be explored from a
++ * root shell (Python) without a kernel build per try. Write a request, then read the reply:
++ *   request (16 bytes): u8 op (0 read, 1 write), u8 addr7, u8 reg_len (0..2), u8 len (read: 1..11; write:
++ *           data bytes, reg_len + len <= 10), u32 reg (big-endian on the wire, as reg_len bytes), u8 data[8];
++ *   reply   (16 bytes): i32 result (0 ok, -1 NACK/error, -2 short read, other: errno), u32 last IRQ status,
++ *           u8 data[8] (read bytes).
++ * CCI0 master 1 only (the rear main sensor's bus), 100 kHz. Root only.
++ */
++struct cam_i2c_req {
++	uint8_t  op, addr7, reg_len, len;
++	uint32_t reg;
++	uint8_t  data[8];
++};
++struct cam_i2c_rep {
++	int32_t  result;
++	uint32_t status;
++	uint8_t  data[8];
++};
++_Static_assert(sizeof(struct cam_i2c_req) == 16, "16-byte request");
++_Static_assert(sizeof(struct cam_i2c_rep) == 16, "16-byte reply");
++static struct cam_i2c_rep cam_i2c_last;
++
++/* write reg (reg_len bytes) + data (n bytes) to addr7; 0 = ACKed */
++static int
++cci_write(unsigned addr7, uint32_t reg, unsigned reg_len, const uint8_t *data, unsigned n, uint32_t *status)
++{
++	uint8_t load[12];
++	unsigned k = 0;
++	uint32_t st;
++
++	*status = 0;
++	if (reg_len > 2 || reg_len + n > 10) {
++		return EINVAL;
++	}
++	load[k++] = (uint8_t)(CCI_WRITE | ((reg_len + n) << 4));
++	for (unsigned i = 0; i < reg_len; i++) {
++		load[k++] = (uint8_t)(reg >> (8 * (reg_len - 1 - i)));
++	}
++	for (unsigned i = 0; i < n; i++) {
++		load[k++] = data[i];
++	}
++	while (k % 4 != 0) {
++		load[k++] = 0;
++	}
++	wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0), CCI_SET_PARAM | (addr7 << 4));
++	for (unsigned w = 0; w < k; w += 4) {
++		wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0),
++		    (uint32_t)load[w] | (uint32_t)load[w + 1] << 8 | (uint32_t)load[w + 2] << 16 | (uint32_t)load[w + 3] << 24);
++	}
++	wr32(cam_cci, CCI_LOAD_DATA(CAM_MASTER, 0), CCI_REPORT | CCI_REPORT_IRQ_EN);
++	st = cci_run(0, CCI_ST_M1_Q0_REPORT);
++	*status = st;
++	if (cci_failed(st, CCI_ST_M1_Q0_REPORT)) {
++		cci_recover();
++		return -1;
++	}
++	cci_clear();
++	return 0;
++}
++
++static int
++sysctl_sweetcami2c SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct cam_i2c_req q;
++	int error = 0;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		if (req->newlen != sizeof(q)) {
++			return EINVAL;
++		}
++		error = SYSCTL_IN(req, &q, sizeof(q));
++		if (error) {
++			return error;
++		}
++		bzero(&cam_i2c_last, sizeof(cam_i2c_last));
++		if (cam_stage < 7 || cam_cci == 0) {
++			cam_i2c_last.result = ENXIO;    /* (run kern.sweetcam=2 first) */
++		} else if (q.addr7 > 0x7f || q.reg_len > 2) {
++			cam_i2c_last.result = EINVAL;
++		} else if (q.op == 0) {
++			if (q.len == 0 || q.len > 8) {
++				cam_i2c_last.result = EINVAL;
++			} else {
++				cam_i2c_last.result = cci_xfer(q.addr7, q.reg, q.reg_len, cam_i2c_last.data, q.len,
++				    &cam_i2c_last.status);
++			}
++		} else if (q.op == 1) {
++			if (q.len > 8) {
++				cam_i2c_last.result = EINVAL;
++			} else {
++				cam_i2c_last.result = cci_write(q.addr7, q.reg, q.reg_len, q.data, q.len,
++				    &cam_i2c_last.status);
++			}
++		} else {
++			cam_i2c_last.result = EINVAL;
++		}
++	}
++	if (req->oldptr != USER_ADDR_NULL || req->newptr == USER_ADDR_NULL) {
++		error = SYSCTL_OUT(req, &cam_i2c_last, sizeof(cam_i2c_last));
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcami2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweetcami2c, "S", "camera bus CCI0 master 1 (0203): write a 16-byte request, read the 16-byte reply");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

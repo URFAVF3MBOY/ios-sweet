@@ -1,0 +1,72 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2000,6 +2000,13 @@ static const struct { const char *path, *part; } rmtfs_parts[] = {
+  */
+ static bool rmtfs_reads_on = true, rmtfs_nvbk_on = true;
+ static unsigned rmtfs_logged;
++/*
++ * 0101. Boot b9072b (sweetmodem_reads=0) survived; the modem's FIRST read is caller 5 (oem_stanvbk,
++ * LUN 0 block 0x12d08) sector 0, 1 x 512 bytes -> phys b8003000; served (0099) the phone died.
++ *   sweetmodem_readmax=N  serve only the first N read requests, refuse the rest (0 = no limit);
++ *   sweetmodem_readzero=1 serve reads with zeros, no UFS read (keeps the modem going without LUN 0).
++ */
++static uint32_t rmtfs_readmax, rmtfs_readzero, rmtfs_served;
+ static uint64_t rmtfs_pa;
+ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+@@ -2104,6 +2111,10 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			ok = false;
+ 			LOG("t=%u ms: rmtfs: refused (sweetmodem_reads=0)", g_ms);
+ 		}
++		if (ok && !write && rmtfs_readmax != 0 && rmtfs_served >= rmtfs_readmax) {
++			ok = false;
++			LOG("t=%u ms: rmtfs: refused (sweetmodem_readmax=%u reached)", g_ms, rmtfs_readmax);
++		}
+ 		for (i = 0; ok && i < iov[0]; i++) {
+ 			uint32_t e[3];                      /* sector, phys, count */
+ 			memcpy(e, iov + 1 + 12 * i, 12);
+@@ -2115,14 +2126,27 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			if (write) {
+ 				rmtfs_writes++;                 /* never written to the phone's EFS */
+ 			} else {
+-				ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512,
+-				    rmtfs_va + (e[1] - rmtfs_pa), bytes) == 0;
++				uint8_t *to = rmtfs_va + (e[1] - rmtfs_pa);
++				if (rmtfs_readzero) {
++					bzero(to, (size_t)bytes);
++				} else {
++					ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512, to, bytes) == 0;
++				}
+ 				rmtfs_reads++;
++				if (ok && rmtfs_served < 6 && bytes >= 16) {
++					LOG("t=%u ms: rmtfs: served %s sector %x x%u%s: %02x%02x%02x%02x %02x%02x%02x%02x "
++					    "%02x%02x%02x%02x %02x%02x%02x%02x", g_ms, rmtfs_parts[caller - 1].part, e[0], e[2],
++					    rmtfs_readzero ? " (zeros)" : "", to[0], to[1], to[2], to[3], to[4], to[5], to[6], to[7],
++					    to[8], to[9], to[10], to[11], to[12], to[13], to[14], to[15]);
++				}
+ 			}
+ 		}
+ 		if (!ok && ++rmtfs_err <= 3) {
+ 			LOG("t=%u ms: rmtfs: iovec caller %u %s FAILED", g_ms, caller, write ? "write" : "read");
+ 		}
++		if (ok && !write) {
++			rmtfs_served++;
++		}
+ 		qm_result(&m, ok);
+ 		break;
+ 	}
+@@ -5729,8 +5753,11 @@ sweet_modem_init(void)
+ 	if (PE_parse_boot_argn("sweetmodem_nvbk", &v, sizeof(v))) {
+ 		rmtfs_nvbk_on = v != 0;
+ 	}
+-	if (!rmtfs_reads_on || !rmtfs_nvbk_on) {
+-		LOG("bisect: rmtfs reads %s, /oem/nvbk %s", rmtfs_reads_on ? "on" : "OFF", rmtfs_nvbk_on ? "on" : "OFF");
++	(void)PE_parse_boot_argn("sweetmodem_readmax", &rmtfs_readmax, sizeof(rmtfs_readmax));
++	(void)PE_parse_boot_argn("sweetmodem_readzero", &rmtfs_readzero, sizeof(rmtfs_readzero));
++	if (!rmtfs_reads_on || !rmtfs_nvbk_on || rmtfs_readmax || rmtfs_readzero) {
++		LOG("bisect: rmtfs reads %s, /oem/nvbk %s, readmax %u, readzero %u", rmtfs_reads_on ? "on" : "OFF",
++		    rmtfs_nvbk_on ? "on" : "OFF", rmtfs_readmax, rmtfs_readzero);
+ 	}
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

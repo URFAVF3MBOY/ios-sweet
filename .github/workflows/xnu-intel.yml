@@ -1,0 +1,239 @@
+name: xnu-intel
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: SWEET
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+      use_ccache:
+        description: compile the kernel through ccache (cached objects from earlier runs)
+        default: "true"
+concurrency:
+  group: xnu-intel-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  USE_CCACHE: ${{ inputs.use_ccache || 'true' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+jobs:
+  build:
+    # same build on the Intel macOS 15 pool: the arm64 pool leaves jobs unassigned (Nov 2026)
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls dxb/patches
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja ccache
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app || true
+
+          # macos-15 has no Xcode 15; use oldest 16.x (better odds than 26 for iig)
+          XC=$(ls -d /Applications/Xcode_16.app /Applications/Xcode_16.0.app /Applications/Xcode_16.0.0.app 2>/dev/null | head -1 || true)
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | head -1 || true)
+          fi
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -1 || true)
+          fi
+          if [ -z "$XC" ]; then
+            XC="/Applications/Xcode.app"
+          fi
+          echo "Using Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig || true
+
+          mkdir -p /tmp/ccache-bin
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang)" > /tmp/ccache-bin/clang
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang++)" > /tmp/ccache-bin/clang++
+          chmod +x /tmp/ccache-bin/clang /tmp/ccache-bin/clang++
+          ccache --version | head -1
+          ccache -z
+
+      - name: Restore KDK cache
+        id: kdkcache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-13.5
+
+      - name: Install KDK 13.5.x
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          for root in /Library/Developer/KDKs/KDK_13.5*.kdk; do
+            if [ -d "$root" ]; then
+              echo "KDK already present: $root"
+              echo "KDKROOT=$root" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo chmod 755 /Library/Developer/KDKs
+          mkdir -p /tmp/kdk-cache
+
+          if ! ls /tmp/kdk-cache/*.dmg >/dev/null 2>&1; then
+            # own mirror first (create with: gh release create kdk-22G91 <dmg> -R URFAVF3MBOY/ios-sweet), then Dortania
+            for src in \
+              "URFAVF3MBOY/ios-sweet kdk-22G91" \
+              "dortania/KdkSupportPkg 22G91" \
+              "dortania/KdkSupportPkg 22G90" \
+              "dortania/KdkSupportPkg 22G74"; do
+              set -- $src
+              echo "=== $1 $2 ==="
+              rm -f /tmp/kdk-cache/*.dmg
+              if gh release download "$2" -R "$1" -p '*.dmg' -D /tmp/kdk-cache --clobber; then
+                SIZE=$(stat -f%z /tmp/kdk-cache/*.dmg | head -1)
+                echo "size=$SIZE"
+                if [ "$SIZE" -gt 100000000 ]; then break; fi
+              fi
+              echo "failed: $1 $2"
+              rm -f /tmp/kdk-cache/*.dmg
+            done
+          fi
+
+          DMG=$(ls /tmp/kdk-cache/*.dmg 2>/dev/null | head -1 || true)
+          if [ -z "$DMG" ]; then
+            echo "All KDK sources failed"
+            exit 1
+          fi
+
+          hdiutil attach "$DMG" -nobrowse
+          PKG=$(echo /Volumes/Kernel*/KernelDebugKit.pkg)
+          echo "installing $PKG"
+          sudo installer -pkg "$PKG" -target /
+          hdiutil detach "$(dirname "$PKG")" || true
+
+          FOUND=$(ls -d /Library/Developer/KDKs/KDK_13.5*.kdk 2>/dev/null | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "KDK install produced no KDK_13.5*.kdk"
+            exit 1
+          fi
+          echo "KDKROOT=$FOUND" >> "$GITHUB_ENV"
+          echo "Installed: $FOUND"
+
+      - name: Save KDK cache
+        if: steps.kdkcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-13.5
+
+      - name: Restore ccache
+        if: env.USE_CCACHE == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: xnu-intel-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            xnu-intel-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }} ${{ (inputs.use_ccache || 'true') == 'true' && 'CC=/tmp/ccache-bin/clang CXX=/tmp/ccache-bin/clang++' || '' }}
+        run: |
+          if [ -z "$KDKROOT" ]; then
+            export KDKROOT=$(ls -d /Library/Developer/KDKs/KDK_13.5*.kdk 2>/dev/null | head -1)
+          fi
+          echo "KDKROOT=$KDKROOT"
+          test -d "$KDKROOT"
+          bash build.sh
+
+      - name: ccache statistics
+        if: always() && env.USE_CCACHE == 'true'
+        run: ccache -s
+
+      - name: Save ccache
+        if: always() && env.USE_CCACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: xnu-intel-ccache-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          set +e
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ 2>/dev/null || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform 2>/dev/null
+          if [ ! -s buildtree.tgz ]; then
+            echo "no build tree; empty placeholder" > /tmp/empty.txt
+            tar czf buildtree.tgz -C /tmp empty.txt
+          fi
+          ls -la buildtree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Inspect closed KDK support libs
+        if: always()
+        run: |
+          mkdir -p out/kdk-libs
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -f "$lib" ] || continue
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs || true
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn

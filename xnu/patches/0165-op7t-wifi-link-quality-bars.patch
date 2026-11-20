@@ -1,0 +1,213 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 01:30:00 -0500
+Subject: [PATCH] op7t-0165: Wi-Fi: link-quality events, so the status bar shows bars
+
+The Wi-Fi bars stayed grey with Naja2025 joined and heard at -63 dBm
+(0164, 2026-11-09; RSSI answered -63). wifid starts monitoring
+APPLE80211_M_WEIGHT_AVG_LQM_UPDATE (event 145, wifid at 0x1000484f4..:
+"mov w1, #0x91; bl Apple80211StartMonitoringEvent") and takes the signal
+it shows from it; this driver never sent one. IO80211.framework of 16.5
+turns the event into WEIGHT_AVG_RSSI/_SNR/_TX_RATE/_RX_RATE only when its
+data is exactly 16 bytes (cmp w2, #0x10): four int32s in that order.
+
+Now: while joined, event 145 every 5 s (the first 1 s after link-up),
+RSSI and SNR (RSSI + 95) of the joined BSS, rates 54. Logged the first
+20 times as "apple80211: link quality: rssi .., snr ..".
+topaz_sta.c also keeps the joined BSS's RSSI current: it used to keep the
+scan's value from before the join; now the radio's AP table entry for
+that BSSID, when heard in the last 10 s (checked at most every 2 s).
+
+Apply after 0164.
+---
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index 366352f..fd875f5 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -31,8 +31,10 @@
+  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
+  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+  */
++#include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <libkern/libkern.h>
+ #include <sys/errno.h>
+ #include <sys/kern_event.h>
+@@ -206,7 +208,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10 };
++       EVENT_SCAN_DONE = 10, EVENT_WEIGHT_AVG_LQM_UPDATE = 145 };
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -639,6 +641,92 @@ post(uint32_t code, const void *data, uint32_t length)
+ 	kev_post_msg(&message);
+ }
+ 
++/*
++ * 0165: the link quality, every LQM_PERIOD_MS while joined. The Wi-Fi bars stayed grey with the
++ * network joined and heard at -63 dBm (2026-11-09): wifid takes the signal it shows from the
++ * driver's WEIGHT_AVG_LQM_UPDATE event (Apple80211's event 145; wifid starts monitoring it next to
++ * the others at startup, "monitoring APPLE80211_M_WEIGHT_AVG_LQM_UPDATE failed" otherwise), and this
++ * driver never sent it. IO80211.framework of 16.5 turns the event into WEIGHT_AVG_RSSI, _SNR,
++ * _TX_RATE and _RX_RATE only when its data is exactly 16 bytes: four int32s in that order. The rates
++ * are not measured here: 54 (Mbit/s) stands for them. wifid drops events that come "too frequent";
++ * Apple's drivers send them every few seconds.
++ */
++#define LQM_PERIOD_MS           5000u
++
++struct apple80211_weight_avg_lqm {
++	int32_t rssi, snr, tx_rate, rx_rate;
++};
++_Static_assert(sizeof(struct apple80211_weight_avg_lqm) == 16, "IO80211.framework of 16.5 reads 16 bytes, or nothing");
++
++static thread_call_t lqm_call;
++static bool lqm_running;
++
++static uint64_t
++lqm_period_abs(void)
++{
++	uint64_t abs;
++
++	nanoseconds_to_absolutetime((uint64_t)LQM_PERIOD_MS * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static void
++lqm_post(void)
++{
++	struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++	static unsigned said;
++
++	if (state == NULL) {
++		return;
++	}
++	redwood_sta_state(state);
++	if (state->phase == REDWOOD_STA_JOINED && state->bss.rssi < 0) {
++		struct apple80211_weight_avg_lqm lqm = { .rssi = state->bss.rssi, .snr = snr_of(state->bss.rssi), .tx_rate = 54,
++			                                 .rx_rate = 54 };
++
++		post(EVENT_WEIGHT_AVG_LQM_UPDATE, &lqm, sizeof(lqm));
++		if (said < 20) {
++			said++;
++			printf("apple80211: link quality: rssi %d, snr %d\n", lqm.rssi, lqm.snr);
++		}
++	}
++	kfree_data(state, sizeof(*state));
++}
++
++static void
++lqm_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	bool again;
++
++	lqm_post();
++	lck_mtx_lock(&apple80211_lock);
++	again = lqm_running;
++	lck_mtx_unlock(&apple80211_lock);
++	if (again) {
++		thread_call_enter_delayed(lqm_call, mach_absolute_time() + lqm_period_abs());
++	}
++}
++
++static void
++lqm_run(bool on)
++{
++	if (lqm_call == NULL) {
++		lqm_call = thread_call_allocate(lqm_tick, NULL);
++		if (lqm_call == NULL) {
++			return;
++		}
++	}
++	lck_mtx_lock(&apple80211_lock);
++	lqm_running = on;
++	lck_mtx_unlock(&apple80211_lock);
++	if (on) {
++		/* (the first a second after the link: wifid sets up its link-quality state on link-up first) */
++		thread_call_enter_delayed(lqm_call, mach_absolute_time() + lqm_period_abs() / 5);
++	} else {
++		thread_call_cancel(lqm_call);
++	}
++}
++
+ /* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
+ void
+ redwood_apple80211_event(enum redwood_sta_event event, int status)
+@@ -683,6 +771,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+ 		post(EVENT_BSSID_CHANGED, NULL, 0);
+ 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		lqm_run(status == 1);           /* 0165 */
+ 		break;
+ 	}
+ 	}
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+index f2ffed4..3f24fda 100644
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -4,6 +4,9 @@
+  * made (a radio, link down: no data path yet) and the station attached, so that wifid finds a
+  * Wi-Fi interface and Settings can list what the scans hear. Joining is not there yet.
+  */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+@@ -121,6 +124,44 @@ sta_join(const struct redwood_sta_join *what)
+ 	return error;
+ }
+ 
++/*
++ * 0165: the joined network's signal as the radio hears it now. sta_joined_bss kept the RSSI of the
++ * scan before the join for as long as the link lasted; the radio's table of access points is
++ * brought up to date by every beacon and probe response it hears (TopazModem's mgmt rx), so the
++ * joined BSSID's entry there is used when it was heard in the last 10 s. At most every 2 s: the
++ * walk copies each entry, and the state is asked for by every Apple80211 request.
++ */
++static LCK_GRP_DECLARE(refresh_group, "topaz-sta-refresh");
++static LCK_MTX_DECLARE(refresh_lock, &refresh_group);
++
++static void
++sta_joined_refresh(void)
++{
++	static uint64_t last_abs;
++	static struct topaz_wlan_bss *t;
++	uint64_t now = mach_absolute_time(), period;
++
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &period);
++	lck_mtx_lock(&refresh_lock);
++	if (last_abs != 0 && now - last_abs < period) {
++		lck_mtx_unlock(&refresh_lock);
++		return;
++	}
++	last_abs = now;
++	if (t == NULL) {
++		t = kalloc_data(sizeof(*t), Z_WAITOK | Z_ZERO);
++	}
++	for (unsigned i = 0; t != NULL && topaz_wlan_heard(i, t); i++) {
++		if (memcmp(t->bssid, sta_joined_bss.bssid, 6) == 0) {
++			if (t->age_ms < 10000 && t->rssi < 0) {
++				sta_joined_bss.rssi = t->rssi;
++			}
++			break;
++		}
++	}
++	lck_mtx_unlock(&refresh_lock);
++}
++
+ static int
+ sta_leave(void)
+ {
+@@ -133,6 +174,7 @@ sta_state(struct redwood_sta_state *state)
+ 	bzero(state, sizeof(*state));
+ 	state->phase = topaz_wlan_joined() ? REDWOOD_STA_JOINED : REDWOOD_STA_IDLE;
+ 	if (state->phase == REDWOOD_STA_JOINED) {
++		sta_joined_refresh();
+ 		state->bss = sta_joined_bss;
+ 	}
+ 	state->last_error = sta_last_error;

@@ -1,0 +1,254 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 08:00:00 -0500
+Subject: [PATCH] op7t-0173: Bluetooth: H4 packets and in-band sleep after the firmware
+
+0172 booted (2026-11-11 00:19): bluetooth_a is FAT16 (16 KB clusters);
+crbtfw11.tlv (29368 bytes, TLV type 1, download mode 0, product 0xa, ROM
+build 0x101, patch version 2) went in: 121 segments, all answered, the
+last with 0x3, 2.9 s; crnv11.bin (2798 bytes, TLV type 4) 12 segments,
+all answered, the last with 0x5. Then HCI_Reset got "00 fd" and nothing
+more: 0xFD is HCI_IBS_WAKE_IND. The NVM switches Qualcomm's in-band sleep
+on (0171 only edited TLV type 2), and the chip waits for WAKE_ACK (0xFC)
+before it sends the command complete.
+
+Now, after the NVM: an H4 parser (event 04 / ACL 02 / SCO 03, by their
+lengths) with the IBS bytes between packets handled as Linux hci_qca:
+WAKE_IND from the chip answered WAKE_ACK; before a command, WAKE_IND sent
+(up to 10 times, 10 ms apart) until WAKE_ACK when the chip said SLEEP_IND
+or nothing yet; replies matched by opcode (command complete 0e / status
+0f), other events logged. Then HCI_Reset, Read Local Version, Read
+BD_ADDR (stage 8), and the IBS counters. The head of an NVM that is not
+TLV type 2 is logged (to see its tags).
+
+Apply after 0172.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 63f2510..fa0e8e8 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -31,8 +31,8 @@
+  * NVM with in-band sleep off and the UART speed 115200 in its HCI tag; HCI_Reset; Read Local Version.
+  * Reading kern.sweetbt gives the stage reached: 0 not run, 1 clock, 2 UART up, 3 the chip answered
+  * the version request, 4 it answered HCI_Reset, 5 patch sent, 6 NVM sent, 7 reset after firmware
+- * answered 0; negative: stopped there (-1 clock did not start, -2 no mapping, -3 not the UART
+- * firmware, -5 patch, -6 NVM).
++ * answered 0, 8 the BD address read (0173: through the in-band sleep handshake); negative: stopped
++ * there (-1 clock did not start, -2 no mapping, -3 not the UART firmware, -5 patch, -6 NVM).
+  * Everything is logged as "sweet_bt: ...".
+  */
+ #include <sys/param.h>
+@@ -686,6 +686,8 @@ tlv_download(const char *path, bool nvm)
+ 		    "patch version %#x\n", h[0] | h[1] << 8 | h[2] << 16 | (uint32_t)h[3] << 24,
+ 		    h[4] | h[5] << 8 | h[6] << 16 | (uint32_t)h[7] << 24, h[8], h[9], h[10], h[12] | h[13] << 8,
+ 		    h[14] | h[15] << 8, h[16] | h[17] << 8);
++	} else if (nvm && (type_len & 0xff) != 2) {
++		dump("nvm head (not TLV type 2: left as it is)", f, size < 48 ? (unsigned)size : 48);
+ 	} else if (nvm && (type_len & 0xff) == 2) {
+ 		/* tags: id (2), length (2), 8 reserved, data; HCI tag: in-band sleep off (our driver does not do it), 115200 */
+ 		for (uint64_t at = 4; at + 12 <= (uint64_t)size;) {
+@@ -745,6 +747,155 @@ tlv_download(const char *path, bool nvm)
+ 	return ok;
+ }
+ 
++/*
++ * ---- 0173: H4 packets and in-band sleep ----
++ *
++ * 0172 (2026-11-11): patch and NVM went in (121 and 12 segments answered; ROM build 0x101 in the patch
++ * header), and after the reset the chip sent "00 fd" and nothing else: 0xFD is HCI_IBS_WAKE_IND. The NVM
++ * (crnv11.bin is TLV type 4, so 0171's edit of type 2 did not touch it) turns Qualcomm's in-band sleep
++ * on, as Linux hci_qca.c expects: the chip says WAKE_IND (0xFD) before it sends and waits for the host's
++ * WAKE_ACK (0xFC); it says SLEEP_IND (0xFE) when it goes to sleep; the host wakes it the same way (0xFD,
++ * answered 0xFC) before sending. Those bytes come between H4 packets, so packets are parsed here: type
++ * 04 event (2-byte header, length in byte 2), 02 ACL (4, length 16-bit in bytes 3-4), 03 SCO (3, length
++ * in byte 3); anything else between packets is an IBS byte or noise.
++ */
++#define HCI_ACL_PKT             0x02
++#define HCI_SCO_PKT             0x03
++#define IBS_WAKE_IND            0xfd
++#define IBS_WAKE_ACK            0xfc
++#define IBS_SLEEP_IND           0xfe
++
++static struct {
++	uint8_t pkt[4 + 1024];
++	unsigned have, need;            /* bytes of the packet so far; 0: between packets */
++	bool chip_awake;                /* last seen: WAKE_IND/WAKE_ACK (true) or SLEEP_IND (false) */
++	unsigned wakes, acks, sleeps, junk;
++} h4;
++
++static uint8_t evq[2048];               /* complete events, each as type, header and body */
++static unsigned evq_len;
++
++static void
++h4_byte(uint8_t c)
++{
++	if (h4.have == 0) {
++		if (c == HCI_EVENT_PKT || c == HCI_ACL_PKT || c == HCI_SCO_PKT) {
++			h4.pkt[0] = c;
++			h4.have = 1;
++			h4.need = c == HCI_EVENT_PKT ? 3 : c == HCI_ACL_PKT ? 5 : 4;
++			return;
++		}
++		if (c == IBS_WAKE_IND) {
++			uint8_t ack = IBS_WAKE_ACK;
++
++			h4.wakes++;
++			h4.chip_awake = true;
++			uart_tx(&ack, 1, 20000);
++		} else if (c == IBS_WAKE_ACK) {
++			h4.acks++;
++			h4.chip_awake = true;
++		} else if (c == IBS_SLEEP_IND) {
++			h4.sleeps++;
++			h4.chip_awake = false;
++		} else {
++			h4.junk++;
++		}
++		return;
++	}
++	h4.pkt[h4.have++] = c;
++	if (h4.have == h4.need) {
++		uint8_t t = h4.pkt[0];
++		unsigned body = t == HCI_EVENT_PKT ? (h4.have == 3 ? h4.pkt[2] : 0) :
++		    t == HCI_ACL_PKT ? (h4.have == 5 ? (unsigned)(h4.pkt[3] | h4.pkt[4] << 8) : 0) : (h4.have == 4 ? h4.pkt[3] : 0);
++		bool header_done = (t == HCI_EVENT_PKT && h4.have == 3) || (t == HCI_ACL_PKT && h4.have == 5) ||
++		    (t == HCI_SCO_PKT && h4.have == 4);
++
++		if (header_done && body != 0 && h4.have + body <= sizeof(h4.pkt)) {
++			h4.need = h4.have + body;
++			return;
++		}
++		if (t == HCI_EVENT_PKT && evq_len + h4.have <= sizeof(evq)) {
++			memcpy(evq + evq_len, h4.pkt, h4.have);
++			evq_len += h4.have;
++		}
++		h4.have = 0;
++	}
++}
++
++static void
++h4_pump(unsigned wait_us)
++{
++	uint8_t b[128];
++	unsigned n = uart_rx(b, sizeof(b), wait_us, 300);
++
++	for (unsigned i = 0; i < n; i++) {
++		h4_byte(b[i]);
++	}
++}
++
++/* wake the chip if it said it sleeps (or never said anything yet): WAKE_IND until WAKE_ACK */
++static bool
++ibs_wake(void)
++{
++	if (h4.chip_awake) {
++		return true;
++	}
++	for (unsigned tries = 0; tries < 10 && !h4.chip_awake; tries++) {
++		uint8_t w = IBS_WAKE_IND;
++
++		uart_tx(&w, 1, 20000);
++		for (unsigned t = 0; t < 10 && !h4.chip_awake; t++) {
++			h4_pump(1000);
++		}
++	}
++	if (!h4.chip_awake) {
++		printf("sweet_bt: ibs: no WAKE_ACK to WAKE_IND\n");
++	}
++	return h4.chip_awake;
++}
++
++/* an HCI command, IBS-aware; the reply event (command complete 0e or status 0f for this opcode) into r */
++static unsigned
++hci_cmd_ibs(const char *what, uint16_t opcode, const uint8_t *param, uint8_t plen, uint8_t *r, unsigned rmost)
++{
++	uint8_t c[4 + 32];
++
++	evq_len = 0;
++	ibs_wake();
++	c[0] = HCI_COMMAND_PKT;
++	c[1] = (uint8_t)opcode;
++	c[2] = (uint8_t)(opcode >> 8);
++	c[3] = plen;
++	if (plen != 0) {
++		memcpy(c + 4, param, plen);
++	}
++	if (!uart_tx(c, 4u + plen, 200000)) {
++		return 0;
++	}
++	for (unsigned t = 0; t < 1000; t++) {
++		h4_pump(1000);
++		for (unsigned at = 0; at + 3 <= evq_len; at += 3 + evq[at + 2]) {
++			const uint8_t *e = evq + at;
++			unsigned len = 3u + e[2];
++
++			if ((e[1] == 0x0e && e[2] >= 3 && (e[4] | e[5] << 8) == opcode) ||
++			    (e[1] == 0x0f && e[2] >= 4 && (e[5] | e[6] << 8) == opcode)) {
++				unsigned n = len < rmost ? len : rmost;
++
++				memcpy(r, e, n);
++				dump(what, r, n);
++				return n;
++			}
++			if (e[1] != 0x0e && e[1] != 0x0f) {
++				dump("event", e, len);
++			}
++		}
++	}
++	printf("sweet_bt: %s: no reply (ibs: %u wakes, %u acks, %u sleeps, %u other bytes)\n", what, h4.wakes, h4.acks,
++	    h4.sleeps, h4.junk);
++	return 0;
++}
++
+ static int
+ sweet_bt_up(void)
+ {
+@@ -837,25 +988,35 @@ sweet_bt_up(void)
+ 		return -6;
+ 	}
+ 	bt_stage = 6;
+-	n = hci_cmd("reset after firmware", 0x0c03, NULL, 0, r, sizeof(r));
+-	for (unsigned i = 0; i + 6 < n; i++) {
+-		if (r[i] == HCI_EVENT_PKT && r[i + 1] == 0x0e && r[i + 4] == 0x03 && r[i + 5] == 0x0c) {
+-			printf("sweet_bt: reset after firmware: status %#x\n", r[i + 6]);
+-			if (r[i + 6] == 0) {
+-				bt_stage = 7;
+-			}
+-			break;
++	/* 0173: from here on the chip speaks in-band sleep; whatever came after the NVM goes through the parser first */
++	bzero(&h4, sizeof(h4));
++	for (unsigned i = 0; i < rx_kept; i++) {
++		h4_byte(rx_keep[i]);
++	}
++	rx_kept = 0;
++	h4_pump(20000);
++	n = hci_cmd_ibs("reset after firmware", 0x0c03, NULL, 0, r, sizeof(r));
++	if (n >= 7 && r[1] == 0x0e) {
++		printf("sweet_bt: reset after firmware: status %#x\n", r[6]);
++		if (r[6] == 0) {
++			bt_stage = 7;
+ 		}
+ 	}
+ 	/* HCI_Read_Local_Version_Information: 04 0e 0c 01 01 10 status hci_ver hci_rev(2) lmp_ver manufacturer(2) lmp_subver(2) */
+-	n = hci_cmd("local version", 0x1001, NULL, 0, r, sizeof(r));
+-	for (unsigned i = 0; i + 14 < n; i++) {
+-		if (r[i] == HCI_EVENT_PKT && r[i + 1] == 0x0e && r[i + 4] == 0x01 && r[i + 5] == 0x10) {
+-			printf("sweet_bt: local version: status %#x hci %u rev %#x lmp %u manufacturer %#x lmp subversion %#x\n",
+-			    r[i + 6], r[i + 7], r[i + 8] | r[i + 9] << 8, r[i + 10], r[i + 11] | r[i + 12] << 8, r[i + 13] | r[i + 14] << 8);
+-			break;
++	n = hci_cmd_ibs("local version", 0x1001, NULL, 0, r, sizeof(r));
++	if (n >= 15 && r[1] == 0x0e) {
++		printf("sweet_bt: local version: status %#x hci %u rev %#x lmp %u manufacturer %#x lmp subversion %#x\n",
++		    r[6], r[7], r[8] | r[9] << 8, r[10], r[11] | r[12] << 8, r[13] | r[14] << 8);
++	}
++	/* HCI_Read_BD_ADDR: 04 0e 0a 01 09 10 status addr(6, little-endian) */
++	n = hci_cmd_ibs("bd addr", 0x1009, NULL, 0, r, sizeof(r));
++	if (n >= 13 && r[1] == 0x0e && r[6] == 0) {
++		printf("sweet_bt: bd addr %02x:%02x:%02x:%02x:%02x:%02x\n", r[12], r[11], r[10], r[9], r[8], r[7]);
++		if (bt_stage == 7) {
++			bt_stage = 8;
+ 		}
+ 	}
++	printf("sweet_bt: ibs: %u wakes, %u acks, %u sleeps, %u other bytes\n", h4.wakes, h4.acks, h4.sleeps, h4.junk);
+ 	return bt_stage;
+ }
+ 

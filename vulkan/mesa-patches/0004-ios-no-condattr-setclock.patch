@@ -1,0 +1,21 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 82efb07af90..a820c10fd13 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3161,6 +3161,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
++   /* (no pthread_condattr_setclock on iOS: timeline_cond is only waited on with a deadline by kgsl) */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3168,6 +3170,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
