@@ -1,0 +1,250 @@
+name: vulkan
+
+# Turnip (Mesa's Vulkan driver for Adreno) for iOS 16 arm64, msm backend over sweetdrm (vulkan/sweetdrm: the
+# libdrm calls Turnip makes, answered by RedwoodGPU's IOKit client), plus vulkan/vktest.
+# Mesa 85fda3b3 + vulkan/mesa-patches. libdrm-2.4.124 gives only its header (xf86drm.h).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner pool (the arm64 pool queues for long, Nov 2026; Intel cross-builds the same)
+        type: choice
+        options: [macos-15-intel, macos-15]
+        default: macos-15-intel
+
+permissions:
+  contents: read
+
+env:
+  MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  LIBDRM_TAG: libdrm-2.4.124
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Caches: Mesa's source + build tree, and Rust's toolchain, crates and build. A change to one file then
+      # rebuilds that file only. Restored here, saved at the end even when a later step failed.
+      - name: Restore Mesa cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/mesa
+            work/build
+            work/sysroot
+            work/sweetdrm-src
+            work/ios.cross
+          key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}
+          restore-keys: |
+            mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-
+            mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-
+
+      - name: Restore Rust cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/mtl-target
+          key: cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}
+          restore-keys: |
+            cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-
+            cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-
+            cargo-${{ runner.arch }}-
+
+      - name: Toolchain
+        run: |
+          brew install meson ninja bison flex pkgconf glslang >/dev/null
+          python3 -m venv work/venv
+          work/venv/bin/pip install -q meson mako pyyaml packaging
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "IOSCC=$(xcrun --sdk iphoneos --find clang)" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/work/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin" >> $GITHUB_PATH
+
+      - name: Sources
+        run: |
+          want=$(cat vulkan/mesa-patches/*.patch | shasum | cut -c1-16)
+          if [ -d work/mesa/.git ] && [ "$(cat work/mesa/.sweet-patches 2>/dev/null)" = "$want" ]; then
+            echo "Mesa from the cache, patches unchanged: tree left as it is"
+          else
+            if [ -d work/mesa/.git ]; then
+              echo "Mesa from the cache, patches changed: reset and re-apply"
+              git -C work/mesa reset -q --hard $MESA_COMMIT
+            else
+              git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/mesa
+              git -C work/mesa checkout -q $MESA_COMMIT
+            fi
+            for p in vulkan/mesa-patches/*.patch; do echo "apply $p"; git -C work/mesa apply --whitespace=nowarn "$PWD/$p"; done
+            echo "$want" > work/mesa/.sweet-patches
+          fi
+          mkdir -p work/sysroot/include work/sysroot/lib/pkgconfig
+          curl -sSfL -o work/xf86drm.h.new https://gitlab.freedesktop.org/mesa/drm/-/raw/$LIBDRM_TAG/xf86drm.h
+          cmp -s work/xf86drm.h.new work/sysroot/include/xf86drm.h && rm -f work/xf86drm.h.new || mv -f work/xf86drm.h.new work/sysroot/include/xf86drm.h
+
+      - name: sweetdrm
+        run: |
+          R=$GITHUB_WORKSPACE
+          # replace $2 with $1 only if they differ, so an unchanged input keeps its old mtime in a cached tree
+          keep() { cmp -s "$1" "$2" && rm -f "$1" || mv -f "$1" "$2"; }
+          echo 'keep() { cmp -s "$1" "$2" && rm -f "$1" || mv -f "$1" "$2"; }' > work/keep.sh
+          mkdir -p work/sweetdrm-src
+          cp vulkan/sweetdrm/sweetdrm.h work/sweetdrm-src/sweetdrm.h.new && keep work/sweetdrm-src/sweetdrm.h.new work/sweetdrm-src/sweetdrm.h
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -Wextra -Wno-unused-parameter \
+            -I work/sysroot/include -I work/mesa/include -I work/mesa/include/drm-uapi -I vulkan/sweetdrm \
+            -c vulkan/sweetdrm/sweetdrm.c -o work/sweetdrm.o
+          ZERO_AR_DATE=1 ar rcs work/libsweetdrm.a.new work/sweetdrm.o && keep work/libsweetdrm.a.new work/sysroot/lib/libsweetdrm.a
+          cat > work/libdrm.pc.new <<EOF
+          Name: libdrm
+          Description: sweetdrm (libdrm over RedwoodGPU)
+          Version: 2.4.124
+          Libs: -L$R/work/sysroot/lib -lsweetdrm -framework IOKit
+          Cflags: -I$R/work/sysroot/include -I$R/work/mesa/include/drm-uapi
+          EOF
+          keep work/libdrm.pc.new work/sysroot/lib/pkgconfig/libdrm.pc
+
+      - name: Turnip
+        run: |
+          R=$GITHUB_WORKSPACE
+          . work/keep.sh
+          flags="'-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK', '-I$R/work/sweetdrm-src'"
+          cat > work/ios.cross.new <<EOF
+          [binaries]
+          c = '$IOSCC'
+          cpp = '$(xcrun --sdk iphoneos --find clang++)'
+          objc = '$IOSCC'
+          ar = '$(xcrun --sdk iphoneos --find ar)'
+          strip = '$(xcrun --sdk iphoneos --find strip)'
+          pkg-config = '$(brew --prefix pkgconf)/bin/pkgconf'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+          [properties]
+          needs_exe_wrapper = true
+          [built-in options]
+          c_args = [$flags]
+          cpp_args = [$flags]
+          objc_args = [$flags]
+          c_link_args = [$flags]
+          cpp_link_args = [$flags]
+          objc_link_args = [$flags]
+          EOF
+          keep work/ios.cross.new work/ios.cross
+          export PKG_CONFIG_LIBDIR=$R/work/sysroot/lib/pkgconfig PKG_CONFIG_PATH=
+          [ -f work/build/build.ninja ] && echo "build tree from the cache" || meson setup work/build work/mesa --cross-file work/ios.cross --wrap-mode=nodownload \
+            -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dplatforms= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+            -Dllvm=disabled -Dshader-cache=disabled -Dxmlconfig=disabled -Dzstd=disabled -Dexpat=disabled \
+            -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dtools= \
+            -Dvideo-codecs= -Dvulkan-layers= -Dperfetto=false -Dandroid-libbacktrace=disabled \
+            -Dbuildtype=release -Db_ndebug=true > work/configure.log 2>&1 || { tail -60 work/configure.log; exit 1; }
+          grep -iE "libdrm|zlib|freedreno|kmds" work/configure.log | head -20
+          ninja -k 0 -C work/build src/freedreno/vulkan/libvulkan_freedreno.dylib > work/build.log 2>&1 ||
+            { grep -E "error:|undefined|Undefined" work/build.log | sort | uniq | head -80; exit 1; }
+          lib=work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib
+          nm -gU "$lib" | grep -E " T _(vk_icd|vkGetInstanceProcAddr)" || true
+          # anything non-weak left to dynamic lookup is a function sweetdrm (or iOS) lacks: fail here, not on the phone
+          if nm -m "$lib" | grep "dynamically looked up" | grep -v "weak external"; then exit 1; fi
+          echo "optional entrypoints left NULL: $(nm -m "$lib" | grep -c 'weak external.*dynamically looked up')"
+          ls -la "$lib"
+
+      - name: vktest
+        run: |
+          mkdir -p out
+          cp work/build/src/freedreno/vulkan/libvulkan_freedreno.dylib out/
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include \
+            -o out/vktest vulkan/vktest/vktest.c
+          glslangValidator -V --target-env vulkan1.1 --vn compute_spv -o work/compute_spv.h vulkan/vktest/compute.comp
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/vkcompute vulkan/vktest/vkcompute.c
+          glslangValidator -V --target-env vulkan1.1 --vn tri_vert -o work/tri_vert.h vulkan/vktest/tri.vert
+          glslangValidator -V --target-env vulkan1.1 --vn tri_frag -o work/tri_frag.h vulkan/vktest/tri.frag
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/vkdraw vulkan/vktest/vkdraw.c
+          glslangValidator -V --target-env vulkan1.1 --vn bench_vert -o work/bench_vert.h vulkan/bench/bench.vert
+          glslangValidator -V --target-env vulkan1.1 --vn bench_frag -o work/bench_frag.h vulkan/bench/bench.frag
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include -I work             -o out/bench_vk vulkan/bench/bench_vk.c
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I work/mesa/include             -o out/bench_gl vulkan/bench/bench_gl.c
+          codesign -f -s - out/libvulkan_freedreno.dylib out/vktest out/vkcompute out/vkdraw out/bench_vk out/bench_gl
+          ls -la out
+
+      - name: SweetMTL (Metal over metal2vulkan + Turnip)
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target aarch64-apple-ios
+          export IPHONEOS_DEPLOYMENT_TARGET=16.0
+          # the OnePlus 7T's cores: Kryo 485 (Cortex-A76 and A55, both ARMv8.2 with dotprod)
+          export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a76"
+          # metal2vulkan at the bridge's rev with metal/m2v-patches applied, in place of the git source
+          M2V_REV=$(sed -n 's/^metal2vulkan-runtime = .*rev = "\([0-9a-f]*\)".*/\1/p' metal/bridge/Cargo.toml)
+          rm -rf work/m2v && git init -q work/m2v
+          git -C work/m2v fetch -q --depth 1 https://github.com/steelbrain/metal2vulkan "$M2V_REV"
+          git -C work/m2v checkout -q FETCH_HEAD
+          for p in metal/m2v-patches/*.patch; do echo "apply $p"; git -C work/m2v apply "$PWD/$p"; done
+          M2V='patch."https://github.com/steelbrain/metal2vulkan"'
+          cargo +1.98.1 build --release --target aarch64-apple-ios --manifest-path metal/bridge/Cargo.toml \
+            --config "$M2V.metal2vulkan-runtime.path=\"$PWD/work/m2v/crates/metal2vulkan-runtime\"" \
+            --config "$M2V.metal2vulkan.path=\"$PWD/work/m2v/crates/metal2vulkan\"" \
+            --target-dir work/mtl-target > work/bridge.log 2>&1 ||
+            { grep -E "^(error|warning: unused)" -A8 work/bridge.log | head -120; exit 1; }
+          B=out/SweetMTL.bundle
+          mkdir -p $B
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -g -Wall -Wno-protocol \
+            -Wno-objc-property-implementation -Wno-incomplete-implementation -Wno-objc-protocol-property-synthesis -bundle -I metal/frontend \
+            -c -o out/SweetMTL.o metal/frontend/SweetMTL.m
+          # out/SweetMTL.o: the Objective-C side, for relinking the bundle off CI with a locally built bridge
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -bundle             -o $B/SweetMTL out/SweetMTL.o work/mtl-target/aarch64-apple-ios/release/libsweetmtl_bridge.a \
+            -Wl,-u,_vkGetInstanceProcAddr -framework Foundation -framework Metal -framework IOSurface -lc++
+          nm -gU $B/SweetMTL | grep -E " T _(vkGetInstanceProcAddr|smtl_device_new)"
+          cp metal/frontend/Info.plist $B/
+          cp out/libvulkan_freedreno.dylib $B/
+          codesign -f -s - $B/libvulkan_freedreno.dylib $B
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtltest \
+            metal/test/mtltest.m -framework Foundation -framework Metal
+          xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/compute.metal -o work/compute.air
+          xcrun -sdk iphoneos metallib work/compute.air -o out/compute.metallib
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlcompute             metal/test/mtlcompute.m -framework Foundation -framework Metal
+          xcrun -sdk iphoneos metal -target air64-apple-ios16.0 -c metal/test/render.metal -o work/render.air
+          xcrun -sdk iphoneos metallib work/render.air -o out/render.metallib
+          "$IOSCC" -target arm64-apple-ios16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -o out/mtlrender \
+            metal/test/mtlrender.m -framework Foundation -framework Metal -framework IOSurface
+          codesign -f -s - out/mtltest out/mtlcompute out/mtlrender
+          ls -la $B out/mtltest out/mtlrender
+
+      - name: Save Mesa cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/mesa
+            work/build
+            work/sysroot
+            work/sweetdrm-src
+            work/ios.cross
+          key: mesa-${{ runner.arch }}-${{ env.MESA_COMMIT }}-${{ hashFiles('vulkan/mesa-patches/*.patch') }}-${{ github.run_id }}
+
+      - name: Save Rust cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/mtl-target
+          key: cargo-${{ runner.arch }}-${{ hashFiles('metal/bridge/Cargo.toml') }}-${{ hashFiles('metal/bridge/*.rs') }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan
+          path: |
+            out/
+            work/configure.log
+            work/build.log
+            work/build/meson-logs/meson-log.txt
+            work/bridge.log

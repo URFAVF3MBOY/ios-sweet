@@ -1,0 +1,95 @@
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -3758,6 +3758,8 @@
+ 	}
+ }
+ 
++static void w_diag_rx(const uint8_t *f, uint32_t flen);      /* 0159 */
++
+ static void
+ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ {
+@@ -3786,6 +3788,9 @@
+ 		return;
+ 	}
+ 	flen = MIN(hdr[4], flen);
++	if (flen >= 24) {
++		w_diag_rx(f, flen);
++	}
+ 	if (flen >= 24 && (f[0] & 0x0C) == 0 && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
+ 		w_assoc_mgmt_rx(f, flen);               /* auth, assoc response, deauth, disassoc */
+ 		return;
+@@ -4483,7 +4488,10 @@
+ 	p = w_p32(p, buf);
+ 	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, buf);
+ 	memcpy(p, s_mgmt_va, buf);
+-	return wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++	bool ok = wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++	JLOG("t=%u ms: join: mgmt tx fc %02x len %u desc %u try %u -> %s", g_ms, f[0], len, s_desc, s_tries,
++	    ok ? "queued to the radio" : "FAILED");
++	return ok;
+ }
+ 
+ static uint32_t
+@@ -4861,10 +4869,41 @@
+ 	s_ptk_set = false;
+ }
+ 
++/*
++ * 0159: what the radio hears while a join runs. Join 2026-11-08: VDEV_START ok, then four auth
++ * requests with no reply (ETIMEDOUT in state 2, 1.6 s), nothing logged in between.
++ */
++static unsigned d_ap_frames, d_other_frames, d_ap_mgmt_logged;
++
++static void
++w_diag_rx(const uint8_t *f, uint32_t flen)
++{
++	if (s_state == S_IDLE) {
++		return;
++	}
++	bool from_ap = memcmp(f + 10, s_bssid, 6) == 0;
++	if (from_ap) {
++		d_ap_frames++;
++	} else {
++		d_other_frames++;
++	}
++	bool beacon = (f[0] & 0x0C) == 0 && ((f[0] >> 4) == 8 || (f[0] >> 4) == 5);
++	if ((from_ap || memcmp(f + 4, our_mac, 6) == 0) && !beacon && d_ap_mgmt_logged < 40) {
++		d_ap_mgmt_logged++;
++		JLOG("t=%u ms: join: heard fc %02x%02x len %u from %02x:%02x:%02x:**:**:** to %02x:%02x:%02x:**:**:** (state %u)",
++		    g_ms, f[0], f[1], flen, f[10], f[11], f[12], f[4], f[5], f[6], s_state);
++	}
++}
++
+ static void
+ w_join_end(int result)
+ {
+ 	if (result != 0) {
++		JLOG("t=%u ms: join: while joining the radio heard %u frames from the AP (beacons etc), %u from others",
++		    g_ms, d_ap_frames, d_other_frames);
++	}
++	d_ap_frames = d_other_frames = 0;
++	if (result != 0) {
+ 		JLOG("t=%u ms: join: failed (%d) in state %u", g_ms, result, s_state);
+ 		w_teardown();
+ 	} else {
+@@ -5330,9 +5369,18 @@
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+ 		break;
+-	default:
++	default: {
++		static unsigned unhandled_logged;
++		if (s_state != S_IDLE && unhandled_logged < 60) {   /* 0159: e.g. the mgmt-tx completion */
++			unhandled_logged++;
++			uint32_t w[4] = {};
++			memcpy(w, d + 4, MIN(len - 4, (uint32_t)sizeof(w)));
++			JLOG("t=%u ms: join: wmi event 0x%x len %u (not handled) state %u: %08x %08x %08x %08x", g_ms, id, len,
++			    s_state, w[0], w[1], w[2], w[3]);
++		}
+ 		break;
+ 	}
++	}
+ }
+ 
+ /*

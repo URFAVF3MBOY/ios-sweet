@@ -1,0 +1,47 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 82efb07..7c477ff 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -327,6 +327,10 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_dma_buf = true,
++#ifdef __APPLE__
++      /* iOS: advertised so that metal2vulkan's no-copy buffers take their dma-buf route; every pointer is refused */
++      .EXT_external_memory_host = true,
++#endif
+       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_fragment_density_map_offset = true,
+@@ -1346,6 +1350,11 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    /* VK_KHR_push_descriptor */
+    props->maxPushDescriptors = MAX_PUSH_DESCRIPTORS;
+ 
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host (refuses every pointer: tu_GetMemoryHostPointerPropertiesEXT) */
++   props->minImportedHostPointerAlignment = 16384;
++#endif
++
+    /* VK_EXT_transform_feedback */
+    if (pdevice->info->props.is_a702) {
+        /* a702 only 32 streamout ram entries.. 1 stream, 64 components */
+@@ -4417,6 +4426,19 @@ tu_GetMemoryFdKHR(VkDevice _device,
+    return VK_SUCCESS;
+ }
+ 
++#ifdef __APPLE__
++/* iOS (RedwoodGPU): no import of host pages by pointer; IOSurfaces come in as dma-bufs (sweetdrm). */
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
++                                     VkExternalMemoryHandleTypeFlagBits handleType,
++                                     const void *pHostPointer,
++                                     VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   pMemoryHostPointerProperties->memoryTypeBits = 0;
++   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ tu_GetMemoryFdPropertiesKHR(VkDevice _device,
+                             VkExternalMemoryHandleTypeFlagBits handleType,

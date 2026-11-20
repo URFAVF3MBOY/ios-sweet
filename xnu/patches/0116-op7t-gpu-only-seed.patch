@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -44,6 +44,7 @@
+ 	uint64_t                  clientAddress;
+ 	uint32_t                  gpuDrawn;     /* the GPU's last submission naming the pixels (RedwoodGPU.cpp), 0: none */
+ 	uint32_t                  gpuSynced;    /* ... the one after which the CPU's cache was last invalidated */
++	uint32_t                  cleanSeed;    /* 0116: a seed with no CPU write since the cache was last pushed (RedwoodGPU.cpp) */
+ 	uint32_t                  scanSlot;     /* 0108: 1 + slot of the scanout pool holding the pixels, 0: none */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -72,6 +72,7 @@
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockAvoidSync         0x2     /* 0116: "not going to modify the data" */
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -993,10 +994,19 @@
+ }
+ 
+ static IOReturn
+-sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
++sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump, bool cpuIdle = false)
+ {
+-	uint32_t seed = bump ? OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) + 1 :
+-	    *sweet_surface_seed(s);
++	uint32_t old = bump ? (uint32_t)OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) : *sweet_surface_seed(s);
++	uint32_t seed = bump ? old + 1 : old;
++	/*
++	 * 0116: an unlock that says it wrote nothing (kIOSurfaceLockAvoidSync: our GL library after the
++	 * GPU drew, only so that others see the seed move) keeps the surface clean for the cache: if
++	 * there was no CPU write before it either, the new seed is clean too and RedwoodGPU's submit
++	 * does not push 13 MB out of the cache for it.
++	 */
++	if (bump && cpuIdle) {
++		(void)OSCompareAndSwap(old, seed, (volatile UInt32 *)&s->cleanSeed);
++	}
+ 	if (seedOut != NULL && copyout(&seed, (user_addr_t)seedOut, sizeof(seed)) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -1043,7 +1053,7 @@
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+-	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	    !((uintptr_t)options & kIOSurfaceLockReadOnly), ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0);
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1057,11 +1057,21 @@
+ 			if (!b->surface->wrapped && OSDynamicCast(IOBufferMemoryDescriptor, b->surface->memory) == NULL) {
+ 				continue;
+ 			}
+-			if (b->kernel == NULL || (seed == b->seed && !b->seen && began - b->pushed < again)) {
++			/*
++			 * 0116: a seed that moved only by unlocks that wrote nothing (kIOSurfaceLockAvoidSync,
++			 * SweetSurface.cpp) is as good as the same seed: nothing new of the CPU's to push.
++			 */
++			bool clean = seed == b->seed || seed == b->surface->cleanSeed;
++
++			if (b->kernel == NULL || (clean && !b->seen && began - b->pushed < again)) {
++				if (clean) {
++					b->seed = seed;
++				}
+ 				continue;
+ 			}
+ 			b->seed = seed;
+ 			b->pushed = began;
++			b->surface->cleanSeed = seed;  /* 0116: pushed: nothing of the CPU's left in the cache at this seed */
+ 		} else if (!b->seen || !gGPUCached) {
+ 			continue;
+ 		}

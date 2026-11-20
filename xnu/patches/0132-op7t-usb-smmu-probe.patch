@@ -1,0 +1,156 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 02:30:00 +0000
+Subject: [PATCH] op7t-0132: read-only apps SMMU probe for USB (sysctl kern.sweetsmmu)
+
+USB on the 7T sits behind the apps SMMU (stream ID 0x140), unlike the Redmi,
+and starting the USB device (sweetusb=2) sent the phone to crashdump. Before
+the next USB attempt: what does the stream-match entry for 0x140 say now --
+bypass, translate (whose page tables?) or fault? Read over SSH:
+  sysctl kern.sweetsmmu
+Register reads only, on demand. No effect unless read.
+
+Apply after 0131 (bsd/conf/files context).
+---
+ bsd/conf/files       |   1 +
+ bsd/dev/sweet_smmu.c | 121 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 45ade07..b927265 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_clock.c			standard
++bsd/dev/sweet_smmu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+new file mode 100755
+index 0000000..11f2bbb
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.c
+@@ -0,0 +1,121 @@
++/*
++ * 0132: read-only look at the apps SMMU (OnePlus 7T), for USB.
++ *
++ * On the 7T, USB DMA goes through the apps SMMU (DT iommus <&apps_smmu 0x140 0>; the Redmi's did
++ * not), and starting the USB device (0073-0076, 0092) sent the phone to crashdump. The SMMU is set
++ * up before us (DT qcom,skip-init): what matters is what the stream-match entry for USB's stream ID
++ * says now: bypass (physical addresses work), translate (whose page tables, and do they survive
++ * XNU?) or fault. `sysctl kern.sweetsmmu` prints, for SIDs 0x140 (USB) and 0x160 (2nd USB):
++ * the matching SMRs, their S2CR (type, context bank) and, for a translating bank, CBAR, SCTLR,
++ * TCR, TTBR0, FSR, FAR. Register reads only, on demand; nothing is written.
++ * ARM SMMUv2: SMR(n) GR0+0x800 (VALID 31, MASK 30:16, ID 14:0), S2CR(n) GR0+0xc00 (TYPE 17:16,
++ * CBNDX 7:0), CBAR(n) GR1+4n, context bank n at base + NUMPAGE*PAGESIZE + n*PAGESIZE.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/kalloc.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SMMU_PA         0x15000000u
++#define SMMU_SIZE       0x00100000u
++#define SMMU_TEXT       4096
++
++static vm_offset_t smmu;
++static const uint32_t smmu_sids[] = { 0x140, 0x160 };
++
++static uint32_t
++smmu_rd(uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(smmu + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++static uint64_t
++smmu_rd64(uint32_t off)
++{
++	return (uint64_t)smmu_rd(off) | (uint64_t)smmu_rd(off + 4) << 32;
++}
++
++static int
++sysctl_sweetsmmu SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static const char *s2cr_type[] = { "translate", "bypass", "fault", "reserved" };
++	char *text;
++	size_t len = 0;
++	int error;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (smmu == 0) {
++		smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++		if (smmu == 0) {
++			return ENOMEM;
++		}
++	}
++	text = kalloc_data(SMMU_TEXT, Z_WAITOK | Z_ZERO);
++	if (text == NULL) {
++		return ENOMEM;
++	}
++#define SMMU_OUT(...) do { \
++	if (len < SMMU_TEXT) { \
++	        int n_ = snprintf(text + len, SMMU_TEXT - len, __VA_ARGS__); \
++	        len += n_ > 0 ? (size_t)n_ : 0; \
++	        if (len >= SMMU_TEXT) { \
++	                len = SMMU_TEXT - 1; \
++	        } \
++	} \
++} while (0)
++
++	uint32_t scr0 = smmu_rd(0x0), idr0 = smmu_rd(0x20), idr1 = smmu_rd(0x24);
++	uint32_t nsmr = idr0 & 0xffu, ncb = idr1 & 0xffu;
++	uint32_t pagesize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	uint32_t cb_base = numpage * pagesize;
++	SMMU_OUT("sCR0 %08x (CLIENTPD %u, USFCFG %u) sIDR0 %08x sIDR1 %08x: %u SMRs, %u context banks, page %#x, CB at +%#x\n",
++	    scr0, scr0 & 1u, (scr0 >> 10) & 1u, idr0, idr1, nsmr, ncb, pagesize, cb_base);
++
++	for (unsigned s = 0; s < sizeof(smmu_sids) / sizeof(smmu_sids[0]); s++) {
++		uint32_t sid = smmu_sids[s];
++		unsigned found = 0;
++		for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++			uint32_t smr = smmu_rd(0x800 + 4 * i);
++			uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++			if (!(smr & (1u << 31)) || ((sid ^ id) & ~mask & 0x7fffu) != 0) {
++				continue;
++			}
++			found++;
++			uint32_t s2cr = smmu_rd(0xc00 + 4 * i), type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
++			SMMU_OUT("SID %#x: SMR[%u] %08x (id %#x mask %#x) S2CR %08x: %s", sid, i, smr, id, mask, s2cr,
++			    s2cr_type[type]);
++			if (type != 0 || cb >= ncb || cb_base + (cb + 1) * pagesize > SMMU_SIZE) {
++				SMMU_OUT("\n");
++				continue;
++			}
++			uint32_t cbo = cb_base + cb * pagesize;
++			SMMU_OUT(" -> bank %u: CBAR %08x SCTLR %08x TCR %08x TTBR0 %016llx FSR %08x FAR %016llx\n",
++			    cb, smmu_rd(pagesize + 4 * cb), smmu_rd(cbo + 0x0), smmu_rd(cbo + 0x30),
++			    (unsigned long long)smmu_rd64(cbo + 0x20), smmu_rd(cbo + 0x58),
++			    (unsigned long long)smmu_rd64(cbo + 0x60));
++		}
++		if (found == 0) {
++			SMMU_OUT("SID %#x: no valid SMR matches (unmatched streams: sCR0.USFCFG %s)\n", sid,
++			    (scr0 >> 10) & 1u ? "fault" : "bypass");
++		}
++	}
++#undef SMMU_OUT
++	error = SYSCTL_OUT(req, text, len + 1);
++	kfree_data(text, SMMU_TEXT);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetsmmu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetsmmu, "A",
++    "apps SMMU stream mapping for USB (0132, read only)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

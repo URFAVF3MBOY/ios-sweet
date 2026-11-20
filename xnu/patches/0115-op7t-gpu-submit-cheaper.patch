@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -473,7 +473,12 @@
+ 		k1_l3_made++;
+ 	}
+ 	tab[(va >> 12) & 0x1ffU] = pa | PTE_PAGE | PTE_ATTR | (read_only ? K1_PTE_RO : 0);
+-	k1_clean(&tab[(va >> 12) & 0x1ffU], 8);
++	/*
++	 * 0115: the line out of the cache, but no barrier per page: a 13 MB surface is 3400 pages,
++	 * and a dsb sy each was most of mapping it. The caller ends the run with sweet_gpu_mapped()
++	 * (dsb sy) before anything is submitted.
++	 */
++	__asm__ volatile("dc civac, %0" : : "r"((vm_offset_t)&tab[(va >> 12) & 0x1ffU] & ~(vm_offset_t)63) : "memory");
+ 	return 1;
+ }
+ 
+@@ -539,11 +544,20 @@
+ 	if (k1_tlb_method >= 1)
+ 		k1_cbw(CB_TLBIASID, k1_cb_index);
+ 	if (k1_tlb_method >= 2) {
+-		/* every page: on the 7T TLBIASID does not reach these entries (method 2 is what works) */
++		/*
++		 * every page: on the 7T TLBIASID does not reach these entries (method 2 is what works).
++		 * 0115: without a dsb sy after each write (two per page; 6800 for a 13 MB surface):
++		 * Device-nGnRE keeps writes to one device in order, and the dsb before TLBSYNC below makes
++		 * sure all of them have reached the SMMU first -- Linux arm-smmu does the same
++		 * (writel_relaxed per granule, then the sync).
++		 */
++		volatile uint64_t *iva = (volatile uint64_t *)(k1_cb + CB_TLBIVA);
++		volatile uint64_t *ivaa = (volatile uint64_t *)(k1_cb + CB_TLBIVAA);
+ 		for (uint64_t o = 0; o < size; o += 0x1000) {
+-			k1_cbw64(CB_TLBIVA, ((va + o) >> 12) & 0xfffffffffffULL);
+-			k1_cbw64(CB_TLBIVAA, ((va + o) >> 12) & 0xfffffffffffULL);
++			*iva = ((va + o) >> 12) & 0xfffffffffffULL;
++			*ivaa = ((va + o) >> 12) & 0xfffffffffffULL;
+ 		}
++		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+ 	k1_cbw(CB_TLBSYNC, 0);
+ 	unsigned i;
+@@ -586,8 +600,11 @@
+ 		if (k1_l3[t] != NULL) {
+ 			uint64_t *e = &k1_l3[t][(v >> 12) & 0x1ffU];
+ 			*e = 0;
+-			vm_offset_t line = (vm_offset_t)e & ~(vm_offset_t)63;
+-			__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++			/* 0115: a 64-byte line holds 8 entries: clean it once, at its last entry or the end */
++			if ((((vm_offset_t)e + 8) & 63) == 0 || o + 0x1000 >= size) {
++				vm_offset_t line = (vm_offset_t)e & ~(vm_offset_t)63;
++				__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++			}
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -216,7 +216,15 @@
+ #define GPU_SUBMIT_BOS          8192
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+-#define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
++#define GPU_PUSH_AGAIN_MS       33              /* a surface is pushed out of the cache again for a submission this long after the last */
++/*
++ * 0115: was 4 ms. With ~170 submissions a second (2026-10-24 profile) 4 ms meant every unchanged
++ * surface was pushed again at every submission: ~13 MB and ~0.7-1 ms each, 3-4 times a frame.
++ * Surfaces whose seed changes (who writes one locks it), or that this program maps, are still
++ * pushed every time; this only spaces out the safety re-push for writers that say nothing, to
++ * two frames. Boot-arg sweetgpupush=MS sets it (4 = the old behaviour).
++ */
++static uint32_t gGPUPushAgainMs = GPU_PUSH_AGAIN_MS;
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+@@ -413,6 +421,7 @@
+ 	 * write-combined buffers again, as on HackiOS, for when that is understood.
+ 	 */
+ 	(void) PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
++	(void) PE_parse_boot_argn("sweetgpupush", &gGPUPushAgainMs, sizeof(gGPUPushAgainMs));      /* 0115 */
+ 	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+@@ -709,11 +718,17 @@
+ 		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+ 		return NULL;
+ 	}
+-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++	for (uint64_t offset = 0; offset < size && mapped;) {
+ 		IOByteCount length = 0;
+ 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+ 
+-		mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++		/* 0115: every page of the physically contiguous run, one lookup (was one per page) */
++		if (phys == 0 || length < 4096) {
++			length = 4096;
++		}
++		for (uint64_t run = 0; run < length && offset < size && mapped; run += 4096, offset += 4096) {
++			mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys + run, flags & MSM_BO_GPU_READONLY);
++		}
+ 	}
+ 	redwood_gpu_mapped();
+ 	if (!mapped) {
+@@ -1024,7 +1039,7 @@
+ 	 * ordinary memory (gpu_cached=1).
+ 	 */
+ 	began = mach_absolute_time();
+-	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
++	nanoseconds_to_absolutetime((uint64_t)gGPUPushAgainMs * NSEC_PER_MSEC, &again);
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
+ 

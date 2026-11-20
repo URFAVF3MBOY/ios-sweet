@@ -1,0 +1,104 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 02:30:00 -0500
+Subject: [PATCH] op7t-0166: Wi-Fi: the link-quality event wifid reads (39)
+
+0165 booted (2026-11-10): event 145 went out every 5 s with RSSI -61..-65,
+and the bars stayed grey; wifid logged nothing about it. wifid's
+link-quality handler (0x100058f80, "Too frequent(%f secs) LQM event from
+driver, ignoring") reads RSSI, SNR, NOISE, CCA and the tx/rx counters
+from a dictionary that IO80211.framework of 16.5 builds for event 39
+(its event switch: "cmp w2, #0x27" -> parser at 0x226599120 of that
+boot's slide) from at least 180 bytes:
+  0x00 u8 rssi valid, 0x04 int32 rssi, 0x08 u8 per-core valid + 2 int8,
+  0x0b u8 snr valid, 0x0c int16 snr, 0x0e u8 noise valid, 0x10 int16
+  noise, 0x12 u8 cca valid, 0x13 u8 cca, then counters.
+Now posted next to 145 with RSSI, SNR and noise (-95) valid, counters 0.
+A refusal by kev_post_msg is logged ("link quality event 39 not
+posted"); 24 + 16 + 180 bytes fit in MLEN.
+
+Apply after 0165.
+---
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index fd875f5..ccd5230 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -208,7 +208,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10, EVENT_WEIGHT_AVG_LQM_UPDATE = 145 };
++       EVENT_SCAN_DONE = 10, EVENT_LQM = 39, EVENT_WEIGHT_AVG_LQM_UPDATE = 145 };
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -624,7 +624,7 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 
+ /* ---- events -------------------------------------------------------------------------------------------- */
+ 
+-static void
++static int
+ post(uint32_t code, const void *data, uint32_t length)
+ {
+ 	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
+@@ -638,7 +638,7 @@ post(uint32_t code, const void *data, uint32_t length)
+ 		message.dv[1].data_length = length;
+ 		message.dv[1].data_ptr = __DECONST(void *, data);
+ 	}
+-	kev_post_msg(&message);
++	return kev_post_msg(&message);
+ }
+ 
+ /*
+@@ -658,6 +658,27 @@ struct apple80211_weight_avg_lqm {
+ };
+ _Static_assert(sizeof(struct apple80211_weight_avg_lqm) == 16, "IO80211.framework of 16.5 reads 16 bytes, or nothing");
+ 
++/*
++ * 0166: 145 alone left the bars grey. wifid's link-quality handler (the one that logs "Too frequent(%f
++ * secs) LQM event from driver, ignoring" and reads RSSI, SNR, NOISE, CCA, TXFRAMES ...) is fed by event
++ * 39: IO80211.framework of 16.5 builds that dictionary from at least 180 bytes, each value behind a
++ * byte that says it is there. RSSI, SNR and noise are; the counters stay 0.
++ */
++struct apple80211_lqm {
++	uint8_t rssi_valid, pad0[3];
++	int32_t rssi;                           /* 0x04 */
++	uint8_t per_core_valid;                 /* 0x08 */
++	int8_t per_core[2];
++	uint8_t snr_valid;                      /* 0x0b */
++	int16_t snr;                            /* 0x0c */
++	uint8_t noise_valid, pad1;              /* 0x0e */
++	int16_t noise;                          /* 0x10 */
++	uint8_t cca_valid, cca;                 /* 0x12 */
++	uint8_t rest[180 - 0x14];               /* transmit/receive counters: 0 */
++};
++_Static_assert(sizeof(struct apple80211_lqm) == 180 && offsetof(struct apple80211_lqm, snr) == 0xc &&
++    offsetof(struct apple80211_lqm, noise) == 0x10, "IO80211.framework of 16.5: at least 180 bytes");
++
+ static thread_call_t lqm_call;
+ static bool lqm_running;
+ 
+@@ -684,7 +705,24 @@ lqm_post(void)
+ 		struct apple80211_weight_avg_lqm lqm = { .rssi = state->bss.rssi, .snr = snr_of(state->bss.rssi), .tx_rate = 54,
+ 			                                 .rx_rate = 54 };
+ 
++		struct apple80211_lqm *full = kalloc_data(sizeof(*full), Z_WAITOK | Z_ZERO);
++
+ 		post(EVENT_WEIGHT_AVG_LQM_UPDATE, &lqm, sizeof(lqm));
++		if (full != NULL) {             /* 0166 */
++			full->rssi_valid = 1;
++			full->rssi = lqm.rssi;
++			full->snr_valid = 1;
++			full->snr = (int16_t)lqm.snr;
++			full->noise_valid = 1;
++			full->noise = NOISE_FLOOR_DBM;
++			/* (24 + 16 + 180 bytes: under kev_post_msg's limit of one mbuf's data, MLEN) */
++			int error = post(EVENT_LQM, full, sizeof(*full));
++
++			if (error != 0 && said < 20) {
++				printf("apple80211: link quality event 39 not posted: %d\n", error);
++			}
++			kfree_data(full, sizeof(*full));
++		}
+ 		if (said < 20) {
+ 			said++;
+ 			printf("apple80211: link quality: rssi %d, snr %d\n", lqm.rssi, lqm.snr);

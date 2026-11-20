@@ -1,0 +1,210 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 20:30:00 -0400
+Subject: [PATCH] op7t-0140: unattended test runs: kern.sweetswipe, kern.sweetreboot
+
+For fps and profiling runs without anyone at the phone: kern.sweetswipe=N
+swipes left and right between home-screen pages for N seconds through the
+touch driver's own entry point (sweet_hid_touch): finger 9, panel pixels,
+15 moves 16 ms apart across 720 px, 350 ms between swipes, alternating
+direction. kern.sweetswipe=0 stops; reading gives the seconds left.
+kern.sweetreboot=2 reboots into fastboot (IMEM restart reason 0x77665500,
+as the shim, then PSCI SYSTEM_RESET via smc as 0065); =1 plain reboot; sync
+first. This kernel had no software reboot at all.
+Log: "HOTDOGB SWIPE: ...", "HOTDOGB REBOOT: ...". Both syntax-checked with clang -Wall -Wextra on stubs.
+
+Apply after 0134 (bsd/conf/files context).
+---
+ bsd/conf/files         |  2 ++
+ bsd/dev/sweet_reboot.c | 66 ++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_swipe.c  | 98 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 166 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1563cfb..dd59268 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,8 @@ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_clock.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_cores.c			standard
++bsd/dev/sweet_swipe.c			standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+new file mode 100755
+index 0000000..57a2868
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,66 @@
++/*
++ * 0140: reboot from a root shell, into fastboot or plainly -- so a test run needs no one at the
++ * buttons: sync; sysctl kern.sweetreboot=2, then `fastboot boot` the next image from the PC.
++ *   sysctl kern.sweetreboot=2   the bootloader's restart reason "bootloader" (0x77665500 in IMEM
++ *                               restart_reason@0x146aa65c, as the shim's reset() writes it), then
++ *                               PSCI SYSTEM_RESET: ABL comes up in fastboot
++ *   sysctl kern.sweetreboot=1   PSCI SYSTEM_RESET alone
++ * No filesystem sync here: run `sync` first. This kernel has no haltRestart of its own
++ * (SweetPlatformExpert), so this is also the only software reboot it has.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define IMEM_PAGE               0x146aa000u
++#define IMEM_RESTART_REASON     0x65cu
++#define RESTART_BOOTLOADER      0x77665500u
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++/* SMCCC 1.0, as sweet_psci_cpu_on (0065) */
++static void
++sweet_psci_system_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++static int
++sysctl_sweetreboot SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != 1 && value != 2) {
++		return EINVAL;
++	}
++	if (value == 2) {
++		vm_offset_t imem = ml_io_map(IMEM_PAGE, 0x1000);
++		if (imem == 0) {
++			return ENOMEM;
++		}
++		*(volatile uint32_t *)(imem + IMEM_RESTART_REASON) = RESTART_BOOTLOADER;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	printf("HOTDOGB REBOOT: %s\n", value == 2 ? "into fastboot" : "plain");
++	delay(200 * 1000);                      /* (the line out to the persistent log) */
++	sweet_psci_system_reset();
++	return EIO;                             /* (only if the firmware refused) */
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetreboot, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetreboot, "I",
++    "1: reboot, 2: reboot into fastboot (0140; sync first)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_swipe.c b/bsd/dev/sweet_swipe.c
+new file mode 100755
+index 0000000..838b193
+--- /dev/null
++++ b/bsd/dev/sweet_swipe.c
+@@ -0,0 +1,98 @@
++/*
++ * 0140: synthetic home-screen swipes, for fps and profiling runs without anyone at the phone.
++ *   sysctl kern.sweetswipe=N    swipe left and right between home-screen pages for N seconds
++ *   sysctl kern.sweetswipe=0    stop after the current swipe
++ *   sysctl kern.sweetswipe      seconds left
++ * The swipes go in where the touch controller's do (sweet_hid_touch, SweetHID.cpp): finger 9
++ * (the controller's own fingers count from 0), panel pixels 1080x2400. One swipe: down, 15 moves
++ * 16 ms apart across 720 px at mid-height, up; 350 ms between swipes; the direction alternates,
++ * so the home screen goes to the next page and back.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/thread.h>
++
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern kern_return_t thread_terminate(thread_t);
++
++#define SWIPE_FINGER    9
++#define SWIPE_Y         1300
++#define SWIPE_RIGHT_X   900
++#define SWIPE_LEFT_X    180
++#define SWIPE_STEPS     15
++#define SWIPE_STEP_MS   16u
++#define SWIPE_PAUSE_MS  350u
++
++static volatile uint64_t swipe_deadline;        /* mach absolute time; 0: stop */
++static volatile bool swipe_running;
++static uint32_t swipe_count;
++
++static void
++swipe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int towards_left = 1;
++
++	while (mach_absolute_time() < swipe_deadline) {
++		int from = towards_left ? SWIPE_RIGHT_X : SWIPE_LEFT_X;
++		int to = towards_left ? SWIPE_LEFT_X : SWIPE_RIGHT_X;
++
++		for (int i = 0; i <= SWIPE_STEPS; i++) {
++			sweet_hid_touch(SWIPE_FINGER, 1, from + (to - from) * i / SWIPE_STEPS, SWIPE_Y);
++			delay_for_interval(SWIPE_STEP_MS, (uint32_t)NSEC_PER_MSEC);
++		}
++		sweet_hid_touch(SWIPE_FINGER, 0, to, SWIPE_Y);
++		swipe_count++;
++		towards_left = !towards_left;
++		delay_for_interval(SWIPE_PAUSE_MS, (uint32_t)NSEC_PER_MSEC);
++	}
++	printf("HOTDOGB SWIPE: done, %u swipes\n", swipe_count);
++	swipe_running = false;
++	thread_terminate(current_thread());
++}
++
++static int
++sysctl_sweetswipe SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t now = mach_absolute_time(), left_ns = 0;
++	if (swipe_deadline > now) {
++		absolutetime_to_nanoseconds(swipe_deadline - now, &left_ns);
++	}
++	int value = (int)(left_ns / NSEC_PER_SEC), changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 3600) {
++		return EINVAL;
++	}
++	if (value == 0) {
++		swipe_deadline = 0;
++		return 0;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline((uint32_t)value, (uint32_t)NSEC_PER_SEC, &deadline);
++	swipe_deadline = deadline;
++	if (!swipe_running) {
++		thread_t thread;
++		swipe_running = true;
++		swipe_count = 0;
++		if (kernel_thread_start(swipe_thread, NULL, &thread) != KERN_SUCCESS) {
++			swipe_running = false;
++			return ENOMEM;
++		}
++		thread_deallocate(thread);
++	}
++	printf("HOTDOGB SWIPE: swiping the home screen for %d s\n", value);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetswipe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetswipe, "I",
++    "synthetic home-screen swipes for N seconds (0140)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

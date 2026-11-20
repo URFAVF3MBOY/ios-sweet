@@ -1,0 +1,279 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 07:20:00 -0500
+Subject: [PATCH] op7t-0172: Bluetooth: firmware from bluetooth_a, a small FAT reader
+
+0171 booted (2026-11-11 00:07, 7 GiB): version and reset answered as
+before, the file number came out 11 as meant, but "image/crbtfw11.tlv:
+not on the modem partition": the BT files are on the bluetooth_a
+partition (backup/wifi-files.txt, section "== bluetooth_a"), not on
+modem_a. SweetModem's FAT index is the modem's own (it serves the modem's
+file requests at run time), so sweet_bt.c gets its own minimal read-only
+reader on sweet_ufs_read_part("bluetooth_a", ...): FAT12/16/32, short 8.3
+names (IMAGE/CRBTFW11.TLV, IMAGE/CRNV11.BIN), cluster chains. Logs the
+volume ("FAT%u, N-byte clusters"); the rest of 0171 is unchanged.
+
+Apply after 0171.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 3693192..63f2510 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -25,8 +25,8 @@
+  *     event 0xFF: cresp 0, rtype 2, product id, patch, ROM version, SoC id) and HCI_Reset; every
+  *     byte that comes back is logged, and the ROM version and SoC id are decoded.
+  * 0169 worked (2026-11-10): SoC id 0x40010224, ROM 0x1001, patch 0x6699; HCI_Reset status 0.
+- * 0171, step 3: then the firmware from the modem partition (image/crbtfw11.tlv, image/crnv11.bin for
+- * this chip), as Linux btqca.c: TLV in 243-byte EDL segments (HCI 0xFC00, command 0x1E), each answered
++ * 0171, step 3: then the firmware (image/crbtfw11.tlv, image/crnv11.bin for this chip; 0172: from
++ * the bluetooth_a partition, read by a small FAT reader here), as Linux btqca.c: TLV in 243-byte EDL segments (HCI 0xFC00, command 0x1E), each answered
+  * by vendor event rtype 4 unless the patch header's download mode skips it (the last always waits);
+  * NVM with in-band sleep off and the UART speed 115200 in its HCI tag; HCI_Reset; Read Local Version.
+  * Reading kern.sweetbt gives the stage reached: 0 not run, 1 clock, 2 UART up, 3 the chip answered
+@@ -46,9 +46,8 @@
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);    /* (private to the kernel proper; declared as the other drivers do) */
+-/* 0171: files of the modem partition (SweetModem.cpp, 0096: the index the Wi-Fi board data comes from; needs sweetmodem=1) */
+-extern int64_t topaz_part_fw_size(const char *path);
+-extern bool topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n);
++/* 0172: a GPT partition by name, through the UFS host (bsd/dev/sweet_ufs.c, 0096); 0 = read */
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ 
+ #define BT_GCC_PA       0x00100000u
+ #define BT_GCC_LEN      0x00060000u
+@@ -445,11 +444,220 @@ wait_vse(uint8_t rtype, unsigned timeout_us, uint8_t *result)
+ 	return false;
+ }
+ 
++/*
++ * 0172: the firmware is not on modem_a (0171 asked SweetModem's index and found nothing) but on
++ * bluetooth_a (backup/wifi-files.txt: "== bluetooth_a" /image/crbtfw11.tlv, /image/crnv11.bin), a
++ * small FAT volume. SweetModem's FAT index is the modem's own (the modem asks it for files while
++ * it runs), so this is a second, read-only and minimal reader: FAT12/16/32, short (8.3) names only
++ * (IMAGE, CRBTFW11.TLV and CRNV11.BIN are short names), one directory level.
++ */
++#define BT_PART "bluetooth_a"
++
++static struct {
++	bool mounted;
++	unsigned type;
++	uint32_t bps, clus_bytes, nclus, root_entries, root_clus, fat_bytes;
++	uint64_t fat_off, root_off, data_off;
++	uint8_t *fat;
++} bfat;
++
++static bool
++bpart(uint64_t off, void *dst, uint64_t n)
++{
++	return sweet_ufs_read_part(BT_PART, off, dst, n) == 0;
++}
++
++static uint32_t
++bfat_next(uint32_t c)
++{
++	if (bfat.type == 12) {
++		uint32_t at = c + c / 2;
++
++		if (at + 1 >= bfat.fat_bytes) {
++			return 0x0fffffff;
++		}
++		uint32_t v = bfat.fat[at] | bfat.fat[at + 1] << 8;
++		v = (c & 1) ? v >> 4 : v & 0xfff;
++		return v >= 0xff8 ? 0x0fffffff : v;
++	}
++	if (bfat.type == 16) {
++		if (2 * c + 1 >= bfat.fat_bytes) {
++			return 0x0fffffff;
++		}
++		uint32_t v = bfat.fat[2 * c] | bfat.fat[2 * c + 1] << 8;
++		return v >= 0xfff8 ? 0x0fffffff : v;
++	}
++	if (4 * c + 3 >= bfat.fat_bytes) {
++		return 0x0fffffff;
++	}
++	uint32_t v = (bfat.fat[4 * c] | bfat.fat[4 * c + 1] << 8 | bfat.fat[4 * c + 2] << 16 | (uint32_t)bfat.fat[4 * c + 3] << 24) & 0x0fffffff;
++	return v >= 0x0ffffff8 ? 0x0fffffff : v;
++}
++
++static bool
++bfat_mount(void)
++{
++	uint8_t b[512];
++
++	if (bfat.mounted) {
++		return true;
++	}
++	if (!bpart(0, b, sizeof(b))) {
++		printf("sweet_bt: %s: cannot read it\n", BT_PART);
++		return false;
++	}
++	uint32_t bps = b[11] | b[12] << 8, spc = b[13], rsv = b[14] | b[15] << 8, nfats = b[16];
++	uint32_t root_ent = b[17] | b[18] << 8, tot = b[19] | b[20] << 8, fatsz = b[22] | b[23] << 8;
++	if (tot == 0) {
++		tot = b[32] | b[33] << 8 | b[34] << 16 | (uint32_t)b[35] << 24;
++	}
++	if (fatsz == 0) {
++		fatsz = b[36] | b[37] << 8 | b[38] << 16 | (uint32_t)b[39] << 24;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa || (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) || spc == 0 ||
++	    (spc & (spc - 1)) != 0 || rsv == 0 || nfats == 0 || nfats > 2 || fatsz == 0) {
++		printf("sweet_bt: %s is not a FAT volume (bps %u spc %u rsv %u fats %u)\n", BT_PART, bps, spc, rsv, nfats);
++		return false;
++	}
++	uint32_t root_secs = (root_ent * 32 + bps - 1) / bps;
++	uint64_t data_sec = (uint64_t)rsv + (uint64_t)nfats * fatsz + root_secs;
++	if (data_sec >= tot) {
++		printf("sweet_bt: %s: FAT geometry does not fit\n", BT_PART);
++		return false;
++	}
++	bfat.bps = bps;
++	bfat.clus_bytes = bps * spc;
++	bfat.nclus = (uint32_t)((tot - data_sec) / spc);
++	bfat.type = bfat.nclus < 4085 ? 12 : bfat.nclus < 65525 ? 16 : 32;
++	bfat.fat_off = (uint64_t)rsv * bps;
++	bfat.root_off = bfat.fat_off + (uint64_t)nfats * fatsz * bps;
++	bfat.root_entries = root_ent;
++	bfat.root_clus = b[44] | b[45] << 8 | b[46] << 16 | (uint32_t)b[47] << 24;
++	bfat.data_off = data_sec * bps;
++	bfat.fat_bytes = fatsz * bps > (1u << 20) ? (1u << 20) : fatsz * bps;
++	bfat.fat = kalloc_data(bfat.fat_bytes, Z_WAITOK);
++	if (bfat.fat == NULL || !bpart(bfat.fat_off, bfat.fat, bfat.fat_bytes)) {
++		printf("sweet_bt: %s: cannot read the FAT\n", BT_PART);
++		return false;
++	}
++	bfat.mounted = true;
++	printf("sweet_bt: %s: FAT%u, %u-byte clusters, %u clusters\n", BT_PART, bfat.type, bfat.clus_bytes, bfat.nclus);
++	return true;
++}
++
++/* bytes [off, off + n) of the cluster chain from c */
++static bool
++bfat_chain_read(uint32_t c, uint64_t off, void *dst, uint64_t n)
++{
++	uint8_t *d = dst;
++
++	for (uint64_t skip = off / bfat.clus_bytes; skip > 0; skip--) {
++		c = bfat_next(c);
++		if (c < 2 || c >= bfat.nclus + 2) {
++			return false;
++		}
++	}
++	off %= bfat.clus_bytes;
++	while (n > 0) {
++		uint64_t take = bfat.clus_bytes - off < n ? bfat.clus_bytes - off : n;
++
++		if (c < 2 || c >= bfat.nclus + 2 || !bpart(bfat.data_off + (uint64_t)(c - 2) * bfat.clus_bytes + off, d, take)) {
++			return false;
++		}
++		d += take;
++		n -= take;
++		off = 0;
++		if (n > 0) {
++			c = bfat_next(c);
++		}
++	}
++	return true;
++}
++
++/* "crbtfw11.tlv" -> "CRBTFW11TLV" */
++static void
++short_name(const char *name, size_t len, char out[11])
++{
++	size_t i = 0, k = 0;
++
++	memset(out, ' ', 11);
++	for (; i < len && name[i] != '.' && k < 8; i++) {
++		out[k++] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++	while (i < len && name[i] != '.') {
++		i++;
++	}
++	for (i++, k = 8; i < len && k < 11; i++) {
++		out[k++] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++}
++
++/* one name in a directory (dir_clus 0: the FAT12/16 root); the entry's first cluster and size */
++static bool
++bfat_lookup(uint32_t dir_clus, const char *name, size_t len, uint32_t *clus, uint32_t *size, bool *is_dir)
++{
++	char want[11];
++	uint8_t e[32];
++
++	short_name(name, len, want);
++	for (uint32_t i = 0; i < 65536; i++) {
++		bool ok;
++
++		if (dir_clus == 0) {
++			if (i >= bfat.root_entries) {
++				return false;
++			}
++			ok = bpart(bfat.root_off + (uint64_t)i * 32, e, 32);
++		} else {
++			ok = bfat_chain_read(dir_clus, (uint64_t)i * 32, e, 32);
++		}
++		if (!ok || e[0] == 0) {
++			return false;
++		}
++		if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
++			continue;                               /* deleted, long-name part, volume label */
++		}
++		if (memcmp(e, want, 11) == 0) {
++			*clus = (uint32_t)(e[26] | e[27] << 8) | (bfat.type == 32 ? (uint32_t)(e[20] | e[21] << 8) << 16 : 0);
++			*size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
++			*is_dir = (e[11] & 0x10) != 0;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* "image/crbtfw11.tlv": size (or -1) and first cluster */
++static int64_t
++bt_file(const char *path, uint32_t *clus)
++{
++	uint32_t dir = bfat.type == 32 ? bfat.root_clus : 0, c = 0, size = 0;
++	const char *at = path;
++	bool is_dir = true;
++
++	if (!bfat_mount()) {
++		return -1;
++	}
++	while (*at != '\0') {
++		const char *slash = strchr(at, '/');
++		size_t len = slash ? (size_t)(slash - at) : strlen(at);
++
++		if (!is_dir || !bfat_lookup(dir, at, len, &c, &size, &is_dir)) {
++			return -1;
++		}
++		dir = c;
++		at += len + (slash ? 1 : 0);
++	}
++	*clus = c;
++	return is_dir ? -1 : (int64_t)size;
++}
++
+ /* One file of TLV type 1 (patch) or 2 (NVM), whole, in segments of at most 243 bytes. */
+ static bool
+ tlv_download(const char *path, bool nvm)
+ {
+-	int64_t size = topaz_part_fw_size(path);
++	uint32_t first = 0;
++	int64_t size = bt_file(path, &first);
+ 	uint8_t *f, cmd[4 + 2 + TLV_SEGMENT_MOST];
+ 	unsigned mode = QCA_SKIP_EVT_NONE, segments = 0, acks = 0;
+ 	uint64_t began = mach_absolute_time(), took;
+@@ -457,11 +665,11 @@ tlv_download(const char *path, bool nvm)
+ 	bool ok = true;
+ 
+ 	if (size < 8 || size > 0x100000) {
+-		printf("sweet_bt: %s: %s (%lld bytes)\n", path, size < 0 ? "not on the modem partition" : "odd size", size);
++		printf("sweet_bt: %s: %s (%lld bytes)\n", path, size < 0 ? "not on " BT_PART : "odd size", size);
+ 		return false;
+ 	}
+ 	f = kalloc_data((vm_size_t)size, Z_WAITOK);
+-	if (f == NULL || !topaz_part_fw_read(path, 0, f, (uint64_t)size)) {
++	if (f == NULL || !bfat_chain_read(first, 0, f, (uint64_t)size)) {
+ 		printf("sweet_bt: %s: cannot read it\n", path);
+ 		if (f != NULL) {
+ 			kfree_data(f, (vm_size_t)size);

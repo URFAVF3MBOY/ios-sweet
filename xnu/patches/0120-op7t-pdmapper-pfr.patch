@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -1564,6 +1564,20 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ 	qm_init(&m, txn, msg);
+ 	if (msg != 0x21) {                      /* PFR etc.: just say OK */
+ 		LOG("t=%u ms: pd-mapper: msg %x", g_ms, msg);
++		/*
++		 * 0120: 0x24 is SERVREG_LOC_PFR_REQ (Linux pdr_internal.h): a protection domain reporting
++		 * its Failure Reason as a string (TLV 1). Boot 2026-10-24: one arrived right after
++		 * "waiting for FW_READY", just before the phone crashed -- most likely wlan_pd saying why.
++		 * Print the reason; for any other unknown message, the first bytes.
++		 */
++		if (msg == 0x24) {
++			qm_string(d, len, 1, name, sizeof(name));
++			LOG("t=%u ms: *** pd-mapper: PFR (failure reason): \"%s\" ***", g_ms, name);
++		} else if (len > 0) {
++			LOG("t=%u ms: pd-mapper: msg %x, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", g_ms, msg, len,
++			    len > 0 ? d[0] : 0, len > 1 ? d[1] : 0, len > 2 ? d[2] : 0, len > 3 ? d[3] : 0,
++			    len > 4 ? d[4] : 0, len > 5 ? d[5] : 0, len > 6 ? d[6] : 0, len > 7 ? d[7] : 0);
++		}
+ 		qm_result(&m, true);
+ 		qm_send(&m, PORT_PDM, node, port);
+ 		return;

@@ -1,0 +1,130 @@
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -606,12 +606,47 @@ smem_partition(uint16_t a, uint16_t b)
+ 	return NULL;
+ }
+ 
++/*
++ * The partition's cache line size, from its table of contents entry. Linux keeps it per partition
++ * (qcom_smem: part->cacheline = entry->cacheline) and needs it to walk the cached list.
++ */
++static uint32_t
++smem_cacheline(struct smem_part_hdr *p)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++
++	if (memcmp(pt->magic, "$TOC", 4) == 0 && pt->num_entries <= 64) {
++		for (uint32_t i = 0; i < pt->num_entries; i++) {
++			if (e[i].offset != 0 && smem + e[i].offset == (uint8_t *)p) {
++				uint32_t c = e[i].cacheline;
++				/* a power of two from 16 to 4K, else the private entry size */
++				return (c >= 16 && c <= 0x1000 && (c & (c - 1)) == 0) ? c : 16;
++			}
++		}
++	}
++	return 16;
++}
++
++#define SMEM_ALIGN(x, a)    (((x) + (a) - 1) & ~((uintptr_t)(a) - 1))
++
++/*
++ * One item of a private partition. Linux qcom_smem_get_private() (drivers/soc/qcom/smem.c):
++ * first the uncached list, packed upwards from the header to free_uncached; then the CACHED list,
++ * packed downwards from the partition's end to free_cached, each entry header ALIGN(16, cacheline)
++ * bytes ABOVE its data: first = p + size - ALIGN(16, cl), item = entry - entry->size,
++ * next = entry - entry->size - ALIGN(16, cl). 0096 searched only the uncached list. On the 7T the
++ * modem made the descriptor (uncached, found) but its GLINK TX FIFO (item 480) never showed up:
++ * no "modem RX FIFO" line, rx 0 msgs. Most likely it is in the cached list (not seen yet: smem_dump()
++ * below lists both lists if 480 is still missing after 1 s).
++ */
+ static void *
+ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ {
+ 	uint8_t *e, *end;
+ 
+-	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size) {
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size ||
++	    p->free_cached > p->size || p->free_uncached > p->free_cached) {
+ 		return NULL;
+ 	}
+ 	e = (uint8_t *)p + sizeof(*p);
+@@ -629,9 +664,67 @@ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ 		}
+ 		e += sizeof(*h) + h->pad_hdr + h->size;
+ 	}
++
++	uint32_t hsz = (uint32_t)SMEM_ALIGN(sizeof(struct smem_priv_entry), smem_cacheline(p));
++	uint8_t *base = (uint8_t *)p;
++	if (p->size < hsz) {
++		return NULL;
++	}
++	e = base + p->size - hsz;
++	end = base + p->free_cached;
++	for (int n = 0; e > end && n < 4096; n++) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5 || h->size > p->size || h->size < h->pad_data ||
++		    (uint64_t)(e - base) < (uint64_t)h->size + hsz) {
++			return NULL;
++		}
++		if (h->item == item) {
++			if (size != NULL) {
++				*size = h->size - h->pad_data;
++			}
++			return e - h->size;
++		}
++		e = e - h->size - hsz;
++	}
+ 	return NULL;
+ }
+ 
++/* Every item of a partition, both lists, for when the GLINK FIFO does not turn up. */
++static void
++smem_dump(struct smem_part_hdr *p, const char *why)
++{
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0) {
++		LOG("smem dump (%s): no partition", why);
++		return;
++	}
++	uint32_t cl = smem_cacheline(p);
++	LOG("smem dump (%s): hosts %u/%u size %x free_uncached %x free_cached %x cacheline %u",
++	    why, p->host0, p->host1, p->size, p->free_uncached, p->free_cached, cl);
++	uint8_t *base = (uint8_t *)p, *e = base + sizeof(*p), *end = base + p->free_uncached;
++	for (int n = 0; e + sizeof(struct smem_priv_entry) <= end && n < 40; n++) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		LOG("  uncached: item %u size %x pad %u/%u canary %04x", h->item, h->size, h->pad_hdr, h->pad_data, h->canary);
++		if (h->canary != 0xA5A5) {
++			break;
++		}
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	uint32_t hsz = (uint32_t)SMEM_ALIGN(sizeof(struct smem_priv_entry), cl);
++	if (p->size < hsz || p->free_cached > p->size) {
++		return;
++	}
++	e = base + p->size - hsz;
++	end = base + p->free_cached;
++	for (int n = 0; e > end && n < 40; n++) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		LOG("  cached:   item %u size %x pad %u/%u canary %04x", h->item, h->size, h->pad_hdr, h->pad_data, h->canary);
++		if (h->canary != 0xA5A5 || h->size > p->size || (uint64_t)(e - base) < (uint64_t)h->size + hsz) {
++			break;
++		}
++		e = e - h->size - hsz;
++	}
++}
++
+ static bool
+ smem_lock(void)
+ {
+@@ -1319,6 +1412,9 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 			LOG("t=%u ms: modem RX FIFO, %u bytes", ms, sz);
+ 		}
+ 	}
++	if (g_rx == NULL && ms == 1000) {
++		smem_dump(part, "no GLINK RX FIFO (item 480) after 1 s");
++	}
+ 	for (int i = 0; i < 64 && g_rx != NULL && rx_one(); i++) {
+ 	}
+ 	txq_pump();

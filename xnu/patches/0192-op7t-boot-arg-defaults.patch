@@ -1,0 +1,76 @@
+op7t-0192: built-in defaults for the kernel-only boot-args
+
+The boot line is capped at BOOT_LINE_LENGTH (608: boot_args' CommandLine,
+shared by the kernel, the shim and mkpayload). The 0178 Bluetooth line is
+597 bytes, so sweetddr=1 (DDR + memory NoC held at max by the shim; cache
+push per GPU submission ~30 % faster, 2026-11-11) and the bluetoothd hook
+did not fit together.
+
+PE_parse_boot_argn / PE_parse_boot_arg_str (SWEET board only): an argument
+not on the boot line is looked up in a built-in 7T default string with the
+same parser. One on the line always wins, so NAME=0 there turns a default off.
+Defaults: sweetfb_noconsole=1 sweetfb_hz=60 sweetgpu4=1 sweetk1=1 sweetk1b=1
+sweetgpu4delay=0 sweetscan=1 sweetmodem=1 sweetwifi=1 sweetusb=3
+sweetgpudirty=0 sweetbdf=bdwlan.b0a (all read only by the kernel, through
+PE_parse_boot_argn or TUNABLE). Left on the line: what the shim reads
+(sweetgpu, sweetgmu, sweetgpufreq, sweetcpufreq, sweetddr), the injection
+lists, the Wi-Fi SSID, and Apple's own arguments. kern.bootargs shows the
+line only.
+
+Base: pexpert/gen/bootargs.c from xnu-8796.141.3 (no earlier patch touches it).
+---
+diff --git a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+index c94c0eb..4b064cc 100644
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -187,13 +187,35 @@ gotit:
+ 	return arg_found;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0192 (OnePlus 7T): built-in defaults for the kernel-only boot-args every 7T image sets. The boot line
++ * is capped at BOOT_LINE_LENGTH (608, the size of boot_args' CommandLine shared with the shim and
++ * mkpayload) and had no room left for sweetddr=1 next to the Bluetooth hook. An argument that is not on
++ * the boot line is looked up here, with the same parser; one that is on the line always wins (so
++ * NAME=0 on the line turns a default off). Only arguments the kernel alone reads belong here: the shim
++ * reads sweetgpu, sweetgmu, sweetgpufreq, sweetcpufreq, sweetddr (and its g3/mdp/trust ones) from the
++ * line itself. kern.bootargs still shows the line only.
++ */
++static char sweet_default_args[] =
++    "sweetfb_noconsole=1 sweetfb_hz=60 sweetgpu4=1 sweetk1=1 sweetk1b=1 sweetgpu4delay=0 "
++    "sweetscan=1 sweetmodem=1 sweetwifi=1 sweetusb=3 sweetgpudirty=0 sweetbdf=bdwlan.b0a";
++#endif
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE)) {
++		return TRUE;
++	}
++	return PE_parse_boot_argn_internal(sweet_default_args, arg_string, arg_ptr, max_len, FALSE);
++#else
+ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++#endif
+ }
+ 
+ boolean_t
+@@ -202,7 +224,14 @@ PE_parse_boot_arg_str(
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE)) {
++		return TRUE;
++	}
++	return PE_parse_boot_argn_internal(sweet_default_args, arg_string, arg_ptr, strlen, TRUE);
++#else
+ 	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++#endif
+ }
+ 
+ #if defined(CONFIG_XNUPOST)

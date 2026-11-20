@@ -1,0 +1,192 @@
+op7t-0194: a buffer the audio DSP can play from (SMMU stream 0x1b21)
+
+2026-11-11: both TFA9874 amps run on the quaternary MI2S clock (operating,
+PLL locked, from userland), but the DSP only sends silence: no stream feeds
+AFE port 0x1006. An ASM stream needs PCM in memory the ADSP reaches through
+the apps SMMU as stream 0x1b21 (DT qcom,msm-audio-ion iommus <&apps_smmu
+0x1b21>, smmu-sid-mask 0xf), with the SID's low bits at bit 32 of the
+addresses it is given (msm-audio-ion; HackiOS vayu_audio.c the same).
+
+sweet_smmu.c:
+- the identity table (0138) also maps 0x1_80000000 / 0x1_c0000000 to
+  0x80000000 / 0xc0000000 (the SID alias; USB never uses addresses there);
+- sweet_smmu_identity() no longer takes over a match entry that covers the
+  stream with a mask or another ID (somebody else's): it says so and stops;
+- kern.sweetaudiobuf (root): read = { u64 pa, u32 size, i32 bank }, set up on
+  first use (512 KB, kmem_alloc_contig below 4 GiB, else the unused end of
+  the low DDR bank 0xbba7c000-0xbbafc000; 0x1b21 identity-mapped); write =
+  u32 offset + PCM (multiple of 4), copied a word at a time through an
+  uncached mapping (the DSP does not snoop the CPU caches).
+Log: "HOTDOGB AUDIO: buffer ...". The ASM/ADM commands stay in userland
+(tools/sweetaudio.py over kern.sweetapr).
+
+Apply after 0193.
+---
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index c31e62e..66fb2e6 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -19,9 +19,13 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/kalloc.h>
+ #include <kern/clock.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <mach/vm_param.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define SMMU_PA         0x15000000u
+ #define SMMU_SIZE       0x00100000u
+@@ -293,6 +297,15 @@ sweet_smmu_identity(uint32_t sid)
+ 		for (unsigned i = 2; i < 4; i++) {
+ 			l1[i] = ((uint64_t)i << 30) | (1u << 10) | (2u << 8) | (1u << 6) | 1u;
+ 		}
++		/*
++		 * 0194: the same two blocks again at 0x1_80000000 / 0x1_c0000000. Linux hands the ADSP its
++		 * buffers with the audio stream's low SID bits (0x1b21 & smmu-sid-mask 0xf = 1) at bit 32
++		 * (msm-audio-ion; HackiOS vayu_audio.c the same), so those addresses must land on the same
++		 * memory. USB never uses addresses up there.
++		 */
++		for (unsigned i = 6; i < 8; i++) {
++			l1[i] = ((uint64_t)(i - 4) << 30) | (1u << 10) | (2u << 8) | (1u << 6) | 1u;
++		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+ 
+@@ -315,6 +328,11 @@ sweet_smmu_identity(uint32_t sid)
+ 			used[s2cr & 0xffu] = 1;
+ 		}
+ 		if (((sid ^ id) & ~mask & 0x7fffu) == 0) {
++			if (mask != 0 || id != sid) {
++				/* 0194: a stream group somebody (firmware, the hypervisor) set up: not ours to change */
++				printf("HOTDOGB SMMU: SID %#x is covered by SMR[%u] %08x (S2CR %08x): left alone\n", sid, i, smr, s2cr);
++				return -1;
++			}
+ 			smr_i = (int)i;                 /* ours from before (0133's fault entry): reuse it */
+ 		}
+ 	}
+@@ -346,11 +364,120 @@ sweet_smmu_identity(uint32_t sid)
+ 	smmu_wr(0x800 + 4 * (uint32_t)smr_i, (1u << 31) | sid);                 /* SMR: valid, mask 0 */
+ 	uint32_t smr = smmu_rd(0x800 + 4 * (uint32_t)smr_i), s2cr = smmu_rd(0xc00 + 4 * (uint32_t)smr_i);
+ 	bool ok = smr == ((1u << 31) | sid) && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == (uint32_t)cb;
+-	printf("HOTDOGB SMMU: SID %#x -> SMR[%d] %08x S2CR %08x -> bank %d, identity 0x80000000-0xffffffff: %s\n", sid, smr_i,
++	printf("HOTDOGB SMMU: SID %#x -> SMR[%d] %08x S2CR %08x -> bank %d, identity 0x80000000-0xffffffff (+ alias at 0x1_80000000): %s\n", sid, smr_i,
+ 	    smr, s2cr, cb, ok ? "in place" : "NOT taken (read back differs)");
+ 	return ok ? cb : -1;
+ }
+ 
++/*
++ * 0194: memory the ADSP plays from. kern.sweetaudiobuf (root):
++ *   read : struct { uint64_t pa; uint32_t size; int32_t bank; } -- allocated and the audio stream (0x1b21)
++ *          identity-mapped on first use; give the DSP pa | 1 << 32 (the SID alias above)
++ *   write: uint32_t offset, then the bytes (a multiple of 4) to put there
++ * The DSP does not snoop the CPU's caches: the buffer is written through an uncached (device) mapping, a
++ * word at a time. Below 4 GiB because the identity map covers 0x80000000-0xffffffff: kmem_alloc_contig with
++ * that limit (RAM starts at 0xc0000000 since the 7 GB ADT, so xnu has pages there); if that fails, the 512 KB
++ * of the low DDR bank under 0149's DSI packet page (0xbba7c000-0xbbafc000; SweetSurface's scanout pool ends at
++ * 0xbb7c0000), which nothing uses.
++ */
++#define AUDIO_SID               0x1b21u
++#define AUDIO_BUF_SIZE          0x80000u
++#define AUDIO_BUF_FALLBACK      0xbba7c000u
++
++static struct {
++	uint64_t pa;
++	vm_offset_t va;                 /* uncached */
++	int bank;
++	bool tried;
++} audio_buf = { .bank = -1 };
++
++static int
++audio_buf_ready(void)
++{
++	if (audio_buf.tried) {
++		return audio_buf.va != 0 && audio_buf.bank >= 0 ? 0 : EIO;
++	}
++	audio_buf.tried = true;
++
++	vm_offset_t kva = 0;
++	const char *how = "kmem_alloc_contig below 4 GiB";
++	if (kmem_alloc_contig(kernel_map, &kva, AUDIO_BUF_SIZE, PAGE_MASK, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++		KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++		audio_buf.pa = ptoa_64(pn);
++		if (pn == 0 || audio_buf.pa < 0x80000000ull || audio_buf.pa + AUDIO_BUF_SIZE > 0x100000000ull) {
++			printf("HOTDOGB AUDIO: contiguous buffer at %#llx: outside 0x80000000-0xffffffff, not used\n",
++				(unsigned long long)audio_buf.pa);
++			audio_buf.pa = 0;       /* (left allocated: it is permanent) */
++		}
++	}
++	if (audio_buf.pa == 0) {
++		audio_buf.pa = AUDIO_BUF_FALLBACK;
++		how = "the unused end of the low DDR bank";
++	}
++	audio_buf.va = ml_io_map((vm_offset_t)audio_buf.pa, AUDIO_BUF_SIZE);
++	if (audio_buf.va != 0) {
++		for (uint32_t o = 0; o < AUDIO_BUF_SIZE; o += 4) {
++			*(volatile uint32_t *)(audio_buf.va + o) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	audio_buf.bank = sweet_smmu_identity(AUDIO_SID);
++	printf("HOTDOGB AUDIO: buffer %#llx (%u KB, %s), uncached map %s, stream %#x -> SMMU bank %d; DSP address %#llx\n",
++		(unsigned long long)audio_buf.pa, AUDIO_BUF_SIZE / 1024, how, audio_buf.va ? "ok" : "FAILED", AUDIO_SID,
++		audio_buf.bank, (unsigned long long)(audio_buf.pa | (1ull << 32)));
++	return audio_buf.va != 0 && audio_buf.bank >= 0 ? 0 : EIO;
++}
++
++static int
++sysctl_sweetaudiobuf SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct {
++		uint64_t pa;
++		uint32_t size;
++		int32_t bank;
++	} info;
++	uint8_t chunk[4096];
++	int error;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t len = req->newlen;
++		uint32_t offset;
++
++		if (len < 8 || len > sizeof(chunk) || (len & 3u) != 0) {
++			return EINVAL;
++		}
++		if ((error = audio_buf_ready()) != 0) {
++			return error;
++		}
++		if ((error = SYSCTL_IN(req, chunk, len)) != 0) {
++			return error;
++		}
++		memcpy(&offset, chunk, 4);
++		len -= 4;
++		if ((offset & 3u) != 0 || offset > AUDIO_BUF_SIZE || len > AUDIO_BUF_SIZE - offset) {
++			return EINVAL;
++		}
++		for (size_t i = 0; i < len; i += 4) {
++			uint32_t w;
++			memcpy(&w, chunk + 4 + i, 4);
++			*(volatile uint32_t *)(audio_buf.va + offset + i) = w;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return 0;
++	}
++	error = audio_buf_ready();
++	info.pa = audio_buf.pa;
++	info.size = AUDIO_BUF_SIZE;
++	info.bank = audio_buf.bank;
++	(void)error;                    /* (the bank says whether the stream is mapped) */
++	return SYSCTL_OUT(req, &info, sizeof(info));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetaudiobuf, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++	sysctl_sweetaudiobuf, "S", "audio buffer for the ADSP (0194): read pa/size/bank, write offset + PCM");
++
+ /* sysctl kern.sweetsmmu_map=0x140: the same by hand (root); reading gives the bank (or -1) */
+ static int
+ sysctl_sweetsmmu_map SYSCTL_HANDLER_ARGS

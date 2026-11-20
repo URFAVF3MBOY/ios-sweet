@@ -1,0 +1,128 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 00:10:00 -0400
+Subject: [PATCH] op7t-0145: RedwoodGPU: push only the written pages of mapped buffers
+
+0144 on the phone (swiping, 2026-10-25): no surface among what the
+submissions push out of the cache, yet still ~12.8 MB a submission. It is
+the buffers of the GPU driver's own (cached memory by default since
+2026-10-22) that a program has mapped: every one named in a submission was
+pushed whole, written since or not. freedreno maps every buffer the
+processor fills, textures included (the wallpaper alone is ~11 MB), so a
+texture written once was pushed again at every submission that drew it.
+Mesa cannot say when it writes (fd_bo_cpu_prep skips the ioctl for a
+buffer it thinks idle), but the pmap does: a program's page is mapped
+read-only until written and the write sets PP_ATTR_MODIFIED. Now only
+pages with that bit are pushed; the bit is cleared first
+(pmap_clear_refmod_options, PMAP_OPTIONS_FF_WIRED since the kernel's own
+mapping is wired), so the next write is seen again. Pages that are not the
+VM's are pushed as before. Boot-arg sweetgpudirty=0: the old behaviour.
+The five-second line is followed by "RedwoodGPU: pages of mapped buffers:
+N written since and pushed, M left alone".
+Syntax-checked with g++ -Wall -Wextra on stubs.
+
+Apply after 0144.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 65c8eab..00e2ab0 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -55,6 +55,20 @@
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <sys/proc.h>
++__BEGIN_DECLS
++#include <vm/pmap.h>
++__END_DECLS
++
++/* 0145: the pmap's modified bit of a page (osfmk/arm/pmap/pmap.c; declared for the kernel proper only) */
++extern "C" {
++unsigned int pmap_get_refmod(ppnum_t pn);
++void pmap_clear_refmod_options(ppnum_t pn, unsigned int mask, unsigned int options, void * arg);
++boolean_t pmap_valid_page(ppnum_t pn);
++ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++}
++#ifndef VM_MEM_MODIFIED
++#define VM_MEM_MODIFIED 0x01
++#endif
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -239,8 +253,26 @@ static struct {
+ 	uint32_t submissions, commands, buffers, surfaces, waits, over;
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
++	uint32_t written_pages, unwritten_pages;        /* 0145: pages of mapped buffers pushed / left alone */
+ } gGPUStat;
+ 
++/*
++ * 0145: a buffer of its own that a program has mapped (freedreno: command streams, uploads, and
++ * every texture it filled with the processor) was pushed out of the cache whole at every
++ * submission that named it, written since or not: ~13 MB a submission while swiping (0144 found
++ * no surfaces among it), ~0.7 ms each, ~3.5 ms of each of the window server's frames. Mesa
++ * cannot say when it writes one (fd_bo_cpu_prep asks the kernel nothing for a buffer it thinks
++ * idle), but the pmap knows: a page of a program's mapping is entered read-only until it is
++ * written (pmap_enter_options_internal, PP_ATTR_MODFAULT) and the write sets its modified bit
++ * (arm_fast_fault). So only the pages with that bit are pushed, and the bit is cleared first,
++ * which makes the page read-only in every mapping again -- the kernel's own as well, it being
++ * wired, hence PMAP_OPTIONS_FF_WIRED; the kernel only pushes these (dc civac needs no write
++ * permission). A write after the clearing sets the bit again for the next submission. Pages of
++ * other kinds (not the VM's, no translation) are pushed as before. Boot-arg sweetgpudirty=0:
++ * the whole buffer every time, as before.
++ */
++static TUNABLE(uint32_t, gGPUDirty, "sweetgpudirty", 1);
++
+ /*
+  * 0144: which surfaces the submissions push out of the cache, and why. Swiping the home screen
+  * (2026-10-25, touch_lat=1): ~13 MB pushed at every submission (~0.7 ms each, ~285 a second,
+@@ -509,6 +541,30 @@ struct gpu_buffer {
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+ };
+ 
++/* 0145: the pages of a mapped buffer of its own written since the last push, out of the cache (gGPUDirty) */
++static uint64_t
++pushWritten(struct gpu_buffer * b)
++{
++	uint64_t pushed = 0;
++
++	for (uint64_t offset = 0; offset < b->size; offset += PAGE_SIZE) {
++		uint64_t length = b->size - offset < PAGE_SIZE ? b->size - offset : PAGE_SIZE;
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)(b->kernel + offset));
++
++		if (pn != 0 && pmap_valid_page(pn)) {
++			if (!(pmap_get_refmod(pn) & VM_MEM_MODIFIED)) {
++				gGPUStat.unwritten_pages++;
++				continue;
++			}
++			pmap_clear_refmod_options(pn, VM_MEM_MODIFIED, PMAP_OPTIONS_FF_WIRED, NULL);
++		}
++		redwood_gpu_to_memory(b->kernel + offset, length);
++		gGPUStat.written_pages++;
++		pushed += length;
++	}
++	return pushed;
++}
++
+ /*
+  * A buffer given back while the GPU is still at it: its memory and its place in the GPU's
+  * address space are kept until the submission is done, and nobody waits for that. (A window
+@@ -1123,6 +1179,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			b->surface->cleanSeed = seed;  /* 0116: pushed: nothing of the CPU's left in the cache at this seed */
+ 		} else if (!b->seen || !gGPUCached) {
+ 			continue;
++		} else if (gGPUDirty) {
++			gGPUStat.flushed += pushWritten(b);     /* 0145 */
++			continue;
+ 		}
+ 		redwood_gpu_to_memory(b->kernel, b->size);
+ 		gGPUStat.flushed += b->size;
+@@ -1246,6 +1305,10 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
+ 			    largest >> 20, holes, most, lost >> 10, refused);
+ 		}
++		if (gGPUDirty) {                                /* 0145 */
++			IOLog("RedwoodGPU: pages of mapped buffers: %u written since and pushed, %u left alone\n",
++			    gGPUStat.written_pages, gGPUStat.unwritten_pages);
++		}
+ 		for (uint32_t i = 0; i < GPU_PUSH_TOP; i++) {   /* 0144 */
+ 			struct gpu_push * p = &gGPUPush[i];
+ 

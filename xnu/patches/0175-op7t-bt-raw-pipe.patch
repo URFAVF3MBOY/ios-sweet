@@ -1,0 +1,202 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 10:00:00 -0500
+Subject: [PATCH] op7t-0175: Bluetooth: a raw byte pipe (kern.sweetbtio), bring-up split
+
+0174's kernel ran 0173's sequence (2026-11-11 00:50): firmware in as
+before, then "ibs: no WAKE_ACK to WAKE_IND" for the reset, the local
+version and the BD address (0 wakes, 1 other byte). In-band sleep starts
+with the reset that applies the NVM: a WAKE_IND sent before it goes
+unanswered (0172 got "00 fd" when the reset went out as it is).
+
+- kern.sweetbt=1 now stops after the firmware (stage 6) and keeps what
+  came in after the NVM for the pipe.
+- kern.sweetbt=2: the HCI sequence after the firmware, the reset sent
+  without a wake first (then WAKE_IND answered WAKE_ACK, local version,
+  BD_ADDR with a wake each).
+- kern.sweetbtio (opaque, root): writing sends the bytes as they are (up
+  to 1024 a call); reading returns what came in since the last read (up
+  to 4096, waits up to 20 ms for a first byte). No framing, no IBS
+  answers: user space speaks the protocol. ENXIO before stage 6. One
+  mutex for all UART use.
+So the protocol can be tried from a root shell without a kernel build.
+
+Apply after 0174.
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index fa0e8e8..f93d4f7 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -41,6 +41,7 @@
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+@@ -136,6 +137,10 @@ extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64
+ 
+ static int bt_stage;
+ static bool bt_ran;
++static LCK_GRP_DECLARE(bt_io_group, "sweet-bt");
++static LCK_MTX_DECLARE(bt_io_lock, &bt_io_group);    /* 0175: one user of the UART at a time */
++static uint8_t io_rx[4096];
++static size_t io_rx_len;
+ static vm_offset_t gcc, tlmm, se, wrap;
+ static unsigned tx_depth, rx_depth, oversampling;
+ 
+@@ -856,12 +861,14 @@ ibs_wake(void)
+ 
+ /* an HCI command, IBS-aware; the reply event (command complete 0e or status 0f for this opcode) into r */
+ static unsigned
+-hci_cmd_ibs(const char *what, uint16_t opcode, const uint8_t *param, uint8_t plen, uint8_t *r, unsigned rmost)
++hci_cmd_ibs(const char *what, uint16_t opcode, const uint8_t *param, uint8_t plen, uint8_t *r, unsigned rmost, bool wake)
+ {
+ 	uint8_t c[4 + 32];
+ 
+ 	evq_len = 0;
+-	ibs_wake();
++	if (wake) {
++		ibs_wake();
++	}
+ 	c[0] = HCI_COMMAND_PKT;
+ 	c[1] = (uint8_t)opcode;
+ 	c[2] = (uint8_t)(opcode >> 8);
+@@ -988,14 +995,28 @@ sweet_bt_up(void)
+ 		return -6;
+ 	}
+ 	bt_stage = 6;
+-	/* 0173: from here on the chip speaks in-band sleep; whatever came after the NVM goes through the parser first */
++	return bt_stage;
++}
++
++/*
++ * 0175: after the firmware (kern.sweetbt=2). 0174's run (2026-11-11): the chip answered no WAKE_IND
++ * sent before the reset ("no WAKE_ACK", 0 wakes): in-band sleep starts with the reset that applies
++ * the NVM, so the reset goes out as it is, and only then does the chip say WAKE_IND (0172 saw
++ * "00 fd" in answer to it), which the parser answers WAKE_ACK.
++ */
++static int
++sweet_bt_after_firmware(void)
++{
++	uint8_t r[128];
++	unsigned n;
++
+ 	bzero(&h4, sizeof(h4));
+-	for (unsigned i = 0; i < rx_kept; i++) {
+-		h4_byte(rx_keep[i]);
++	for (size_t i = 0; i < io_rx_len; i++) {          /* (what came in after the NVM: kern.sweetbt=1 kept it here) */
++		h4_byte(io_rx[i]);
+ 	}
+-	rx_kept = 0;
++	io_rx_len = 0;
+ 	h4_pump(20000);
+-	n = hci_cmd_ibs("reset after firmware", 0x0c03, NULL, 0, r, sizeof(r));
++	n = hci_cmd_ibs("reset after firmware", 0x0c03, NULL, 0, r, sizeof(r), false);
+ 	if (n >= 7 && r[1] == 0x0e) {
+ 		printf("sweet_bt: reset after firmware: status %#x\n", r[6]);
+ 		if (r[6] == 0) {
+@@ -1003,13 +1024,13 @@ sweet_bt_up(void)
+ 		}
+ 	}
+ 	/* HCI_Read_Local_Version_Information: 04 0e 0c 01 01 10 status hci_ver hci_rev(2) lmp_ver manufacturer(2) lmp_subver(2) */
+-	n = hci_cmd_ibs("local version", 0x1001, NULL, 0, r, sizeof(r));
++	n = hci_cmd_ibs("local version", 0x1001, NULL, 0, r, sizeof(r), true);
+ 	if (n >= 15 && r[1] == 0x0e) {
+ 		printf("sweet_bt: local version: status %#x hci %u rev %#x lmp %u manufacturer %#x lmp subversion %#x\n",
+ 		    r[6], r[7], r[8] | r[9] << 8, r[10], r[11] | r[12] << 8, r[13] | r[14] << 8);
+ 	}
+ 	/* HCI_Read_BD_ADDR: 04 0e 0a 01 09 10 status addr(6, little-endian) */
+-	n = hci_cmd_ibs("bd addr", 0x1009, NULL, 0, r, sizeof(r));
++	n = hci_cmd_ibs("bd addr", 0x1009, NULL, 0, r, sizeof(r), true);
+ 	if (n >= 13 && r[1] == 0x0e && r[6] == 0) {
+ 		printf("sweet_bt: bd addr %02x:%02x:%02x:%02x:%02x:%02x\n", r[12], r[11], r[10], r[9], r[8], r[7]);
+ 		if (bt_stage == 7) {
+@@ -1030,6 +1051,16 @@ sysctl_sweetbt SYSCTL_HANDLER_ARGS
+ 	if (error != 0 || !changed) {
+ 		return error;
+ 	}
++	if (value == 2) {
++		if (bt_stage != 6) {
++			return EAGAIN;
++		}
++		lck_mtx_lock(&bt_io_lock);
++		bt_stage = sweet_bt_after_firmware();
++		lck_mtx_unlock(&bt_io_lock);
++		printf("sweet_bt: sysctl kern.sweetbt=2 -> %d\n", bt_stage);
++		return 0;
++	}
+ 	if (value != 1) {
+ 		return EINVAL;
+ 	}
+@@ -1038,10 +1069,69 @@ sysctl_sweetbt SYSCTL_HANDLER_ARGS
+ 	}
+ 	bt_ran = true;
+ 	bt_stage = 1;
++	lck_mtx_lock(&bt_io_lock);
+ 	bt_stage = sweet_bt_up();
++	if (bt_stage == 6) {
++		/* what came in after the NVM, for kern.sweetbtio's first read */
++		memcpy(io_rx, rx_keep, rx_kept);
++		io_rx_len = rx_kept;
++		rx_kept = 0;
++	}
++	lck_mtx_unlock(&bt_io_lock);
+ 	printf("sweet_bt: sysctl kern.sweetbt=1 -> %d\n", bt_stage);
+ 	return bt_stage < 0 ? EIO : 0;
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetbt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbt, "I",
+-    "1: bring the Bluetooth UART up and ask the WCN3990 for its version (0169); reads how far it got");
++    "1: Bluetooth UART up, WCN3990 version, firmware (stage 6); 2: then the HCI sequence after it; reads the stage");
++
++/*
++ * 0175: kern.sweetbtio, the chip's bytes for user space, so that the protocol (in-band sleep, HCI,
++ * whatever bluetoothd will need) is tried from a root shell without building a kernel each time.
++ * Writing sends the bytes as they are (at most 1024 a call); reading returns what has come in since
++ * the last read (at most the reader's buffer, 4096; waits up to 20 ms for a first byte). Raw: no
++ * H4 framing, no in-band sleep answers here. Only after kern.sweetbt=1 has reached stage 6 (ENXIO
++ * before). Root only.
++ */
++static int
++sysctl_sweetbtio SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint8_t tx[1024];
++	int error = 0;
++
++	if (bt_stage < 6) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&bt_io_lock);
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t n = req->newlen;
++
++		if (n > sizeof(tx)) {
++			error = E2BIG;
++		} else if (n != 0 && (error = SYSCTL_IN(req, tx, n)) == 0 && !uart_tx(tx, (unsigned)n, 200000)) {
++			error = EIO;
++		}
++	}
++	if (error == 0 && req->oldptr != USER_ADDR_NULL) {
++		size_t want = req->oldlen < sizeof(io_rx) ? req->oldlen : sizeof(io_rx);
++
++		if (io_rx_len < want) {
++			io_rx_len += uart_rx(io_rx + io_rx_len, (unsigned)(want - io_rx_len), io_rx_len == 0 ? 20000 : 1, 300);
++		}
++		size_t give = io_rx_len < want ? io_rx_len : want;
++
++		error = SYSCTL_OUT(req, io_rx, give);
++		if (error == 0) {
++			memmove(io_rx, io_rx + give, io_rx_len - give);
++			io_rx_len -= give;
++		}
++	} else if (error == 0 && req->oldptr == USER_ADDR_NULL && req->newptr == USER_ADDR_NULL) {
++		error = SYSCTL_OUT(req, NULL, sizeof(io_rx));     /* (size query) */
++	}
++	lck_mtx_unlock(&bt_io_lock);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetbtio, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweetbtio, "S", "raw bytes to/from the Bluetooth chip (0175; write sends, read takes what came in)");
