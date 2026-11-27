@@ -1,0 +1,33 @@
+0009: the framebuffer console is the serial device when the ADT names none (xnu-12377 serial_init).
+
+12377's serial_init() returns 0 when /chosen has no serial-device phandle, before setting serial_do_transmit or
+calling the registered devices' init. The 7T has no UART, only our fbcon (0003, registered by fbcon_probe() just
+before), so every kernel printf was dropped after early boot: boots 27d/27e showed nothing after EARLY 20 (USB
+network up, ping answered), and the console ring behind the UDP live log (0077) stayed empty.
+
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index d63130e..09c55c6 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -1061,6 +1061,21 @@ serial_init(void)
+ 	// Get the phandle of the serial device XNU has been configured to use.
+ 	uint32_t phandle;
+ 	if (!get_serial_device_phandle(&phandle)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET: no serial-device phandle, but the framebuffer console is registered. Without this, 12377
++		 * returned 0 here: serial_do_transmit stayed 0, fbcon was never init'ed and every printf/kprintf was
++		 * dropped (boots 27d/27e: nothing on screen after EARLY 20, empty console ring, no UDP live log).
++		 */
++		if (gPESF != NULL) {
++			for (fns = gPESF; fns != NULL; fns = fns->next) {
++				serial_do_transmit = 1;
++				fns->init();
++			}
++			uart_initted = true;
++			return 1;
++		}
++#endif
+ 		// XNU has not been configured to use a serial device; return early.
+ 		return 0;
+ 	}

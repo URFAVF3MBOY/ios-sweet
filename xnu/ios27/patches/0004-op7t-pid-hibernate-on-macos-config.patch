@@ -1,0 +1,26 @@
+0004: pid_hibernate on the SWEET (macOS-config) kernel, as 0070 did on xnu-8796.
+
+SpringBoard calls pid_hibernate when an app leaves the foreground; on a macOS-config kernel the syscall table points
+at a function that is only built for !XNU_TARGET_OS_OSX, so build 7 failed to link (_pid_hibernate undefined) and on
+8796 it was SIGSYS. Without CONFIG_FREEZE it returns 0, as on iOS. In 12377 it moved to bsd/kern/kern_proc.c.
+
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -6687,7 +6687,7 @@
+ 	return error;
+ }
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
+  * Freeze the specified process (provided in args->pid), or find and freeze a PID.
+  * When a process is specified, this call is blocking, otherwise we wake up the
+@@ -6760,7 +6760,7 @@
+ 	*ret = error;
+ 	return error;
+ }
+-#endif /* !XNU_TARGET_OS_OSX */
++#endif /* !XNU_TARGET_OS_OSX || SWEET */
+ 
+ #if SOCKETS
+ 

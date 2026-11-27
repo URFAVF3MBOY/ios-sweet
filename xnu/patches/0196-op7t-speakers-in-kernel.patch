@@ -1,0 +1,1076 @@
+op7t-0196: the speakers from boot, in the kernel (bsd/dev/sweet_sound.c)
+
+2026-11-11: iOS's own sound played through the 7T's speakers with the chain
+run from userland (tools/sweetaudio.py, sweet-media.sh). The user wants it
+to work straight from the image, at once, without scripts. This does in the
+kernel what those did:
+
+- /dev/redwood-audio made at boot (sweet_smmu.c's 0195 node, now
+  sweet_audio_dev_make()), so the RedwoodAudio HAL plug-in opens it the first
+  time the audio server loads it: no mediaserverd restart;
+- a thread, after sweetsounddelay s (15): the audio DSP started
+  (sweet_adsp_start, stage 6 awaited); SE4 as an I2C master (GCC votes, S4 at
+  XO, pins 51/52); both TFA9874s set up (I2C reset, keys, NXP's rev 0x0c74
+  values, the 7T's tfa98xx.cnt device + "speaker" writes built in) and muted;
+  MI2S pins 137/138/140; bit clock 3.072 MHz and AFE port 0x1006 (I2S SD1,
+  32-bit, 48 kHz) started; amplifiers out of powerdown on that clock;
+- the stream: the 0194 buffer mapped, ADM path (16-bit, no processing), ASM
+  session 1 opened/routed/run; every period the DSP gives back refilled from
+  the ring (sweet_audio_ring_take), sweetsoundgain dB below full (default
+  12; no speaker protection), clipped; amplifiers on at the first sound, off
+  after 3 s of silence.
+
+sweetsound=0 turns it off (the userland tools still work then). kern.sweetsound:
+stage (7 = playing; negative = stopped there) and counters. Log "HOTDOGB SOUND:".
+Syntax-checked with clang -Wall -Wextra on stub headers.
+
+Apply after 0195.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c20ac68..84c287b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_clock.c			standard
+ bsd/dev/sweet_smmu.c			standard
++bsd/dev/sweet_sound.c			standard
+ bsd/dev/sweet_cores.c			standard
+ bsd/dev/sweet_swipe.c			standard
+ bsd/dev/sweet_reboot.c			standard
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 3fcafc8..ade7e46 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -434,6 +434,20 @@ audio_buf_ready(void)
+ 	return audio_buf.va != 0 && audio_buf.bank >= 0 ? 0 : EIO;
+ }
+ 
++/* 0196: the buffer for sweet_sound.c (allocated and mapped on first use, as for the sysctl) */
++int sweet_audio_buffer(uint64_t *pa, vm_offset_t *va, uint32_t *size);
++
++int
++sweet_audio_buffer(uint64_t *pa, vm_offset_t *va, uint32_t *size)
++{
++	int error = audio_buf_ready();
++
++	*pa = audio_buf.pa;
++	*va = audio_buf.va;
++	*size = AUDIO_BUF_SIZE;
++	return error;
++}
++
+ static int
+ sysctl_sweetaudiobuf SYSCTL_HANDLER_ARGS
+ {
+@@ -572,6 +586,9 @@ static const struct cdevsw rw_audio_cdevsw = {
+ 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+ };
+ 
++int sweet_audio_dev_make(void);
++uint32_t sweet_audio_ring_take(uint32_t *frames, uint32_t max);
++
+ static int
+ sysctl_sweetaudiodev SYSCTL_HANDLER_ARGS
+ {
+@@ -582,16 +599,42 @@ sysctl_sweetaudiodev SYSCTL_HANDLER_ARGS
+ 	if (error != 0 || !changed || value == 0 || rw_major >= 0) {
+ 		return error;
+ 	}
++	return sweet_audio_dev_make();
++}
++
++/* 0196: also called at boot by sweet_sound.c, before the audio server starts */
++int
++sweet_audio_dev_make(void)
++{
++	if (rw_major >= 0) {
++		return 0;
++	}
+ 	rw_major = cdevsw_add(-1, &rw_audio_cdevsw);
+ 	if (rw_major < 0 || devfs_make_node(makedev(rw_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio") == NULL) {
+ 		printf("HOTDOGB AUDIO: /dev/redwood-audio could not be made (major %d)\n", rw_major);
++		rw_major = -1;
+ 		return EIO;
+ 	}
+-	printf("HOTDOGB AUDIO: /dev/redwood-audio made (major %d): restart the audio server so its plug-in opens it\n",
+-		rw_major);
++	printf("HOTDOGB AUDIO: /dev/redwood-audio made (major %d)\n", rw_major);
+ 	return 0;
+ }
+ 
++/* 0196: frames from the ring for sweet_sound.c's feeder; returns how many (0 when iOS wrote nothing) */
++uint32_t
++sweet_audio_ring_take(uint32_t *frames, uint32_t max)
++{
++	uint32_t got;
++
++	lck_mtx_lock(&rw_audio_lock);
++	got = MIN(max, rw_head - rw_tail);
++	for (uint32_t i = 0; i < got; i++) {
++		frames[i] = rw_ring[(rw_tail + i) % RW_RING_FRAMES];
++	}
++	rw_tail += got;
++	lck_mtx_unlock(&rw_audio_lock);
++	return got;
++}
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweetaudiodev, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+ 	sysctl_sweetaudiodev, "I", "1: make /dev/redwood-audio (0195)");
+ 
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+new file mode 100644
+index 0000000..87a6b8f
+--- /dev/null
++++ b/bsd/dev/sweet_sound.c
+@@ -0,0 +1,929 @@
++/*
++ * 0196: the speakers, in the kernel, from boot (OnePlus 7T). What tools/sweetaudio.py + sweet-media.sh did from
++ * userland (2026-11-11, heard by the user), with nothing to run by hand and no script in the image:
++ *
++ *   at boot (sweet_sound_init, from sweet_ufs.c next to the other drivers)
++ *     /dev/redwood-audio made at once (sweet_smmu.c, 0195), so the audio server's HAL plug-in (RedwoodAudio.driver)
++ *     opens it the first time it is loaded: no mediaserverd restart
++ *   then a thread, after sweetsounddelay seconds (default 15: the vendor firmware the DSP loads must be reachable)
++ *     1. the audio DSP started (SweetModem.cpp: sweet_adsp_start), waited for until its audio services are up
++ *     2. QUPv3 wrap0 SE4 as an I2C master at 400 kHz (GCC votes, S4 RCG at XO, pins 51/52 to qup4)
++ *     3. both TFA9874 amplifiers (0x34 right, 0x35 left): I2C reset, keys, NXP's rev 0x0c74 settings
++ *        (tfa_init.c tfa9874_specific), the 7T's container writes (tfa98xx.cnt: device + "speaker" profile,
++ *        built in below), muted (AMPE 0)
++ *     4. the quaternary MI2S pins (137 SCK, 138 WS, 140 SD1; qua_mi2s, 8 mA), the bit clock (3.072 MHz) and AFE
++ *        port 0x1006 (I2S on SD1, 32-bit stereo, 48 kHz, word select ours, started); the amplifiers out of
++ *        powerdown on that clock (MANSCONF 1, PWDN 0, CLKS awaited), still muted
++ *     5. the stream: the DSP buffer mapped (0194), an ADM path to 0x1006 (16-bit, no processing), ASM session 1
++ *        opened, routed, run; periods (20 ms) refilled from /dev/redwood-audio's ring as the DSP gives them back
++ *        (silence where iOS wrote nothing), scaled by sweetsoundgain dB (default 12 below: no speaker protection),
++ *        clipped; the amplifiers on at the first sound, off after 3 s of silence
++ *
++ * Boot-args: sweetsound=0 none of it (the userland tools then still work); sweetsounddelay=N; sweetsoundgain=N
++ * (attenuation in dB, 0..30). Log lines "HOTDOGB SOUND: ...". kern.sweetsound reads the stage reached (see enum
++ * below) and the counters.
++ *
++ * Numbers: as tools/sweetaudio.py (whose sources it names): GCC/QUP/TLMM from Linux sm8150 drivers and the 7T's
++ * live device tree, the GENI I2C sequence of sweet_touch.c, the TFA9874 sequence of NXP's open tfa98xx driver
++ * (Goodix-vas/tfa98xx), the APR/AFE/ADM/ASM packets of HackiOS vayu_audio.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern int sweet_adsp_start(void);
++extern int sweet_adsp_stage(void);
++extern int sweet_adsp_apr_send(const void *p, size_t n);
++extern int sweet_adsp_apr_recv(void *dst, size_t cap, size_t *got);
++/* sweet_smmu.c (0194/0195, exported by this patch) */
++extern int sweet_audio_buffer(uint64_t *pa, vm_offset_t *va, uint32_t *size);
++extern uint32_t sweet_audio_ring_take(uint32_t *frames, uint32_t max);
++extern int sweet_audio_dev_make(void);
++void sweet_sound_init(void);
++
++#define LOG(fmt, ...) printf("HOTDOGB SOUND: " fmt "\n", ##__VA_ARGS__)
++
++enum {
++	ST_OFF = 0, ST_WAIT, ST_DSP, ST_I2C, ST_AMPS, ST_PORT, ST_STREAM, ST_PLAYING,
++};
++static int sound_stage, sound_failed_at;
++static uint64_t sound_periods, sound_short, sound_clipped, sound_amp_on;
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* ---- registers: GCC, QUPv3 wrap0 SE4, TLMM pins ---- */
++
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x00060000u
++#define VOTE0           0x5200cu        /* QUP wrap0 votes: m_ahb bit 6, s_ahb 7, s4 14 */
++#define VOTE_BITS       ((1u << 6) | (1u << 7) | (1u << 14))
++#define S4_RCG          0x17608u        /* CMD, +4 CFG, +0x14 DFSR, +0x1c perf level 0 */
++#define S4_BR           0x17604u
++#define MAHB_BR         0x17004u
++#define SAHB_BR         0x17008u
++#define SE4_PA          0x00890000u
++#define TLMM_SOUTH      0x03d00000u
++
++static vm_offset_t gcc, se4;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (int i = 0; i < 5000; i++) {
++		if (!(rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* a pin: function `fn', drive `ma' mA, no pull (TLMM cfg: pull [1:0], func [5:2], drive [8:6]) */
++static void
++pin(unsigned n, unsigned fn, unsigned ma)
++{
++	vm_offset_t p = ml_io_map(TLMM_SOUTH + n * 0x1000u, 0x1000);
++
++	if (p != 0) {
++		uint32_t cfg = rd(p, 0);
++		wr(p, 0, (cfg & ~0x3ffu) | (fn << 2) | (((ma / 2) - 1) << 6));
++	}
++}
++
++static bool
++clocks_on(void)
++{
++	wr(gcc, VOTE0, rd(gcc, VOTE0) | VOTE_BITS);
++	if (rd(gcc, S4_RCG + 0x14) & 1u) {                      /* DFS: level 0 must be XO / 1 */
++		if ((rd(gcc, S4_RCG + 0x1c) & 0x371fu) != 1u) {
++			LOG("SE4 clock in DFS mode, level 0 not XO/1: stopped");
++			return false;
++		}
++	} else {
++		wr(gcc, S4_RCG + 4, (rd(gcc, S4_RCG + 4) & ~(0x371fu | (1u << 20))) | 1u);
++		wr(gcc, S4_RCG, rd(gcc, S4_RCG) | 1u);
++		if (!wait_clear(gcc, S4_RCG, 1u)) {
++			LOG("SE4 clock update did not finish");
++			return false;
++		}
++	}
++	if (!wait_clear(gcc, MAHB_BR, 1u << 31) || !wait_clear(gcc, S4_BR, 1u << 31)) {
++		LOG("SE4 clocks halted (m_ahb %#x, s4 %#x)", rd(gcc, MAHB_BR), rd(gcc, S4_BR));
++		return false;
++	}
++	(void)wait_clear(gcc, SAHB_BR, 1u << 31);               /* (hardware-gated when idle: fine) */
++	return true;
++}
++
++/* ---- SE4 as an I2C master (GENI), as sweet_touch.c / sweetaudio.py ---- */
++
++#define SE_STATUS       0x040
++#define SE_MCLK         0x048
++#define SE_FW           0x068
++#define SE_CLK_SEL      0x07c
++#define SE_DMA          0x258
++#define SE_TX_LEN       0x26c
++#define SE_RX_LEN       0x270
++#define SE_SCL          0x278
++#define SE_CMD          0x600
++#define SE_CTRL         0x604
++#define SE_IRQ          0x610
++#define SE_IRQ_EN       0x614
++#define SE_IRQ_CLR      0x618
++#define SE_TX           0x700
++#define SE_RX           0x780
++#define SE_TX_COUNT     0x800
++#define SE_RX_COUNT     0x804
++#define SE_TX_WM        0x80c
++#define SE_HW_TX        0xe24
++#define SE_HW_RX        0xe28
++#define I_DONE          1u
++#define I_NACK          (1u << 10)
++#define I_RX_WM         (1u << 26)
++#define I_RX_LAST       (1u << 27)
++#define I_TX_WM         (1u << 30)
++#define I_ERRORS        (0x3eu | (1u << 9) | (1u << 10) | (1u << 12))
++#define PACK0           0x0007f8feu
++#define PACK1           0x000ffefeu
++
++static bool
++i2c_init(void)
++{
++	if (!clocks_on()) {
++		return false;
++	}
++	pin(51, 1, 2);
++	pin(52, 1, 2);
++	uint32_t fw = rd(se4, SE_FW), tx = rd(se4, SE_HW_TX), rx = rd(se4, SE_HW_RX);
++	if (((fw >> 8) & 0xffu) != 3 || ((tx >> 24) & 0x3fu) != 32 || ((rx >> 24) & 0x3fu) != 32) {
++		LOG("SE4: no I2C firmware / 32-bit FIFOs (fw %#x tx %#x rx %#x)", fw, tx, rx);
++		return false;
++	}
++	if (rd(se4, SE_STATUS) & 0x1001u) {
++		LOG("SE4 busy");
++		return false;
++	}
++	wr(se4, 0xe18, 0);
++	wr(se4, 0xe1c, 0);
++	wr(se4, 0x644, 0);
++	wr(se4, SE_IRQ_CLR, 0xffffffffu);
++	wr(se4, 0x648, 0xffffffffu);
++	wr(se4, SE_DMA, 0);
++	wr(se4, 0x28, rd(se4, 0x28) | 0x7fu);
++	wr(se4, 0xe30, rd(se4, 0xe30) | 0x0fu);
++	wr(se4, 0x24, 0x7f);
++	wr(se4, 0x20, 1);
++	wr(se4, SE_CLK_SEL, 0);
++	wr(se4, SE_MCLK, (2u << 4) | 1u);                       /* 400 kHz from 19.2 MHz */
++	wr(se4, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	wr(se4, 0x254, 0);
++	wr(se4, 0x260, PACK0);
++	wr(se4, 0x284, PACK0);
++	wr(se4, 0x264, PACK1);
++	wr(se4, 0x288, PACK1);
++	wr(se4, SE_TX_WM, 0);
++	wr(se4, 0x810, 0);
++	wr(se4, 0x814, ((rx >> 16) & 0x3fu) - 1);
++	wr(se4, SE_IRQ_EN, I_DONE | I_ERRORS | I_RX_WM | I_RX_LAST | I_TX_WM);
++	return rd(se4, 0x260) == PACK0 && rd(se4, 0x264) == PACK1;
++}
++
++static void
++i2c_abort(void)
++{
++	wr(se4, SE_CTRL, 2);
++	for (int i = 0; i < 2000 && !(rd(se4, SE_IRQ) & (1u << 5)); i++) {
++	}
++	for (int i = 0; i < 64 && (rd(se4, SE_RX_COUNT) & 0x1ffffffu); i++) {
++		(void)rd(se4, SE_RX);
++	}
++	wr(se4, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* one FIFO message: a write of up to 3 bytes, or a read of nr (<= 4) bytes */
++static int
++i2c_msg(uint8_t addr, const uint8_t *tx, unsigned ntx, uint8_t *rxb, unsigned nr, bool stretch)
++{
++	uint32_t got = 0, have = 0;
++	bool sent = false;
++
++	if (!wait_clear(se4, SE_STATUS, 1u)) {
++		return EBUSY;
++	}
++	wr(se4, SE_IRQ_CLR, 0xffffffffu);
++	wr(se4, SE_TX_WM, ntx ? 1 : 0);
++	wr(se4, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : ntx);
++	wr(se4, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	for (int i = 0; i < 4000; i++) {
++		uint32_t irq = rd(se4, SE_IRQ);
++
++		if (irq & I_ERRORS) {
++			for (int j = 0; j < 2000 && !(irq & I_DONE); j++) {
++				irq = rd(se4, SE_IRQ);
++			}
++			wr(se4, SE_IRQ_CLR, irq);
++			if (!(irq & I_DONE)) {
++				i2c_abort();
++			}
++			return (irq & I_NACK) ? ENXIO : EIO;
++		}
++		if (ntx && !sent && (irq & I_TX_WM)) {
++			uint32_t w = 0;
++			for (unsigned k = 0; k < ntx; k++) {
++				w |= (uint32_t)tx[k] << (8 * k);
++			}
++			wr(se4, SE_TX, w);
++			sent = true;
++			wr(se4, SE_TX_WM, 0);
++		}
++		uint32_t count = rd(se4, SE_RX_COUNT) & 0x1ffffffu;
++		for (uint32_t k = 0; k < count && k < 64; k++) {
++			uint32_t w = rd(se4, SE_RX);
++			if (have == 0) {
++				got = w;
++			}
++			have++;
++		}
++		if (irq & I_DONE) {
++			wr(se4, SE_IRQ_CLR, irq);
++			for (unsigned k = 0; k < nr; k++) {
++				rxb[k] = (uint8_t)(got >> (8 * k));
++			}
++			return 0;
++		}
++		wr(se4, SE_IRQ_CLR, irq & (I_RX_WM | I_RX_LAST | I_TX_WM));
++	}
++	i2c_abort();
++	return ETIMEDOUT;
++}
++
++/* ---- the TFA9874s ---- */
++
++struct tfa_write {
++	uint8_t reg, pos, len;
++	uint16_t val;
++};
++
++/* the 7T's /vendor/firmware/tfa98xx.cnt (NXP container v3 "9871N1C", 3591 bytes), device lists and profile "speaker" */
++static const struct tfa_write tfa_dev_34[] = {
++	{ 0x0f, 0, 16, 0x5a6b },
++	{ 0xa1, 0, 16, 0x005a },
++	{ 0xa0, 0, 16, 0x005a },
++	{ 0x20, 12, 4, 0x2 },
++	{ 0x21, 4, 5, 0x1f },
++	{ 0x22, 2, 5, 0x1f },
++	{ 0x23, 3, 1, 0x1 },
++	{ 0x23, 4, 1, 0x0 },
++	{ 0x26, 12, 4, 0x0 },
++	{ 0x27, 0, 4, 0x1 },
++	{ 0x68, 0, 3, 0x3 },
++	{ 0x04, 0, 2, 0x1 },
++	{ 0x26, 0, 4, 0x0 },
++	{ 0x26, 4, 4, 0x1 },
++	{ 0x23, 1, 1, 0x1 },
++	{ 0x61, 6, 4, 0x4 },
++	{ 0x61, 2, 4, 0xf },
++	{ 0x68, 3, 2, 0x1 },
++	{ 0x68, 5, 2, 0x2 },
++	{ 0x02, 5, 6, 0x16 },
++	{ 0x52, 5, 8, 0xbe },
++	{ 0x53, 5, 1, 0x1 },
++	{ 0x64, 14, 2, 0x2 },
++	{ 0x56, 9, 1, 0x0 },
++	{ 0x6f, 0, 3, 0x5 },
++	{ 0x6f, 7, 3, 0x1 },
++	{ 0x70, 7, 2, 0x3 },
++	{ 0x74, 3, 1, 0x1 },
++	{ 0x74, 9, 5, 0x8 },
++	{ 0x75, 15, 1, 0x1 },
++	{ 0x74, 15, 1, 0x0 },
++	{ 0x80, 0, 2, 0x0 },
++	{ 0x83, 0, 6, 0x19 },
++	{ 0x83, 6, 5, 0x1e },
++	{ 0x84, 5, 4, 0x4 },
++	{ 0x51, 5, 1, 0x0 },
++	{ 0x58, 4, 5, 0x1 },
++	{ 0x6f, 5, 1, 0x1 },
++	{ 0x85, 1, 1, 0x1 },
++	{ 0x85, 3, 1, 0x0 },
++	{ 0x85, 4, 1, 0x0 },
++	{ 0x88, 0, 2, 0x2 },
++	{ 0x84, 4, 1, 0x0 },
++	{ 0xc4, 13, 1, 0x0 },
++	{ 0xb0, 5, 1, 0x0 },
++	{ 0x70, 3, 4, 0xb },
++	{ 0x74, 4, 5, 0xa },
++	{ 0x75, 3, 5, 0x5 },
++	{ 0x75, 8, 5, 0x10 },
++	{ 0x76, 3, 6, 0x1e },
++	{ 0x76, 9, 6, 0x3f },
++};
++static const struct tfa_write tfa_speaker_34[] = {
++	{ 0x64, 14, 2, 0x2 },
++	{ 0x23, 1, 1, 0x1 },
++	{ 0x00, 4, 1, 0x1 },
++	{ 0x61, 6, 4, 0x4 },
++	{ 0x02, 4, 1, 0x0 },
++	{ 0x62, 14, 2, 0x0 },
++};
++static const struct tfa_write tfa_dev_35[] = {
++	{ 0x0f, 0, 16, 0x5a6b },
++	{ 0xa1, 0, 16, 0x005a },
++	{ 0xa0, 0, 16, 0x005a },
++	{ 0x20, 12, 4, 0x2 },
++	{ 0x21, 4, 5, 0x1f },
++	{ 0x22, 2, 5, 0x1f },
++	{ 0x23, 3, 1, 0x1 },
++	{ 0x23, 4, 1, 0x0 },
++	{ 0x26, 12, 4, 0x1 },
++	{ 0x27, 0, 4, 0x0 },
++	{ 0x68, 0, 3, 0x3 },
++	{ 0x04, 0, 2, 0x1 },
++	{ 0x26, 0, 4, 0x1 },
++	{ 0x26, 4, 4, 0x0 },
++	{ 0x23, 1, 1, 0x1 },
++	{ 0x61, 6, 4, 0x4 },
++	{ 0x61, 2, 4, 0xf },
++	{ 0x68, 3, 2, 0x1 },
++	{ 0x68, 5, 2, 0x2 },
++	{ 0x02, 5, 6, 0x16 },
++	{ 0x52, 5, 8, 0xbe },
++	{ 0x53, 5, 1, 0x1 },
++	{ 0x64, 14, 2, 0x2 },
++	{ 0x56, 9, 1, 0x0 },
++	{ 0x6f, 0, 3, 0x5 },
++	{ 0x6f, 7, 3, 0x1 },
++	{ 0x70, 7, 2, 0x3 },
++	{ 0x74, 3, 1, 0x1 },
++	{ 0x74, 9, 5, 0x8 },
++	{ 0x75, 15, 1, 0x1 },
++	{ 0x74, 15, 1, 0x0 },
++	{ 0x80, 0, 2, 0x0 },
++	{ 0x83, 0, 6, 0x19 },
++	{ 0x83, 6, 5, 0x1e },
++	{ 0x84, 5, 4, 0x4 },
++	{ 0x51, 5, 1, 0x0 },
++	{ 0x58, 4, 5, 0x1 },
++	{ 0x6f, 5, 1, 0x1 },
++	{ 0x85, 1, 1, 0x1 },
++	{ 0x85, 3, 1, 0x0 },
++	{ 0x85, 4, 1, 0x0 },
++	{ 0x88, 0, 2, 0x2 },
++	{ 0x84, 4, 1, 0x0 },
++	{ 0xc4, 13, 1, 0x0 },
++	{ 0xb0, 5, 1, 0x0 },
++	{ 0x70, 3, 4, 0xa },
++	{ 0x74, 4, 5, 0xa },
++	{ 0x75, 3, 5, 0x5 },
++	{ 0x75, 8, 5, 0x10 },
++	{ 0x76, 3, 6, 0x1e },
++	{ 0x76, 9, 6, 0x3f },
++};
++static const struct tfa_write tfa_speaker_35[] = {
++	{ 0x64, 14, 2, 0x2 },
++	{ 0x23, 1, 1, 0x1 },
++	{ 0x00, 4, 1, 0x1 },
++	{ 0x61, 6, 4, 0x4 },
++	{ 0x02, 4, 1, 0x0 },
++	{ 0x62, 14, 2, 0x0 },
++};
++/* 32768 * 10^(-dB/20), dB = 0..30 */
++static const uint16_t sound_gain_q15[31] = {32767, 29205, 26029, 23198, 20675, 18427, 16423, 14637, 13045, 11627, 10362, 9235, 8231, 7336, 6538, 5827, 5193, 4629, 4125, 3677, 3277, 2920, 2603, 2320, 2068, 1843, 1642, 1464, 1305, 1163, 1036};
++
++static int
++tfa_rd(uint8_t addr, uint8_t reg, uint16_t *v)
++{
++	uint8_t b[2];
++	int e = i2c_msg(addr, &reg, 1, NULL, 0, true);
++
++	if (e == 0) {
++		e = i2c_msg(addr, NULL, 0, b, 2, false);
++	}
++	if (e == 0) {
++		*v = (uint16_t)(b[0] << 8 | b[1]);      /* 16-bit registers, big endian */
++	}
++	return e;
++}
++
++static int
++tfa_wr(uint8_t addr, uint8_t reg, uint16_t v)
++{
++	uint8_t b[3] = { reg, (uint8_t)(v >> 8), (uint8_t)v };
++
++	return i2c_msg(addr, b, 3, NULL, 0, false);
++}
++
++static int
++tfa_bf(uint8_t addr, uint8_t reg, unsigned pos, unsigned len, uint16_t val)
++{
++	uint16_t old, mask = (uint16_t)(((1u << len) - 1) << pos);
++	int e = tfa_rd(addr, reg, &old);
++
++	if (e == 0) {
++		e = tfa_wr(addr, reg, (uint16_t)((old & ~mask) | ((val << pos) & mask)));
++	}
++	return e;
++}
++
++static int
++tfa_apply(uint8_t addr, const struct tfa_write *w, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		int e = w[i].len == 16 ? tfa_wr(addr, w[i].reg, w[i].val) : tfa_bf(addr, w[i].reg, w[i].pos, w[i].len, w[i].val);
++		if (e != 0) {
++			return e;
++		}
++	}
++	return 0;
++}
++
++static const uint8_t tfa_addr[2] = { 0x34, 0x35 };
++
++static bool
++tfa_init(void)
++{
++	static const struct { uint8_t reg; uint16_t val; } c74[] = {
++		{ 0x02, 0x22c8 }, { 0x52, 0x57dc }, { 0x53, 0x003e }, { 0x56, 0x0400 }, { 0x61, 0x0110 }, { 0x6f, 0x00a5 },
++		{ 0x70, 0x07f8 }, { 0x73, 0x0047 }, { 0x74, 0x5098 }, { 0x75, 0x8d28 }, { 0x80, 0x0000 }, { 0x83, 0x0799 },
++		{ 0x84, 0x0081 },
++	};
++	bool any = false;
++
++	for (int a = 0; a < 2; a++) {
++		uint8_t addr = tfa_addr[a];
++		uint16_t rev = 0, fb = 0;
++		int e = tfa_rd(addr, 0x03, &rev);
++
++		if (e != 0 || rev != 0x0c74) {
++			LOG("TFA %#x: revision %#x (error %d): not the 0x0c74 these settings are for, left alone", addr, rev, e);
++			continue;
++		}
++		e = tfa_wr(addr, 0x00, 1u << 1);                /* I2CR */
++		sleep_ms(10);
++		e = e ?: tfa_wr(addr, 0x0f, 0x5a6b);            /* keys */
++		e = e ?: tfa_rd(addr, 0xfb, &fb);
++		e = e ?: tfa_wr(addr, 0xa0, fb ^ 0x005a);
++		e = e ?: tfa_wr(addr, 0xa1, 0x005a);
++		e = e ?: tfa_wr(addr, 0x0f, 0);
++		for (unsigned i = 0; e == 0 && i < sizeof(c74) / sizeof(c74[0]); i++) {
++			e = tfa_wr(addr, c74[i].reg, c74[i].val);
++		}
++		if (e == 0) {
++			e = a == 0 ? tfa_apply(addr, tfa_dev_34, sizeof(tfa_dev_34) / sizeof(tfa_dev_34[0])) :
++			    tfa_apply(addr, tfa_dev_35, sizeof(tfa_dev_35) / sizeof(tfa_dev_35[0]));
++		}
++		if (e == 0) {
++			e = a == 0 ? tfa_apply(addr, tfa_speaker_34, sizeof(tfa_speaker_34) / sizeof(tfa_speaker_34[0])) :
++			    tfa_apply(addr, tfa_speaker_35, sizeof(tfa_speaker_35) / sizeof(tfa_speaker_35[0]));
++		}
++		e = e ?: tfa_bf(addr, 0x00, 3, 1, 0);           /* AMPE 0: muted */
++		LOG("TFA %#x: %s", addr, e == 0 ? "set up (rev 0x0c74 settings, container device + speaker), muted" : "FAILED");
++		any |= e == 0;
++	}
++	return any;
++}
++
++static void
++tfa_up(void)
++{
++	for (int a = 0; a < 2; a++) {
++		uint16_t r11 = 0, r14 = 0;
++
++		(void)tfa_bf(tfa_addr[a], 0x01, 2, 1, 1);       /* MANSCONF */
++		(void)tfa_bf(tfa_addr[a], 0x00, 0, 1, 0);       /* PWDN 0 */
++		for (int i = 0; i < 50; i++) {
++			if (tfa_rd(tfa_addr[a], 0x11, &r11) == 0 && (r11 & (1u << 7))) {
++				break;
++			}
++			sleep_ms(10);
++		}
++		(void)tfa_bf(tfa_addr[a], 0x00, 3, 1, 0);       /* (the chip sets AMPE itself in operating) */
++		(void)tfa_rd(tfa_addr[a], 0x14, &r14);
++		LOG("TFA %#x: CLKS %u PLLS %u, state %u", tfa_addr[a], (r11 >> 7) & 1u, (r11 >> 6) & 1u, (r14 >> 3) & 0xfu);
++	}
++}
++
++static void
++tfa_mute(bool on)
++{
++	for (int a = 0; a < 2; a++) {
++		(void)tfa_bf(tfa_addr[a], 0x00, 3, 1, on ? 0 : 1);
++	}
++}
++
++/* ---- APR to the DSP ---- */
++
++#define APR_SVC_AFE     4
++#define APR_SVC_ASM     7
++#define APR_SVC_ADM     8
++#define APR_BASIC_RSP   0x000110e8u
++#define AFE_PORT_CMD_DEVICE_START       0x000100e5u
++#define AFE_PORT_CMD_SET_PARAM_V2       0x000100efu
++#define AFE_SVC_CMD_SET_PARAM           0x000100f3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE  0x0001020cu
++#define AFE_PARAM_ID_I2S_CONFIG         0x0001020du
++#define AFE_MODULE_CLOCK_SET            0x0001028fu
++#define AFE_PARAM_ID_CLOCK_SET          0x00010290u
++#define ADM_CMD_DEVICE_OPEN_V5          0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5       0x00010329u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5  0x00010325u
++#define ADM_TOPOLOGY_NONE               0x00010312u
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS  0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS 0x00010d93u
++#define ASM_STREAM_CMD_OPEN_WRITE_V3    0x00010db3u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 0x00010d98u
++#define ASM_SESSION_CMD_RUN_V2          0x00010daau
++#define ASM_DATA_CMD_WRITE_V2           0x00010dabu
++#define ASM_DATA_EVENT_WRITE_DONE_V2    0x00010d99u
++#define ASM_TOPOLOGY_NONE               0x00010c68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010da5u
++#define QUAT_MI2S_RX    0x1006u
++#define CLOCK_QUAD_MI2S_IBIT 0x106u
++#define RATE            48000u
++#define STREAM_PORT     (1u << 8 | 1u)
++#define WRITE_TOKEN     0x80000000u
++#define PERIOD_FRAMES   960u
++#define PERIOD_BYTES    (PERIOD_FRAMES * 4u)
++#define PERIODS         8u
++
++struct apr_hdr {
++	uint16_t field, size;
++	uint8_t src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t dst_svc, dst_domain;
++	uint16_t dst_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static uint8_t apr_in[4096];
++static size_t apr_in_len, apr_in_at;
++static uint32_t apr_token = 0x200;
++
++static int
++apr_send(uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t len)
++{
++	uint8_t pkt[sizeof(struct apr_hdr) + 128];
++	struct apr_hdr *h = (struct apr_hdr *)pkt;
++
++	if (len > sizeof(pkt) - sizeof(*h)) {
++		return EINVAL;
++	}
++	*h = (struct apr_hdr){ .field = (uint16_t)(2u << 8 | (sizeof(*h) / 4) << 4), .size = (uint16_t)(sizeof(*h) + len),
++		.src_svc = svc, .src_domain = 5, .src_port = port, .dst_svc = svc, .dst_domain = 4, .dst_port = port,
++		.token = token, .opcode = opcode };
++	memcpy(pkt + sizeof(*h), payload, len);
++	return sweet_adsp_apr_send(pkt, sizeof(*h) + len);
++}
++
++/* the next packet from the DSP (opcode, token, payload words); false when none is waiting */
++static bool
++apr_next(uint32_t *opcode, uint32_t *token, const uint32_t **words, uint32_t *nwords)
++{
++	if (apr_in_at >= apr_in_len) {
++		apr_in_len = apr_in_at = 0;
++		if (sweet_adsp_apr_recv(apr_in, sizeof(apr_in), &apr_in_len) != 0 || apr_in_len == 0) {
++			return false;
++		}
++	}
++	uint32_t n;
++	if (apr_in_at + 4 > apr_in_len) {
++		apr_in_len = apr_in_at = 0;
++		return false;
++	}
++	memcpy(&n, apr_in + apr_in_at, 4);
++	if (apr_in_at + 4 + n > apr_in_len) {
++		apr_in_len = apr_in_at = 0;
++		return false;
++	}
++	const uint8_t *p = apr_in + apr_in_at + 4;
++	apr_in_at += 4 + n;
++	if (n < sizeof(struct apr_hdr)) {
++		*opcode = 0;
++		*nwords = 0;
++		return true;
++	}
++	const struct apr_hdr *h = (const struct apr_hdr *)p;
++	uint32_t hl = ((h->field >> 4) & 0xfu) * 4;
++	hl = hl < sizeof(*h) ? sizeof(*h) : hl;
++	*opcode = h->opcode;
++	*token = h->token;
++	*words = (const uint32_t *)(const void *)(p + hl);
++	*nwords = n > hl ? (n - hl) / 4 : 0;
++	return true;
++}
++
++/* a command and its answer within 1 s: the basic response's status (0 ok), or `rsp' (its first words in out) */
++static int
++apr_call(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len, uint32_t rsp,
++    uint32_t *out, uint32_t nout)
++{
++	uint32_t tok = ++apr_token;
++
++	if (apr_send(svc, port, tok, opcode, payload, len) != 0) {
++		LOG("%s: could not be sent", what);
++		return EIO;
++	}
++	for (int i = 0; i < 200; i++) {
++		uint32_t op, token, nw;
++		const uint32_t *w;
++
++		while (apr_next(&op, &token, &w, &nw)) {
++			if (rsp != 0 && op == rsp) {
++				for (uint32_t k = 0; k < nout && k < nw; k++) {
++					out[k] = w[k];
++				}
++				return 0;
++			}
++			if (op == APR_BASIC_RSP && nw >= 2 && w[0] == opcode) {
++				if (w[1] != 0) {
++					LOG("%s: refused, status %#x", what, w[1]);
++				}
++				return w[1] == 0 ? 0 : EIO;
++			}
++		}
++		sleep_ms(5);
++	}
++	LOG("%s: no answer", what);
++	return ETIMEDOUT;
++}
++
++static int
++afe_param(const char *what, bool service, uint32_t module, uint32_t param, const void *data, uint16_t len)
++{
++	uint8_t body[16 + 12 + 32];
++	uint32_t at = service ? 16 : 16;
++
++	struct { uint32_t module, param; uint16_t size, reserved; } __attribute__((packed)) ph = { module, param, len, 0 };
++	if (service) {
++		uint32_t h[4] = { (uint32_t)sizeof(ph) + len, 0, 0, 0 };
++		memcpy(body, h, 16);
++	} else {
++		struct { uint16_t port, size; uint32_t a, b, c; } __attribute__((packed)) h = { QUAT_MI2S_RX,
++			(uint16_t)(sizeof(ph) + len), 0, 0, 0 };
++		memcpy(body, &h, 16);
++	}
++	memcpy(body + at, &ph, sizeof(ph));
++	memcpy(body + at + sizeof(ph), data, len);
++	return apr_call(what, APR_SVC_AFE, 0, service ? AFE_SVC_CMD_SET_PARAM : AFE_PORT_CMD_SET_PARAM_V2, body,
++	           at + (uint32_t)sizeof(ph) + len, 0, NULL, 0);
++}
++
++static bool
++port_start(void)
++{
++	struct { uint32_t version, clk_id, freq; uint16_t attri, root; uint32_t enable; } __attribute__((packed)) clk =
++	{ 1, CLOCK_QUAD_MI2S_IBIT, RATE * 32 * 2, 1, 0, 1 };
++	struct { uint32_t version; uint16_t bits, lines, stereo, ws; uint32_t rate; uint16_t a, b; } __attribute__((packed)) i2s =
++	{ 1, 32, 2, 1, 1, RATE, 0, 0 };
++	uint16_t start[2] = { QUAT_MI2S_RX, 0 };
++
++	return afe_param("bit clock 3.072 MHz", true, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clk, sizeof(clk)) == 0 &&
++	       afe_param("port 0x1006 I2S SD1 32-bit", false, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s,
++	       sizeof(i2s)) == 0 &&
++	       apr_call("port 0x1006 started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL, 0) == 0;
++}
++
++/* ---- the stream and its feeder ---- */
++
++static uint64_t buf_dsp;
++static vm_offset_t buf_va;
++static uint32_t map_handle;
++
++static bool
++stream_open(void)
++{
++	uint64_t pa;
++	uint32_t size, w[2] = { 0, 0 };
++
++	if (sweet_audio_buffer(&pa, &buf_va, &size) != 0 || size < PERIODS * 4096u) {
++		LOG("no DSP buffer (0194)");
++		return false;
++	}
++	buf_dsp = pa | (1ull << 32);                    /* the audio stream's SID bit (0194's alias) */
++	struct { uint16_t pool, regions; uint32_t prop, lo, hi, size; } __attribute__((packed)) map =
++	{ 3, 1, 0, (uint32_t)buf_dsp, (uint32_t)(buf_dsp >> 32), PERIODS * 4096u };
++	if (apr_call("buffer mapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
++	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, w, 1) != 0) {
++		return false;
++	}
++	map_handle = w[0];
++	struct { uint16_t flags, mode, ep1, ep2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t map[8]; }
++	__attribute__((packed)) adm = { 0, 1, QUAT_MI2S_RX, 0xffff, ADM_TOPOLOGY_NONE, 2, 16, RATE, { 1, 2 } };
++	if (apr_call("ADM path to 0x1006", APR_SVC_ADM, QUAT_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5, &adm, sizeof(adm),
++	    ADM_CMDRSP_DEVICE_OPEN_V5, w, 2) != 0 || w[0] != 0) {
++		LOG("ADM path refused (%#x)", w[0]);
++		return false;
++	}
++	uint16_t copp = (uint16_t)w[1];
++	struct { uint32_t flags; uint16_t sink, bits; uint32_t topology, format; } __attribute__((packed)) open =
++	{ 0, 0, 16, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++	struct { uint32_t matrix, sessions; uint16_t session, copps, copp0, copp1; } __attribute__((packed)) route =
++	{ 0, 1, 1, 1, copp, 0 };
++	struct { uint32_t size; uint16_t channels, bits; uint32_t rate; uint16_t sign, res; uint8_t map[8]; }
++	__attribute__((packed)) fmt = { 20, 2, 16, RATE, 1, 0, { 1, 2 } };
++	uint32_t run[3] = { 0, 0, 0 };
++	return apr_call("ASM stream open", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &open, sizeof(open), 0,
++	           NULL, 0) == 0 &&
++	       apr_call("session routed", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0, NULL, 0) == 0 &&
++	       apr_call("stream format", APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &fmt, sizeof(fmt), 0, NULL,
++	       0) == 0 &&
++	       apr_call("session run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0, NULL, 0) == 0;
++}
++
++static uint32_t gain_q15 = 8231, gain_db = 12;  /* -12 dB */
++static bool amp_on;
++static uint32_t quiet_periods;
++
++/* one period from the ring (silence where iOS wrote nothing), scaled and clipped, into period k of the buffer */
++static void
++period_fill(uint32_t k)
++{
++	static uint32_t frames[PERIOD_FRAMES];
++	uint32_t got = sweet_audio_ring_take(frames, PERIOD_FRAMES), peak = 0;
++	volatile uint32_t *dst = (volatile uint32_t *)(buf_va + 4096u * k);
++
++	if (got < PERIOD_FRAMES) {
++		sound_short++;
++	}
++	for (uint32_t i = 0; i < PERIOD_FRAMES; i++) {
++		uint32_t f = i < got ? frames[i] : 0, out = 0;
++
++		for (int c = 0; c < 2; c++) {
++			int32_t s = (int16_t)(f >> (16 * c)), v = (s * (int32_t)gain_q15) >> 15;
++			uint32_t m = (uint32_t)(v < 0 ? -v : v);
++
++			if (v > 32767 || v < -32768) {
++				sound_clipped++;
++				v = v > 0 ? 32767 : -32768;
++			}
++			peak = m > peak ? m : peak;
++			out |= ((uint32_t)(uint16_t)v) << (16 * c);
++		}
++		dst[i] = out;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (peak > 8) {
++		quiet_periods = 0;
++		if (!amp_on) {
++			tfa_mute(false);
++			amp_on = true;
++			sound_amp_on++;
++		}
++	} else if (amp_on && ++quiet_periods >= 150) {          /* 3 s of silence */
++		tfa_mute(true);
++		amp_on = false;
++	}
++}
++
++static void
++period_post(uint32_t k)
++{
++	uint64_t a = buf_dsp + 4096u * k;
++	uint32_t w[8] = { (uint32_t)a, (uint32_t)(a >> 32), map_handle, PERIOD_BYTES, k, 0, 0, 0 };
++
++	(void)apr_send(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | k, ASM_DATA_CMD_WRITE_V2, w, sizeof(w));
++}
++
++static void
++feed(void)
++{
++	for (uint32_t k = 0; k < PERIODS; k++) {
++		period_fill(k);
++		period_post(k);
++	}
++	sound_stage = ST_PLAYING;
++	LOG("playing: iOS's sound from /dev/redwood-audio, %u dB below full, amplifiers on while there is sound", gain_db);
++	for (;;) {
++		uint32_t op, token, nw;
++		const uint32_t *w;
++		bool any = false;
++
++		while (apr_next(&op, &token, &w, &nw)) {
++			if (op == ASM_DATA_EVENT_WRITE_DONE_V2 && (token & WRITE_TOKEN)) {
++				uint32_t k = token & 31u;
++				if (k < PERIODS) {
++					period_fill(k);
++					period_post(k);
++					sound_periods++;
++				}
++				any = true;
++			}
++		}
++		if (!any) {
++			sleep_ms(2);
++		}
++	}
++}
++
++static void
++sound_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	uint32_t delay_s = 15;
++
++	(void)PE_parse_boot_argn("sweetsounddelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweetsoundgain", &gain_db, sizeof(gain_db));
++	gain_q15 = sound_gain_q15[gain_db > 30 ? 30 : gain_db];
++	sound_stage = ST_WAIT;
++	sleep_ms(delay_s * 1000);
++
++	sound_stage = ST_DSP;
++	int e = sweet_adsp_start();
++	for (int i = 0; i < 600 && sweet_adsp_stage() >= 0 && sweet_adsp_stage() < 6; i++) {
++		sleep_ms(100);
++	}
++	if (sweet_adsp_stage() < 6) {
++		LOG("the audio DSP did not come up (start %d, stage %d): no sound", e, sweet_adsp_stage());
++		goto failed;
++	}
++	sleep_ms(500);
++	gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	se4 = ml_io_map(SE4_PA, 0x4000);
++	sound_stage = ST_I2C;
++	if (gcc == 0 || se4 == 0 || !i2c_init()) {
++		LOG("the amplifiers' I2C could not be set up");
++		goto failed;
++	}
++	sound_stage = ST_AMPS;
++	if (!tfa_init()) {
++		goto failed;
++	}
++	sound_stage = ST_PORT;
++	pin(137, 1, 8);
++	pin(138, 1, 8);
++	pin(140, 1, 8);
++	if (!port_start()) {
++		goto failed;
++	}
++	tfa_up();
++	sound_stage = ST_STREAM;
++	if (!stream_open()) {
++		goto failed;
++	}
++	feed();                                         /* (does not return) */
++failed:
++	sound_failed_at = sound_stage;
++	sound_stage = -sound_stage;
++	LOG("stopped at stage %d", sound_failed_at);
++}
++
++void
++sweet_sound_init(void)
++{
++	int on = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetsound", &on, sizeof(on));
++	if (!on) {
++		LOG("off (sweetsound=0)");
++		return;
++	}
++	if (sweet_audio_dev_make() != 0) {
++		LOG("/dev/redwood-audio could not be made");
++	}
++	if (kernel_thread_start(sound_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++static int
++sysctl_sweetsound SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char text[200];
++	int len = snprintf(text, sizeof(text), "stage %d periods %llu short %llu clipped %llu amp-on %llu amp %s",
++	    sound_stage, sound_periods, sound_short, sound_clipped, sound_amp_on, amp_on ? "on" : "off");
++
++	return SYSCTL_OUT(req, text, (size_t)len + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetsound, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetsound, "A",
++    "the speakers from boot (0196): stage (7 playing; negative: stopped there) and counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7737043..8040011 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
++extern void sweet_sound_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -766,6 +767,8 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	/* GPU framebuffer blitting (bsd/dev/sweet_gpu.c; off unless sweetgpu4=1). */
+ 	sweet_gpu_init();
++	/* 0196: the speakers from boot (bsd/dev/sweet_sound.c; sweetsound=0: off) */
++	sweet_sound_init();
+ 	return 0;
+ }
+ 

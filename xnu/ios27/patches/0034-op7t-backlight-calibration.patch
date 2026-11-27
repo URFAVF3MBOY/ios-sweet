@@ -1,0 +1,54 @@
+0034: backlight-calibration-parameters for CoreBrightness.
+
+Boot 28o: the 0033 tables are on AppleARMBacklight (63 properties) and backboardd still crashes at the same place
+(SIGSEGV far 0, unslid 0x22cc60b20). iOS 27.2's CoreBrightness DisplayCreate reads the dictionary
+backlight-calibration-parameters (lMax/lMid/lMin Product and Panel, 16.16 nits) from the backlight; without it the
+calibration curve stays NULL (ios-guacamole's notes). A real phone's display driver publishes it.
+- SweetBacklight.cpp: AppleARMBacklight publishes it from LmaxProduct/LmidProduct/LminProduct (D73: 2175, 155,
+  2 nits), panel = product.
+
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -431,6 +431,42 @@
+ 		}
+ 		LOG("AppleARMBacklight: %u properties from /sweet-backlight", copied);
+ 	}
++	/*
++	 * 0034: iOS 27.2's CoreBrightness (DisplayCreate -> getBacklightCalibration) reads the dictionary
++	 * backlight-calibration-parameters {lMaxProduct, lMidProduct, lMinProduct, lMaxPanel, lMidPanel, lMinPanel}
++	 * (16.16 nits) from the backlight; a real phone's display driver publishes it. Without it the calibration
++	 * curve stays NULL and backboardd crashes (boot 28o: still SIGSEGV far 0 with the 0033 tables; key and
++	 * fields from ios-guacamole's notes). Product and panel get the LmaxProduct/LmidProduct/LminProduct values
++	 * copied above (D73: 2175, 155 and 2 nits), or 500/155/2 nits without them.
++	 */
++	{
++		static const char *const from[3] = { "LmaxProduct", "LmidProduct", "LminProduct" };
++		static const char *const to[6] = { "lMaxProduct", "lMidProduct", "lMinProduct",
++			                           "lMaxPanel", "lMidPanel", "lMinPanel" };
++		static const uint32_t fallback[3] = { 500u << 16, 155u << 16, 2u << 16 };
++		OSDictionary *calib = OSDictionary::withCapacity(6);
++
++		for (unsigned i = 0; calib != NULL && i < 3; i++) {
++			OSData *d = OSDynamicCast(OSData, svc->getProperty(from[i]));
++			uint32_t v = fallback[i];
++			OSNumber *n;
++
++			if (d != NULL && d->getLength() >= 4) {
++				const uint8_t *b = (const uint8_t *)d->getBytesNoCopy();
++				v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			}
++			if ((n = OSNumber::withNumber((unsigned long long)v, 32)) != NULL) {
++				calib->setObject(to[i], n);
++				calib->setObject(to[i + 3], n);
++				n->release();
++			}
++		}
++		if (calib != NULL) {
++			svc->setProperty("backlight-calibration-parameters", calib);
++			calib->release();
++			LOG("AppleARMBacklight: backlight-calibration-parameters published");
++		}
++	}
+ 	if (!svc->attach(sweet_bl_fb)) {
+ 		svc->release();
+ 		return ENXIO;

@@ -1,0 +1,47 @@
+0008: write-combined mappings outside xnu's DRAM stay Normal non-cacheable on SWEET (as on xnu-8796).
+
+xnu-12377 maps VM_WIMG_WCOMB / PMAP_MAP_BD_WCOMB of non-DRAM addresses as Device-GRE (posted, combined, reordered),
+where DC ZVA and unaligned accesses fault. Boot 27c: alignment fault (esr 0x96000061) in bzero+0x44 <- pool_alloc,
+zeroing the GPU pool (/chosen sweet-gpu-pool, outside dram-size). /pram (panic log) and the framebuffer are
+outside xnu's DRAM too (ios-guacamole hit the same in check_for_panic_log).
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 76a7e1e..d451c72 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -1911,6 +1911,12 @@ pmap_construct_io_pte(pmap_paddr_t paddr, pt_entry_t tmplate)
+ }
+ #endif /* XNU_MONITOR */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#define SWEET_WCOMB_NORMAL 1
++#else
++#define SWEET_WCOMB_NORMAL 0
++#endif
++
+ vm_map_address_t
+ pmap_map_bd_with_options(
+ 	vm_map_address_t virt,
+@@ -1943,7 +1949,12 @@ pmap_map_bd_with_options(
+ 
+ 	switch (options & PMAP_MAP_BD_MASK) {
+ 	case PMAP_MAP_BD_WCOMB:
+-		if (is_dram_addr(start)) {
++		/*
++		 * SWEET: write-combined mappings outside xnu-managed DRAM (the GPU pool, /pram, the framebuffer) stay Normal
++		 * non-cacheable as on xnu-8796. 12377 makes them Device-GRE, where DC ZVA and unaligned accesses fault (boot 27c:
++		 * alignment fault in bzero <- pool_alloc).
++		 */
++		if (is_dram_addr(start) || SWEET_WCOMB_NORMAL) {
+ 			mem_attr = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ #if HAS_FEAT_XS
+@@ -6029,7 +6040,7 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_WCOMB:
+-		if (is_dram_addr(pa)) {
++		if (is_dram_addr(pa) || SWEET_WCOMB_NORMAL) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ #if HAS_FEAT_XS

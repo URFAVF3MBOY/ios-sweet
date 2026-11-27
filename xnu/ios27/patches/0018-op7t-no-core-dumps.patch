@@ -1,0 +1,21 @@
+0018: no user core dumps by default on SWEET.
+
+Boot 27o: launchd runs (0016), tzinit (pid 19) crashed and the kernel spent minutes dumping its core over the
+8 GiB shared region while launchd waited. kern.coredump=1 still enables them.
+
+--- a/bsd/kern/kern_core.c
++++ b/bsd/kern/kern_core.c
+@@ -89,6 +89,13 @@
+ 
+ #ifdef SECURE_KERNEL
+ __XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET (0018): no cores by default. Boot 27o: tzinit crashed and its core (a walk over the whole 8 GiB shared
++ * region, written to /cores on the UFS root) took minutes while launchd waited on the boot task.
++ * sysctl kern.coredump=1 turns them back on.
++ */
++__XNU_PRIVATE_EXTERN int do_coredump = 0;
+ #else
+ __XNU_PRIVATE_EXTERN int do_coredump = 1;       /* default: dump cores */
+ #endif /* SECURE_KERNEL */

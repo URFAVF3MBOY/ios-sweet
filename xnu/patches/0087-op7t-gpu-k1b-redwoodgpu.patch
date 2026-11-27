@@ -1,0 +1,1931 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 342b80c..0337000 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -38,6 +38,8 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
++#include <stdbool.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -357,6 +359,7 @@ static vm_offset_t sl_k1, k1_cb;
+ static uint32_t k1_l3_live;			/* bit t: pool table t is in the L2 */
+ static struct { uint64_t start, size; } k1_free[64];
+ static unsigned k1_nfree, k1_lost;
++static int k1_va_fresh;			/* no TLB maintenance works: never reuse an address */
+ static uint32_t k1_fence;
+ 
+ static vm_offset_t k1p(uintptr_t pa)		/* K1 slice PA -> kernel VA */
+@@ -387,6 +390,10 @@ void sweet_gpu_address_free(uint64_t a, uint64_t size)
+ {
+ 	unsigned at;
+ 	size = (size + 0xfffULL) & ~0xfffULL;
++	if (k1_va_fresh) {
++		k1_lost += (unsigned)(size >> 12);	/* never handed out again: see k1_tlb_flush_range */
++		return;
++	}
+ 	for (at = 0; at < k1_nfree && k1_free[at].start < a; at++)
+ 		;
+ 	if (at > 0 && k1_free[at - 1].start + k1_free[at - 1].size == a) {
+@@ -436,24 +443,103 @@ void sweet_gpu_mapped(void)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-static int k1_tlb_flush(void)
++/*
++ * TLB maintenance. Phone, 2026-10-22 (twice, the second time with the UCHE invalidate too):
++ * TLBIASID 0 + TLBSYNC completed, yet the GPU kept the old translation of a remapped page. The
++ * SMMU's global registers are the hypervisor's (HackiOS: "the global ones are the hypervisor's
++ * to grant"), so which invalidation reaches the TLBs is found on the phone: the K1a test tries
++ * these in order, each adding to the ones before, and keeps the first that works
++ * (k1_tlb_method). All are architectural SMMUv2 operations (ARM IHI 0062):
++ *   0  CB TLBIASID (ASID 0, what the shim's TTBR0 carries) + CB TLBSYNC   [what HackiOS does]
++ *   1  + CB TLBIASID with the context's number (HackiOS tags TTBR0 with it)
++ *   2  + CB TLBIVA and TLBIVAA for each page (64-bit, VA[55:12] in [43:0], ASID in [63:48])
++ *   3  + global TLBIALLNSNH + TLBGSYNC (every non-secure context: only costs refills)
++ * None works: k1_va_fresh = 1, the allocator never hands an address out twice, so a stale
++ * translation is never used (the 64 MiB window then runs out after 64 MiB of buffers: enough
++ * for the tests, not for Mesa).
++ */
++#define CB_TLBIVA		0x600U
++#define CB_TLBIVAA		0x608U
++#define SMMU_TLBIALLNSNH	0x68U
++#define SMMU_TLBGSYNC		0x70U
++#define SMMU_TLBGSTATUS		0x74U
++static vm_offset_t k1_gr0;
++static uint32_t k1_cb_index;
++static int k1_tlb_method = 3;		/* until the K1a test has chosen: the most thorough */
++
++static inline void k1_cbw(uint32_t off, uint32_t v)
+ {
+-	if (!k1_cb)
+-		return 0;
+-	*(volatile uint32_t *)(k1_cb + CB_TLBIASID) = 0;
++	*(volatile uint32_t *)(k1_cb + off) = v;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(k1_cb + CB_TLBSYNC) = 0;
++}
++static inline void k1_cbw64(uint32_t off, uint64_t v)
++{
++	*(volatile uint64_t *)(k1_cb + off) = v;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	for (unsigned i = 0; i < 100000; i++) {
+-		if (!(*(volatile uint32_t *)(k1_cb + CB_TLBSTATUS) & 1U))
+-			return 1;
++}
++static inline uint32_t k1_cbr(uint32_t off)
++{
++	return *(volatile uint32_t *)(k1_cb + off);
++}
++static inline void k1_gr0w(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(k1_gr0 + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline uint32_t k1_gr0r(uint32_t off)
++{
++	return *(volatile uint32_t *)(k1_gr0 + off);
++}
++
++static int k1_tlb_flush_range(uint64_t va, uint64_t size)
++{
++	int ok = 1;
++	if (!k1_cb)
++		return 0;
++	k1_cbw(CB_TLBIASID, 0);
++	if (k1_tlb_method >= 1)
++		k1_cbw(CB_TLBIASID, k1_cb_index);
++	if (k1_tlb_method >= 2) {
++		for (uint64_t o = 0; o < size && o < (4ULL << 20); o += 0x1000) {
++			k1_cbw64(CB_TLBIVA, ((va + o) >> 12) & 0xfffffffffffULL);
++			k1_cbw64(CB_TLBIVAA, ((va + o) >> 12) & 0xfffffffffffULL);
++		}
++		if (size >= (4ULL << 20))
++			k1_cbw(CB_TLBIASID, 0);
++	}
++	k1_cbw(CB_TLBSYNC, 0);
++	unsigned i;
++	for (i = 0; i < 100000 && (k1_cbr(CB_TLBSTATUS) & 1U); i++)
+ 		delay(1);
++	ok = i < 100000;
++	if (k1_tlb_method >= 3 && k1_gr0) {
++		k1_gr0w(SMMU_TLBIALLNSNH, 0);
++		k1_gr0w(SMMU_TLBGSYNC, 0);
++		for (i = 0; i < 100000 && (k1_gr0r(SMMU_TLBGSTATUS) & 1U); i++)
++			delay(1);
++		ok = ok && i < 100000;
+ 	}
+-	return 0;
++	return ok;
++}
++
++static int k1_tlb_flush(void)
++{
++	return k1_tlb_flush_range(0, 0);
+ }
+ 
++/*
++ * The GPU's own cache (UCHE) sits before the SMMU and keeps lines by GPU address: after a page
++ * is unmapped (and maybe mapped elsewhere) a line it still holds would be read or written back
++ * where the page used to be. Phone, K1a boot 2026-10-22: page A got the write meant for page B
++ * although the TLB maintenance completed. Linux a6xx_set_pagetable() ends a translation change
++ * with CP_EVENT_WRITE CACHE_INVALIDATE ("be sure there isn't anything lingering"); so does the
++ * next submission here, once after any unmap. (0x31 is the event 0084's blits already use.)
++ */
++static int k1_uche_stale;
++
+ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ {
++	k1_uche_stale = 1;
+ 	for (uint64_t o = 0; o < size; o += 0x1000) {
+ 		uint64_t v = va + o;
+ 		if (v < K1_VA_BASE || v >= K1_VA_BASE + K1_VA_SIZE)
+@@ -463,17 +549,21 @@ int sweet_gpu_unmap(uint64_t va, uint64_t size)
+ 			((volatile uint64_t *)k1p(K1_POOL_PA + (uintptr_t)t * 0x1000))[(v >> 12) & 0x1ffU] = 0;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	return k1_tlb_flush();
++	return k1_tlb_flush_range(va, size);
+ }
+ 
+ /* HackiOS redwood_gpu_submit, on 0084's ring: invalidate CCU, the IBs, then the fence (synchronous here) */
+ uint32_t sweet_gpu_submit(const uint64_t *ib_va, const uint32_t *ib_dw, uint32_t count)
+ {
+-	uint32_t dw[4 + 4 * 8 + 4], n = 0;
++	uint32_t dw[2 + 4 + 4 * 8 + 5], n = 0;
+ 	if (count > 8)
+ 		return 0;
+ 	if (++k1_fence == 0)
+ 		k1_fence = 1;
++	if (k1_uche_stale) {
++		dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CACHE_INVALIDATE;
++		k1_uche_stale = 0;
++	}
+ 	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_DEPTH;
+ 	dw[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); dw[n++] = EV_CCU_INV_COLOR;
+ 	for (uint32_t i = 0; i < count; i++) {
+@@ -496,11 +586,13 @@ static int k1_find_cb(void)
+ 	vm_offset_t g = ml_io_map(K1_SMMU_PA, 0x1000);
+ 	if (!g)
+ 		return 0;
++	k1_gr0 = g;
+ 	uint32_t idr1 = *(volatile uint32_t *)(g + SMMU_IDR1_OFF);
+ 	uint32_t num_global = 1U << (((idr1 >> 28) & 7U) + 1U);
+ 	for (uint32_t n = 0; n < 32; n++) {
+ 		if (*(volatile uint32_t *)(g + SMMU_SMR_OFF(n)) == K1_GPU_SMR) {
+ 			uint32_t cb = *(volatile uint32_t *)(g + SMMU_S2CR_OFF(n)) & 0xffU;
++			k1_cb_index = cb;
+ 			k1_cb = ml_io_map(K1_SMMU_PA + 0x1000UL * (num_global + cb), 0x1000);
+ 			printf("HOTDOGB K1: GPU context: smr %u cb %u (num_global %u)\n", n, cb, num_global);
+ 			return k1_cb != 0;
+@@ -521,50 +613,391 @@ static int k1_write_and_check(uint64_t va, uint32_t magic, uint64_t ib_va, volat
+ 	return sweet_gpu_submit(&ib_va, &n, 1) != 0;
+ }
+ 
+-static void k1_selftest(void)
++/*
++ * K1b: the 3D context's output address size. The shim writes TCR but never TCR2, whose
++ * PASize (bits 2:0) is then whatever the context bank held: 0 = 32 bits, and every page above
++ * 4 GiB faults. The K1a test used scratch pages below 4 GiB; kernel memory for programs
++ * (IOBufferMemoryDescriptor) is anywhere in DRAM (to 0x27fffffff on an 8 GB 7T). HackiOS
++ * writes SMMU_TCR2 = 1 | 1 << 4 | 7 << 15 (36-bit PA, 16-bit ASID, SEP upstream) into the
++ * same kind of context. Done once, with the ring idle, followed by the TLB maintenance.
++ * Always written: the phone (boot 2026-10-22) showed TCR2 = 0x4003c077, an UNKNOWN reset value
++ * (PASize 7 is reserved, TBI0/TBI1 and bits 14/30 set), not something anybody chose.
++ */
++#define SMMU_CB_TCR2		0x10U
++#define SMMU_CB_FSR		0x58U
++#define SMMU_CB_FAR		0x60U
++#define K1B_TCR2		(1U | (1U << 4) | (7U << 15))
++
++static int k1_tcr2(void)
+ {
+-	int on = 0;
+-	(void)PE_parse_boot_argn("sweetk1", &on, sizeof(on));
+-	if (!on)
+-		return;
+-	sl_k1 = ml_io_map(SL_K1_PA, SL_K1_LEN);
+-	if (!sl_k1 || !k1_find_cb()) {
+-		printf("HOTDOGB K1: setup failed (slice %#lx cb %#lx)\n", (unsigned long)sl_k1, (unsigned long)k1_cb);
+-		return;
++	volatile uint32_t *tcr2 = (volatile uint32_t *)(k1_cb + SMMU_CB_TCR2);
++	uint32_t was = *tcr2;
++	if ((was & ~0x60U) == K1B_TCR2) {
++		printf("HOTDOGB K1: TCR2 %#x already HackiOS's: left alone\n", was);
++		return 1;
+ 	}
+-	k1_free[0].start = K1_VA_BASE;
+-	k1_free[0].size = K1_VA_SIZE;
+-	k1_nfree = 1;
++	if (grd(A6XX_CP_RB_RPTR) != grd(A6XX_CP_RB_WPTR)) {
++		printf("HOTDOGB K1: TCR2 %#x and the ring is busy: not changed\n", was);
++		return 0;
++	}
++	*tcr2 = K1B_TCR2;
++	__asm__ volatile("dsb sy" ::: "memory");
++	int tlb = k1_tlb_flush();
++	printf("HOTDOGB K1: TCR2 %#x -> %#x (36-bit PA), TLB %s\n", was, *tcr2, tlb ? "ok" : "TIMEOUT");
++	/* the phone reads 0x38071 back: TBI0/TBI1 (bits 5, 6) stay set; what matters is PASize 1 and AS */
++	return tlb && (*tcr2 & 0x1fU) == (K1B_TCR2 & 0x1fU);
++}
++
++/* map the K1 slice and the GPU context, start the allocator (once); the PA size when asked (once) */
++static int k1_ready, k1_tcr2_ok;
++static int k1_setup(int want_tcr2)
++{
++	if (!k1_ready) {
++		sl_k1 = ml_io_map(SL_K1_PA, SL_K1_LEN);
++		if (!sl_k1 || !k1_find_cb()) {
++			printf("HOTDOGB K1: setup failed (slice %#lx cb %#lx)\n", (unsigned long)sl_k1, (unsigned long)k1_cb);
++			return 0;
++		}
++		k1_free[0].start = K1_VA_BASE;
++		k1_free[0].size = K1_VA_SIZE;
++		k1_nfree = 1;
++		k1_ready = 1;
++	}
++	if (want_tcr2 && !k1_tcr2_ok) {
++		if (!k1_tcr2())
++			return 0;
++		k1_tcr2_ok = 1;
++	}
++	return 1;
++}
++
++/* the K1a test, which also chooses the TLB maintenance method; K1b runs it if sweetk1 did not */
++static int k1_probed;
++static void k1_probe(void)
++{
++	if (k1_probed || !k1_setup(0))
++		return;
++	k1_probed = 1;
++	/* test pages: A at +0, the IB at +0x2000, P[m] at +0x3000 + m * 0x1000 (m < 13) */
+ 	volatile uint32_t *pa_a = (volatile uint32_t *)k1p(K1_TEST_PA);
+-	volatile uint32_t *pa_b = (volatile uint32_t *)k1p(K1_TEST_PA + 0x1000);
+ 	volatile uint32_t *ibp = (volatile uint32_t *)k1p(K1_TEST_PA + 0x2000);
+-	for (unsigned i = 0; i < 0x1000 / 4; i++) {
+-		pa_a[i] = 0;
+-		pa_b[i] = 0;
+-	}
++	for (unsigned i = 0; i < 0x10000 / 4; i++)
++		((volatile uint32_t *)k1p(K1_TEST_PA))[i] = 0;
+ 	uint64_t ibva = sweet_gpu_address(0x1000), v = sweet_gpu_address(0x1000);
+ 	int ok1 = ibva && v && sweet_gpu_map(ibva, K1_TEST_PA + 0x2000, 1) && sweet_gpu_map(v, K1_TEST_PA, 0);
+ 	sweet_gpu_mapped();
+ 	int w1 = ok1 && k1_write_and_check(v, 0x0001a001U, ibva, ibp);
+ 	printf("HOTDOGB K1: map+submit va %#llx ib %#llx: fence %s, page A = %#x (want 0x1a001)\n",
+ 	    v, ibva, w1 ? "ok" : "MISSING", pa_a[4]);
+-	int tlb = sweet_gpu_unmap(v, 0x1000);
+-	printf("HOTDOGB K1: unmap + TLB maintenance on the GPU context: %s\n", tlb ? "ok" : "TIMEOUT");
+-	sweet_gpu_map(v, K1_TEST_PA + 0x1000, 0);
+-	sweet_gpu_mapped();
+-	int w2 = k1_write_and_check(v, 0x0001a002U, ibva, ibp);
+-	printf("HOTDOGB K1: same va on page B: fence %s, B = %#x (want 0x1a002), A = %#x (want 0x1a001)\n",
+-	    w2 ? "ok" : "MISSING", pa_b[4], pa_a[4]);
++	/*
++	 * Remap v to a new page with TLB maintenance method m = 0, 1, 2, 3; the first m whose
++	 * write lands in the new page (and not in the old) is kept, and checked once more.
++	 */
++	volatile uint32_t *prev = pa_a;
++	int chosen = -1, confirmed = 0, m, slot = 0;
++	for (m = 0; w1 && m <= 3 && slot < 12; m++) {
++		uint32_t magic = 0x0001a100U + (uint32_t)m, before = prev[4];
++		volatile uint32_t *next = (volatile uint32_t *)k1p(K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot);
++		k1_tlb_method = m;
++		int tlb = sweet_gpu_unmap(v, 0x1000);
++		sweet_gpu_map(v, K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot, 0);
++		sweet_gpu_mapped();
++		int w = k1_write_and_check(v, magic, ibva, ibp);
++		int good = w && tlb && next[4] == magic && prev[4] == before;
++		printf("HOTDOGB K1: TLB method %d: sync %s, fence %s, new page %#x (want %#x), old page %#x (want %#x): %s\n",
++		    m, tlb ? "ok" : "TIMEOUT", w ? "ok" : "MISSING", next[4], magic, prev[4], before,
++		    good ? "WORKS" : "stale");
++		prev = good ? next : (next[4] == magic ? next : prev);
++		slot++;
++		if (good) {
++			chosen = m;
++			break;
++		}
++	}
++	if (chosen >= 0) {
++		/* once more with the chosen method, to a fresh page */
++		volatile uint32_t *next = (volatile uint32_t *)k1p(K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot);
++		uint32_t before = prev[4];
++		int tlb = sweet_gpu_unmap(v, 0x1000);
++		sweet_gpu_map(v, K1_TEST_PA + 0x3000 + 0x1000 * (uintptr_t)slot, 0);
++		sweet_gpu_mapped();
++		int w = k1_write_and_check(v, 0x0001a1ffU, ibva, ibp);
++		confirmed = w && tlb && next[4] == 0x0001a1ffU && prev[4] == before;
++		printf("HOTDOGB K1: TLB method %d again: %s\n", chosen, confirmed ? "WORKS" : "stale (not repeatable)");
++	}
++	if (!confirmed) {
++		k1_tlb_method = 3;
++		k1_va_fresh = 1;
++		printf("HOTDOGB K1: no TLB maintenance works here: GPU addresses are never reused from now on\n");
++	} else {
++		k1_tlb_method = chosen;
++	}
+ 	sweet_gpu_unmap(v, 0x1000);
+ 	sweet_gpu_unmap(ibva, 0x1000);
+ 	sweet_gpu_address_free(v, 0x1000);
+ 	sweet_gpu_address_free(ibva, 0x1000);
+-	int pass = w1 && w2 && tlb && pa_a[4] == 0x0001a001U && pa_b[4] == 0x0001a002U;
+-	printf("HOTDOGB K1: %s (free list %u hole(s), first %#llx size %#llx, hwfault %#x)\n",
+-	    pass ? "K1a PASS -- dynamic GPU maps, TLB maintenance and IB submit work" : "K1a FAILED",
++	printf("HOTDOGB K1: %s (TLB method %d%s, free list %u hole(s), first %#llx size %#llx, hwfault %#x)\n",
++	    confirmed ? "K1a PASS -- dynamic GPU maps, TLB maintenance and IB submit work" :
++	    (w1 ? "K1a PARTIAL -- maps and submit work, TLB maintenance does not (fresh addresses instead)" : "K1a FAILED"),
++	    k1_tlb_method, k1_va_fresh ? ", addresses never reused" : "",
+ 	    k1_nfree, k1_free[0].start, k1_free[0].size, grd(A6XX_CP_HW_FAULT));
+ }
+ 
++static void k1_selftest(void)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("sweetk1", &on, sizeof(on));
++	if (on)
++		k1_probe();
++}
++
++/*
++ * ---- K1b (G5): HackiOS's kernel interface for RedwoodGPU.cpp, on K1a ----
++ * iokit/Kernel/arm/RedwoodGPU.cpp is HackiOS's IOKit service + user client (Linux msm DRM
++ * requests as selectors, what tools/mesa/redwood-drm in Mesa calls). It calls the
++ * redwood_gpu_* functions of HackiOS's bsd/dev/redwood_adreno.c; these are the same functions
++ * for the A640 kept running by the shim. Differences from HackiOS, on purpose:
++ *  - submit: HackiOS's ring sequence (invalidate depth/color, one CP_INDIRECT_BUFFER per
++ *    command buffer, CP_EVENT_WRITE CACHE_FLUSH_TS with the fence), asynchronous as theirs,
++ *    on 0084's ring. Not ported: the CP_ALWAYS_ON_COUNTER timestamps (redwood_gpu_worked
++ *    reports zeros), CP_SCRATCH_REG2 (debug only);
++ *  - GET_PARAM: A640 values from Linux 6.13 (a6xx_catalog.c: chip 0x06040001, gmem SZ_1M;
++ *    a6xx_calc_ubwc_config: highest_bank_bit 15, ubwc_swizzle 6, macrotile_mode 0).
++ *    MAX_FREQ is refused (the shim's GPU clock is not known here; freedreno treats that as
++ *    "not fatal", freedreno_screen.c);
++ *  - recover: none yet (reports, then the GPU is given nothing more);
++ *  - VA window: K1a's 64 MiB (HackiOS 2 GiB) -- enough for K1b's tests, to grow for Mesa.
++ * The fence word is scratch +0x1a0 (free: the shim uses 0..0x158, 0084 0x160/0x168, K1a 0x180).
++ * Locking is the caller's (RedwoodGPU.cpp's gGPULock), as in HackiOS.
++ */
++#define K1B_FENCE_OFF		0x1a0U
++#define K1B_RING_WORDS		1024U
++#define A640_CHIP_ID		0x06040001ULL
++
++uint32_t gpu_va;		/* (HackiOS boot-args; 0 here) */
++uint32_t gpu_log;
++static int k1b_on;
++static uint32_t k1b_fence;
++static uint32_t k1b_ring[2 + 4 + 4 * 128 + 8];
++
++bool redwood_gpu_ready(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t redwood_gpu_address(uint64_t size);
++void redwood_gpu_address_free(uint64_t address, uint64_t size);
++void redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most,
++    uint64_t *lost, uint32_t *refused);
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_gpu_mapped(void);
++void redwood_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_gpu_to_memory(void *start, uint64_t size);
++uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool redwood_gpu_done(uint32_t fence);
++uint32_t redwood_gpu_last(void);
++void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void redwood_gpu_report(const char *why);
++bool redwood_gpu_recover(void);
++void redwood_gpu_stop(void);
++extern void RedwoodGPUStart(void);
++extern int RedwoodGPUSelfTest(void);
++
++bool redwood_gpu_ready(void)
++{
++	return k1b_on != 0;
++}
++
++bool redwood_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01:			/* GPU_ID: none, the chip ID says it */
++	case 0x06:			/* GMEM_BASE */
++	case 0x08:			/* PP_PGTABLE */
++	case 0x09:			/* FAULTS */
++	case 0x0a:			/* SUSPENDS */
++	case 0x11:			/* RAYTRACING */
++	case 0x13:			/* MACROTILE_MODE: 0 on A640 */
++		*value = 0;
++		return true;
++	case 0x02:			/* GMEM_SIZE */
++		*value = 1024 * 1024;
++		return true;
++	case 0x03:			/* CHIP_ID (speed bin 0 above it) */
++		*value = A640_CHIP_ID;
++		return true;
++	case 0x05:			/* TIMESTAMP */
++		*value = mach_absolute_time();
++		return true;
++	case 0x07:			/* PRIORITIES */
++		*value = 1;
++		return true;
++	case 0x10:			/* HIGHEST_BANK_BIT */
++		*value = 15;
++		return true;
++	case 0x12:			/* UBWC_SWIZZLE */
++		*value = 6;
++		return true;
++	default:			/* MAX_FREQ (0x04), VA_START/VA_SIZE (0x0e/0x0f, as HackiOS without gpu_va), ... */
++		return false;
++	}
++}
++
++uint64_t redwood_gpu_address(uint64_t size)
++{
++	return sweet_gpu_address(size);
++}
++
++void redwood_gpu_address_free(uint64_t address, uint64_t size)
++{
++	sweet_gpu_address_free(address, size);
++}
++
++void redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most,
++    uint64_t *lost, uint32_t *refused)
++{
++	uint64_t free_bytes = 0, big = 0;
++	for (unsigned i = 0; i < k1_nfree; i++) {
++		free_bytes += k1_free[i].size;
++		if (k1_free[i].size > big)
++			big = k1_free[i].size;
++	}
++	*used = K1_VA_SIZE - free_bytes;
++	*live = 0;
++	*largest = big;
++	*holes = k1_nfree;
++	*most = 64;
++	*lost = (uint64_t)k1_lost << 12;
++	*refused = 0;
++}
++
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	return sweet_gpu_map(address, phys, read_only ? 1 : 0) != 0;
++}
++
++void redwood_gpu_mapped(void)
++{
++	sweet_gpu_mapped();
++}
++
++void redwood_gpu_unmap(uint64_t address, uint64_t size)
++{
++	if (!sweet_gpu_unmap(address, size))
++		printf("HOTDOGB K1: TLB maintenance timed out unmapping %#llx+%#llx\n", address, size);
++}
++
++/* push what this processor wrote out of its cache (HackiOS to_memory); (NULL, 0): a barrier */
++void redwood_gpu_to_memory(void *start, uint64_t size)
++{
++	vm_offset_t s = (vm_offset_t)start;
++	for (vm_offset_t line = s & ~(vm_offset_t)63; line < s + size; line += 64)
++		__asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* HackiOS redwood_gpu_submit: returns the submission's number; 0 = the ring stayed full (2 s) */
++uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	volatile uint32_t *ring = gva32(GPU_VA_RB);
++	uint32_t n = 0, w, room = 0;
++	if (!k1b_on || count == 0 || count > 128)
++		return 0;
++	int stale = k1_uche_stale;
++	if (stale) {
++		k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CACHE_INVALIDATE;
++	}
++	k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CCU_INV_DEPTH;
++	k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 1); k1b_ring[n++] = EV_CCU_INV_COLOR;
++	for (uint32_t i = 0; i < count; i++) {
++		k1b_ring[n++] = cp_type7(CP_OP_INDIRECT_BUFFER_PFE, 3);
++		k1b_ring[n++] = (uint32_t)addresses[i];
++		k1b_ring[n++] = (uint32_t)(addresses[i] >> 32);
++		k1b_ring[n++] = words[i];
++	}
++	uint32_t next = k1b_fence + 1 ? k1b_fence + 1 : 1;
++	k1b_ring[n++] = cp_type7(CP_OP_EVENT_WRITE, 4);
++	k1b_ring[n++] = EV_CACHE_FLUSH_TS;
++	k1b_ring[n++] = GPU_VA_SCR + K1B_FENCE_OFF;
++	k1b_ring[n++] = 0;
++	k1b_ring[n++] = next;
++	w = grd(A6XX_CP_RB_WPTR) & (K1B_RING_WORDS - 1U);
++	for (int i = 0; i < 20000; i++) {
++		room = (grd(A6XX_CP_RB_RPTR) - w - 1U) & (K1B_RING_WORDS - 1U);
++		if (room >= n + 4U)
++			break;
++		delay(100);
++	}
++	if (room < n + 4U)
++		return 0;
++	if (stale)
++		k1_uche_stale = 0;
++	for (uint32_t i = 0; i < n; i++)
++		ring[(w + i) & (K1B_RING_WORDS - 1U)] = k1b_ring[i];
++	__asm__ volatile("dsb sy" ::: "memory");
++	gwrr(A6XX_CP_RB_WPTR, (w + n) & (K1B_RING_WORDS - 1U));
++	k1b_fence = next;
++	return next;
++}
++
++bool redwood_gpu_done(uint32_t fence)
++{
++	volatile uint32_t *word = gva32(GPU_VA_SCR + K1B_FENCE_OFF);
++	return (int32_t)(*word - fence) >= 0;
++}
++
++uint32_t redwood_gpu_last(void)
++{
++	return k1b_fence;
++}
++
++void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = 0;
++	for (int i = 0; i < 7; i++)
++		by[i] = 0;
++}
++
++/* a submission did not come back: what the core and its (own) SMMU context say */
++void redwood_gpu_report(const char *why)
++{
++	uint32_t fsr = k1_cb ? *(volatile uint32_t *)(k1_cb + SMMU_CB_FSR) : 0;
++	uint64_t far = k1_cb ? *(volatile uint64_t *)(k1_cb + SMMU_CB_FAR) : 0;
++	printf("HOTDOGB K1: GPU %s: fence %#x of %#x, rptr %#x wptr %#x rbbm %#x hwfault %#x cpint %#x, "
++	    "smmu fsr %#x far %#llx\n", why, *gva32(GPU_VA_SCR + K1B_FENCE_OFF), k1b_fence,
++	    grd(A6XX_CP_RB_RPTR), grd(A6XX_CP_RB_WPTR), grd(A6XX_RBBM_STATUS), grd(A6XX_CP_HW_FAULT),
++	    grd(A6XX_CP_INTERRUPT_STATUS), fsr, far);
++}
++
++bool redwood_gpu_recover(void)
++{
++	return false;
++}
++
++void redwood_gpu_stop(void)
++{
++	k1b_on = 0;
++}
++
++/* boot-arg sweetk1b=1: TCR2, the fence word, the RedwoodGPU service; sweetk1b=2 also its self-test */
++static void k1b_start(void)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("sweetk1b", &on, sizeof(on));
++	if (!on)
++		return;
++	k1_probe();				/* (no-op when sweetk1=1 ran it) */
++	if (!k1_probed || !k1_setup(1)) {
++		printf("HOTDOGB K1B: K1 setup failed: no RedwoodGPU\n");
++		return;
++	}
++	*gva32(GPU_VA_SCR + K1B_FENCE_OFF) = 0;
++	k1b_fence = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	k1b_on = 1;
++	if (on >= 2)
++		(void)RedwoodGPUSelfTest();
++	RedwoodGPUStart();
++}
++
+ static void sweet_gpu_thread(void *arg, wait_result_t result)
+ {
+ 	unsigned delay_s = 8;
+@@ -678,6 +1111,7 @@ static void sweet_gpu_thread(void *arg, wait_result_t result)
+ 	if (drew == 1 && good == G4_CHECK_ROWS * 252U)
+ 		printf("HOTDOGB GPU4: THE GPU DREW THE PANEL FROM XNU -- gradient in the top-left corner\n");
+ 	k1_selftest();
++	k1b_start();
+ out:
+ 	printf("HOTDOGB GPU4: thread exiting\n");
+ 	thread_terminate(current_thread());
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+new file mode 100644
+index 0000000..827b5fe
+--- /dev/null
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -0,0 +1,1306 @@
++/*
++ * RedwoodGPU: the phone's Adreno for programs to draw with.
++ *
++ * bsd/dev/redwood_adreno.c wakes the GPU and, with boot-arg adreno_keep=1, keeps it on and
++ * starts this service. A program that opens it speaks the interface of Linux's msm DRM driver,
++ * the one Mesa's freedreno knows: every request of that interface is a call of the user client
++ * with the request's number as the selector and the request's structure passed in and back
++ * (userland: tools/mesa/redwood-drm, which stands in for libdrm inside Mesa). What Linux does
++ * with mmap() on the device is the client memory of the type that is the buffer's handle.
++ *
++ * What there is of the interface is what freedreno uses to draw: parameters, buffers (made,
++ * told their address in the GPU's address space, mapped, given back), submission of command
++ * buffers, and waiting for one to be done. A buffer is wired kernel memory entered into the 3D
++ * core's SMMU context; it is zero when made, and write-combined: what the program writes goes to
++ * memory, where the GPU reads it, and not into this processor's cache (as Linux maps them for
++ * freedreno; boot-arg gpu_cached=1 makes them ordinary memory, pushed out of the cache whenever
++ * the GPU is given something to do: see submit()).
++ *
++ * One request is not Linux's: a buffer that is the memory of an IOSurface (surfaceBuffer()), for
++ * drawing into what the display shows and for reading pictures where other programs have drawn
++ * them. Linux hands such memory around as file descriptors; here it has a name already. That
++ * memory is ordinary, cached memory, which everybody else reads and writes as such.
++ *
++ * OnePlus 7T (A640) port for kitty, K1b (G5): this file is HackiOS's (oosexgang/hackios-xnu-kernel,
++ * xnu/files/iokit/Kernel/RedwoodGPU.cpp) with the IOSurface parts taken out until K2
++ * (surfaceBuffer, MiniIOSurfaceDrawn, show: their selectors answer kIOReturnUnsupported) and a
++ * kernel self-test added (RedwoodGPUSelfTest, boot-arg sweetk1b=2). The redwood_gpu_* functions
++ * it calls are in bsd/dev/sweet_gpu.c, on the GPU the shim keeps running. Selectors and
++ * structures are unchanged, so HackiOS's tools/mesa/redwood-drm talks to it as it is.
++ *
++ * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
++ * program's worth of care (every client's buffers are in the one address space; a client that
++ * goes takes its own away), fences and buffers as file descriptors. A GPU that has stopped
++ * answering is reported (redwood_gpu_report()) and, with boot-arg gpu_recover=1, reset and
++ * started again, so that the submission that hung is all that is lost: what that does and
++ * which source says so is at redwood_gpu_recover() in bsd/dev/redwood_adreno.c. Without the
++ * boot-arg it stays stopped and nothing is waited for again.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++
++extern "C" {
++/* bsd/dev/sweet_gpu.c (K1b: the A640 the shim keeps on) */
++bool redwood_gpu_ready(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
++uint64_t redwood_gpu_address(uint64_t size);
++void redwood_gpu_address_free(uint64_t address, uint64_t size);
++void redwood_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
++    uint64_t * lost, uint32_t * refused);
++extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_gpu_mapped(void);
++void redwood_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_gpu_to_memory(void * start, uint64_t size);
++uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
++extern uint32_t gpu_log;
++bool redwood_gpu_done(uint32_t fence);
++uint32_t redwood_gpu_last(void);
++void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++void redwood_gpu_report(const char * why);
++bool redwood_gpu_recover(void);
++void redwood_gpu_stop(void);
++
++void RedwoodGPUStart(void);
++void RedwoodGPUStop(void);
++int RedwoodGPUSelfTest(void);
++}
++
++/* Linux's include/uapi/drm/msm_drm.h and drm.h: the requests' numbers and structures. */
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
++	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
++	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
++};
++
++struct msm_timespec {
++	int64_t seconds, nanoseconds;           /* of the clock that goes on while the machine sleeps */
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct redwood_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kRedwoodDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++struct redwood_show {
++	uint64_t pixels;
++	uint32_t width, height, rowBytes, pad;
++};
++/*
++ * kRedwoodGPUWorked: the GPU's own side of a measurement a program makes with its own clock.
++ *
++ * A program timing this driver (userland/src/metal_drv_test.m --time) can measure only wall
++ * time: the whole of a draw, which is its own work, this ioctl, the submission, the core's
++ * execution and the wait. Nothing it can reach says how much of that was the core -- and the
++ * kernel has known all along, because bsd/dev/redwood_adreno.c times every submission off
++ * CP_ALWAYS_ON_COUNTER (19.2 ticks a microsecond) and until now only ever printed it. This
++ * request hands the same three numbers to the program, so the subtraction happens where the
++ * two halves are both in hand instead of in whoever reads the log afterwards.
++ *
++ * It RESETS what it reports, which is redwood_gpu_worked()'s own contract ("since this was
++ * last asked") and is what makes it useful: a caller reads once to zero the counters, does the
++ * work it wants to price, and reads again. Two consequences, and they are the whole of the
++ * sharp edge: two programs asking at once each get a part of the truth, and the kernel's own
++ * five-second report in submit() below shares the same counters -- so a boot that reads this
++ * will see gaps in those lines, and that is expected rather than a fault.
++ */
++struct redwood_worked {
++	uint64_t microseconds;                  /* the core's own time on the submissions counted here */
++	uint32_t submissions;                   /* how many of them it timed; 0 means nothing finished since */
++	uint32_t by[7];                         /* ... of which under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
++};
++
++#define kRedwoodDescribe        0xffffffffu
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++#define MSM_INFO_SET_NAME       2
++#define MSM_INFO_SET_IOVA       4
++#define MSM_INFO_GET_FLAGS      5
++#define MSM_BO_GPU_READONLY     0x00000002
++#define MSM_PREP_NOSYNC         0x04
++#define MSM_SUBMIT_CMD_BUF      1
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++
++#define GPU_BUFFERS             8192            /* a client's, at most */
++#define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_BOS          8192
++#define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
++#define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
++#define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
++
++static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
++static bool gGPUReported;
++static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
++static bool gGPUSaidSetIova;                    /* MSM_INFO_SET_IOVA has been refused out loud once */
++
++/* What the last seconds' submissions were and cost here, for the log. */
++static struct {
++	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
++	uint64_t flushed;                       /* bytes sent out of the cache */
++	uint32_t submissions, commands, buffers, surfaces, waits, over;
++	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
++	uint64_t making;                        /* ... and the time it took to make the others */
++} gGPUStat;
++
++/* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
++static bool
++gpuWait(uint32_t fence, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	for (bool waited = false;; waited = true) {
++		if (redwood_gpu_done(fence)) {
++			if (waited) {
++				gGPUStat.waits++;
++				gGPUStat.waiting += mach_absolute_time() - began;
++			}
++			return true;
++		}
++		if (mach_absolute_time() - began >= patience || gGPUReported) {
++			break;                  /* (a GPU that has stopped answering is not waited for again) */
++		}
++		IOLockUnlock(gGPULock);
++		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
++		IOLockLock(gGPULock);
++	}
++	/*
++	 * A wait of a second or more that came to nothing: the core has stopped answering. What it
++	 * and its SMMU context say is put down, and then, with boot-arg gpu_recover=1, the core is
++	 * reset and started again, which gives up the submission that hung and leaves later ones
++	 * the core's own. Without that -- or if it does not work -- nothing is waited for again in
++	 * this run: a GPU that may yet write memory of ours is given nothing more. Either way this
++	 * wait has failed, and says so: the submission did not finish.
++	 */
++	if (milliseconds >= 1000 && !gGPUReported) {
++		redwood_gpu_report("no answer");
++		gGPUReported = !redwood_gpu_recover();
++	}
++	return false;
++}
++
++/*
++ * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
++ * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
++ */
++static TUNABLE(uint32_t, gWaitLines, "touch_lat", 0);
++
++static void
++slowWait(const char * kind, uint64_t began)
++{
++	uint64_t now = mach_absolute_time(), ns, at;
++
++	if (!gWaitLines) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now - began, &ns);
++	if (ns >= NSEC_PER_MSEC) {
++		absolutetime_to_nanoseconds(now, &at);
++		IOLog("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
++	}
++}
++
++/* How long from now a time of msm's is, in milliseconds; 0: now or past. */
++static uint64_t
++millisecondsUntil(const struct msm_timespec * when)
++{
++	uint64_t now;
++	int64_t left;
++
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->seconds * (int64_t) NSEC_PER_SEC + when->nanoseconds - (int64_t) now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t) left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t) left / NSEC_PER_MSEC;
++}
++
++/*
++ * A wait that was to end at a time that had passed when it was asked for, and the GPU was not
++ * done: whoever asked goes on as if it were (a picture is shown half drawn). That is what comes
++ * of a caller whose clock is not this one, so the first few are told.
++ */
++static void
++waitOver(const struct msm_timespec * when, uint32_t fence)
++{
++	static uint32_t told;
++	uint64_t now;
++
++	gGPUStat.over++;
++	if (told < 4) {
++		told++;
++		absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++		IOLog("RedwoodGPU: a wait for submission %u, which is not done, until %lld.%09lld s, asked for at %llu.%09llu s: "
++		    "over before it began\n", fence, when->seconds, when->nanoseconds, now / NSEC_PER_SEC, now % NSEC_PER_SEC);
++	}
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class RedwoodGPU : public IOService
++{
++	OSDeclareDefaultStructors(RedwoodGPU);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodGPU, IOService);
++
++bool
++RedwoodGPU::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
++	setName("RedwoodGPU");
++	registerService();
++	return true;
++}
++
++void
++RedwoodGPUStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	RedwoodGPU * gpu;
++	uint32_t cached = 1;
++
++	/*
++	 * kitty: ordinary (cached) memory by default, HackiOS's gpu_cached=1. A write-combined kernel
++	 * buffer panicked the 7T (boot 2026-10-22, K1b self-test: "phystokv_range: illegal PA
++	 * 0x78778000", a quarter of a real page's address: a 4K/16K page-number mix-up somewhere on
++	 * XNU's cache-mode path, which no kitty driver had used before). gpu_cached=0 asks for
++	 * write-combined buffers again, as on HackiOS, for when that is understood.
++	 */
++	(void) PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
++	gGPUCached = cached != 0;
++	gGPULock = IOLockAlloc();
++	gpu = OSTypeAlloc(RedwoodGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("RedwoodGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("RedwoodGPU: the service did not start\n");
++	}
++	gpu->release();
++}
++
++/* The run is ending (redwood_adreno.c): nobody is in the middle of anything when the GPU goes. */
++void
++RedwoodGPUStop(void)
++{
++	IOLockLock(gGPULock);
++	redwood_gpu_stop();
++	IOLockUnlock(gGPULock);
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++struct gpu_buffer {
++	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
++	uint8_t *                       kernel;         /* where it is in the kernel */
++	uint64_t                        address;        /* the GPU's for it */
++	uint64_t                        size;
++	uint32_t                        flags;
++	bool                            seen;           /* by the program: mapped, and from then on written by it */
++	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++};
++
++/*
++ * A buffer given back while the GPU is still at it: its memory and its place in the GPU's
++ * address space are kept until the submission is done, and nobody waits for that. (A window
++ * server that makes a surface for every frame gives the last frame's back while the GPU draws
++ * this one: waiting there, for all the GPU had been given, cost it some five milliseconds a
++ * frame.)
++ */
++struct gpu_left {
++	IOMemoryDescriptor *            memory;
++	uint64_t                        address, size;
++	uint32_t                        fence, flags;
++};
++#define GPU_LEFT                64
++
++/*
++ * A buffer of the program's own given back, and done with: kept, memory and place in the GPU's
++ * address space, for the next one of the same size and kind. CoreAnimation makes a new texture to
++ * draw a blur into for every frame of an animation with one (Search: 1082 x 1226, 6 MB with Mesa's
++ * rounding), and gives them back only later, a score at a time; Mesa keeps what is given back for
++ * a second and then lets it go. Each made afresh here took 2 to 3.5 ms of the window server's frame
++ * (memory got, cleared, made write-combined, and entered page by page into the GPU's address
++ * space). A buffer kept is given again as it is, not cleared: it was the same program's (Mesa's own
++ * cache gives buffers back the same way). At most GPU_KEPT_BYTES are kept (the one kept longest
++ * makes way), none for longer than GPU_KEPT_SECONDS. rc.jobs.fps, Search: 8 such textures made
++ * slowly instead of 77, the window server's frames drawn in 6.8 ms instead of 9.3-10 (median).
++ */
++struct gpu_kept {
++	IOMemoryDescriptor *            memory;         /* NULL: this place is free */
++	uint8_t *                       kernel;
++	uint64_t                        address, size, since;
++	uint32_t                        flags;
++};
++#define GPU_KEPT                48
++#define GPU_KEPT_BYTES          (160ull << 20)
++#define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
++#define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
++static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
++
++class RedwoodGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(RedwoodGPUUserClient);
++
++	task_t                  fTask;
++	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextQueue;
++	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
++	uint32_t                fBufferCount;
++	uint64_t                fBufferBytes;
++	uint32_t                fSubmits;
++	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
++	struct gpu_left         fLeft[GPU_LEFT];
++	uint32_t                fLeftCount;
++	struct gpu_kept         fKept[GPU_KEPT];
++	uint64_t                fKeptBytes;
++
++	struct gpu_buffer * buffer(uint32_t handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
++	void freeBuffer(struct gpu_buffer * b);
++	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
++	void dropKept(struct gpu_kept * k);
++	void reap(void);
++	IOReturn gemNew(struct msm_gem_new * request);
++	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn submit(struct msm_gem_submit * request);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodGPUUserClient, IOUserClient);
++
++bool
++RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++RedwoodGPUUserClient::start(IOService * provider)
++{
++	if (!redwood_gpu_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	return fBuffers != NULL;
++}
++
++/*
++ * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
++ * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
++ * written, and must not be somebody else's by then.
++ */
++void
++RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
++{
++	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
++
++	if (busy && fLeftCount == GPU_LEFT) {
++		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
++	}
++	if (busy && fLeftCount < GPU_LEFT) {
++		struct gpu_left * left = &fLeft[fLeftCount++];
++
++		left->memory = b->memory;
++		left->address = b->address;
++		left->size = b->size;
++		left->fence = b->fence;
++		left->flags = b->flags;
++	} else {
++		if (busy) {
++			static uint32_t said;
++
++			b->memory->retain();
++			if (said++ < 8) {
++				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
++			}
++		} else if (redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++			b->memory = NULL;               /* (now the kept one's) */
++		} else if (redwood_gpu_ready()) {
++			redwood_gpu_unmap(b->address, b->size);
++			redwood_gpu_address_free(b->address, b->size);
++		}
++		if (b->memory != NULL) {
++			b->memory->release();
++		}
++	}
++	b->memory = NULL;
++	fBufferCount--;
++	fBufferBytes -= b->size;
++}
++
++/* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
++void
++RedwoodGPUUserClient::reap(void)
++{
++	for (uint32_t i = 0; i < fLeftCount;) {
++		struct gpu_left * left = &fLeft[i];
++
++		if (redwood_gpu_ready() && !redwood_gpu_done(left->fence)) {
++			i++;
++			continue;
++		}
++		if (redwood_gpu_ready() &&
++		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
++			left->memory = NULL;
++		} else if (redwood_gpu_ready()) {
++			redwood_gpu_unmap(left->address, left->size);
++			redwood_gpu_address_free(left->address, left->size);
++		}
++		if (left->memory != NULL) {
++			left->memory->release();
++		}
++		*left = fLeft[--fLeftCount];
++	}
++}
++
++IOReturn
++RedwoodGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		IOLockLock(gGPULock);
++		/* what the client had the GPU do last may still be going on, in these buffers */
++		if (redwood_gpu_ready()) {
++			gpuWait(redwood_gpu_last(), 1000);
++		}
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		reap();
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			dropKept(&fKept[i]);
++		}
++		if (fLeftCount != 0) {
++			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
++		}
++		IOLockUnlock(gGPULock);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++RedwoodGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct gpu_buffer *
++RedwoodGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		/* (a program that names a buffer it has given back draws into somebody else's next: worth knowing) */
++		if (handle != 0 && fStrangers++ < 16) {
++			IOLog("RedwoodGPU: buffer %u is asked for and is not there\n", handle);
++		}
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/*
++ * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
++ * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
++ */
++struct gpu_buffer *
++RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
++{
++	struct gpu_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
++		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
++		return NULL;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++	}
++	redwood_gpu_mapped();
++	if (!mapped) {
++		redwood_gpu_unmap(b->address, size);
++		redwood_gpu_address_free(b->address, size);
++		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	b->size = size;
++	b->flags = flags;
++	b->seen = false;
++	b->fence = 0;
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++/* With the lock held. */
++void
++RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
++{
++	if (k->memory == NULL) {
++		return;
++	}
++	if (redwood_gpu_ready()) {
++		redwood_gpu_unmap(k->address, k->size);
++		redwood_gpu_address_free(k->address, k->size);
++	}
++	k->memory->release();
++	k->memory = NULL;
++	fKeptBytes -= k->size;
++}
++
++/* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
++bool
++RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
++{
++	struct gpu_kept * place = NULL;
++
++	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
++	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
++		return false;
++	}
++	for (;;) {
++		struct gpu_kept * oldest = NULL;
++
++		place = NULL;
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			if (fKept[i].memory == NULL) {
++				place = place != NULL ? place : &fKept[i];
++			} else if (oldest == NULL || fKept[i].since < oldest->since) {
++				oldest = &fKept[i];
++			}
++		}
++		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
++			break;
++		}
++		dropKept(oldest);
++	}
++	place->memory = memory;
++	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
++	place->address = address;
++	place->size = size;
++	place->flags = flags;
++	place->since = mach_absolute_time();
++	fKeptBytes += size;
++	return true;
++}
++
++IOReturn
++RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
++{
++	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
++	struct gpu_buffer * b;
++	IOBufferMemoryDescriptor * memory;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* one kept of this size and kind, if there is one (the one kept last: likeliest still in the caches' way) */
++	IOLockLock(gGPULock);
++	struct gpu_kept * found = NULL;
++	uint64_t old;
++
++	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
++	for (uint32_t i = 0; i < GPU_KEPT; i++) {
++		struct gpu_kept * k = &fKept[i];
++
++		if (k->memory != NULL && began - k->since > old) {
++			dropKept(k);
++		}
++
++		if (k->memory != NULL && k->size == size && k->flags == request->flags && (found == NULL || k->since > found->since)) {
++			found = k;
++		}
++	}
++	for (uint32_t n = 0; found != NULL && n < GPU_BUFFERS; n++) {
++		uint32_t h = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[h].memory == NULL) {
++			b = &fBuffers[h];
++			bzero(b, sizeof(*b));
++			b->memory = found->memory;
++			b->kernel = found->kernel;
++			b->address = found->address;
++			b->size = found->size;
++			b->flags = found->flags;
++			fNextBuffer = h + 1;
++			fBufferCount++;
++			fBufferBytes += size;
++			request->handle = h + 1;
++			found->memory = NULL;
++			fKeptBytes -= size;
++			gGPUStat.given_again++;
++			IOLockUnlock(gGPULock);
++			if (gGPUKeep == 2) {
++				bzero(b->kernel, (size_t) b->size);
++			}
++			return kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(gGPULock);
++	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("RedwoodGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
++		    fBufferBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	if (gGPUCached) {
++		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
++	}
++
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, 0, size, request->flags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++		gGPUStat.made++;
++		gGPUStat.making += mach_absolute_time() - began;
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		ret = kIOReturnBadArgument;
++	} else if (request->info == MSM_INFO_GET_OFFSET) {
++		request->value = (uint64_t) request->handle << 32;      /* nobody maps by it here */
++	} else if (request->info == MSM_INFO_GET_IOVA) {
++		/*
++		 * The address the buffer was given when it was made, and the buffer's until it is
++		 * given back. Nothing here ever moves a live buffer, so a caller may ask once and
++		 * keep the answer -- which is what freedreno does (fd_bo_init_common).
++		 */
++		request->value = b->address;
++	} else if (request->info == MSM_INFO_SET_IOVA) {
++		/*
++		 * Where a buffer goes is not the program's to choose here: every client is in the
++		 * one SMMU context 0, so an address one program picked would be a place in every
++		 * other program's space as well. Linux draws the line in the same place for the
++		 * two parameters that describe a space -- VA_START and VA_SIZE are refused unless
++		 * the client has page tables of its own (adreno_gpu.c, adreno_get_param) -- and
++		 * placing a buffer is the stronger request of the two. Said once, by name, rather
++		 * than returned as a bare code nobody can look up.
++		 */
++		if (!gGPUSaidSetIova) {
++			gGPUSaidSetIova = true;
++			IOLog("RedwoodGPU: a program asked to place buffer %u at %#llx itself: refused. There is one "
++			    "page table here for every client, so addresses are the kernel's to give and "
++			    "MSM_INFO_GET_IOVA is how to learn them\n", request->handle, request->value);
++		}
++		ret = kIOReturnUnsupported;
++	} else if (request->info == MSM_INFO_GET_FLAGS) {
++		request->value = b->flags;
++	} else if (request->info != MSM_INFO_SET_NAME) {            /* a name for somebody's debugger: not kept */
++		ret = kIOReturnUnsupported;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
++{
++	struct msm_gem_submit_bo * bos = NULL;
++	struct msm_gem_submit_cmd * cmds = NULL;
++	uint64_t addresses[GPU_SUBMIT_CMDS];
++	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint64_t began, nanos;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++		IOLog("RedwoodGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
++	if (bos == NULL || cmds == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t) request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t) request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	IOLockLock(gGPULock);
++	/*
++	 * (K1b: no IOSurfaces yet, so only buffers of ordinary memory, gpu_cached=1, are pushed out.)
++ * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
++	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
++	 * draw into it again) goes out of the cache now: when the surface is said to have changed
++	 * (its seed: who writes one is to lock it, and so does a program that has had the GPU draw
++	 * into one: userland/src/eagl.c), and in any case once in a few milliseconds, which is once
++	 * a frame and not once a submission: not everybody who draws into a surface says so (an
++	 * application drawing a picture that is on the screen meanwhile). A surface this program
++	 * has mapped, every time. The buffers made here need none of that, unless they are
++	 * ordinary memory (gpu_cached=1).
++	 */
++	began = mach_absolute_time();
++	for (uint32_t i = 0; i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b == NULL) {
++			continue;
++		}
++		if (!b->seen || !gGPUCached) {
++			continue;
++		}
++		redwood_gpu_to_memory(b->kernel, b->size);
++		gGPUStat.flushed += b->size;
++	}
++	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
++	gGPUStat.flushing += mach_absolute_time() - began;
++	gGPUStat.buffers += request->nr_bos;
++	for (uint32_t i = 0; i < request->nr_cmds; i++) {
++		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
++			continue;                               /* the other kinds are for a GPU shared between address spaces */
++		}
++		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
++		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
++			IOLog("RedwoodGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
++			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++			IOLockUnlock(gGPULock);
++			goto out;
++		}
++		addresses[count] = b->address + cmds[i].submit_offset;
++		words[count++] = cmds[i].size / 4;
++	}
++	request->fence = redwood_gpu_submit(addresses, words, count);
++	/*
++	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
++	 * reset and given this submission again -- after a reset the ring is empty, so there is
++	 * room for it. (A wait of a second or more notices a stopped core first, as a rule; this is
++	 * for a program that submits without waiting.)
++	 */
++	if (request->fence == 0 && !gGPUReported) {
++		redwood_gpu_report("the ring is full");
++		gGPUReported = !redwood_gpu_recover();
++		if (!gGPUReported) {
++			request->fence = redwood_gpu_submit(addresses, words, count);
++		}
++	}
++	if (gpu_log && request->fence != 0) {
++		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
++		uint32_t big = 0, all_words = 0;
++		uint64_t ns;
++
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			struct gpu_buffer * b = buffer(bos[i].handle);
++
++			big += b != NULL && b->size >= (4u << 20);
++		}
++		for (uint32_t i = 0; i < count; i++) {
++			all_words += words[i];
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		IOLog("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
++	}
++	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		request->fence_fd = -1;
++	}
++	/*
++	 * The surfaces named are being drawn into, or read, until this submission is done: the
++	 * display's driver waits for that before it puts one on the panel (MiniIOSurfaceDrawn()).
++	 * (freedreno names every buffer for reading and writing alike, so which it is cannot be
++	 * told; the last submission of a frame names the surface the frame is drawn into.)
++	 */
++	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b != NULL) {
++			b->fence = request->fence;
++		}
++	}
++	reap();
++	if (fSubmits++ < 4) {
++		IOLog("RedwoodGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
++		    addresses[0], words[0]);
++	}
++	/* every five seconds in which something was submitted: how much, and what it cost here */
++	gGPUStat.submissions++;
++	gGPUStat.commands += count;
++	if (gGPUStat.since == 0) {
++		gGPUStat.since = began;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - gGPUStat.since, &nanos);
++	if (nanos >= 5 * NSEC_PER_SEC) {
++		uint64_t flushing, waiting, taking, worked;
++		uint32_t timed, by[7];
++
++		absolutetime_to_nanoseconds(gGPUStat.flushing, &flushing);
++		absolutetime_to_nanoseconds(gGPUStat.waiting, &waiting);
++		absolutetime_to_nanoseconds(gGPUStat.taking, &taking);
++		redwood_gpu_worked(&worked, &timed, by);
++		uint64_t making;
++
++		absolutetime_to_nanoseconds(gGPUStat.making, &making);
++		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
++		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
++		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
++		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
++		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
++		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
++		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
++		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
++		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
++		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
++		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
++		    fBufferBytes >> 20);
++		if (gpu_va != 0) {
++			/*
++			 * The address space itself, because nothing else said anything about it: what
++			 * argument buffers and heaps are built on is that this allocator holds, and
++			 * "lost" and "refused" are the two ways it stops holding (bsd/dev/
++			 * redwood_adreno.c, redwood_gpu_address_free).
++			 */
++			uint64_t used, largest, lost;
++			uint32_t live, refused;
++			unsigned holes, most;
++
++			redwood_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
++			IOLog("RedwoodGPU: addresses: %llu MB in %u buffers, longest run free %llu MB, %u holes "
++			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
++			    largest >> 20, holes, most, lost >> 10, refused);
++		}
++		bzero(&gGPUStat, sizeof(gGPUStat));
++	}
++	IOLockUnlock(gGPULock);
++	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
++out:
++	if (bos != NULL) {
++		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
++	}
++	if (cmds != NULL) {
++		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
++	}
++	return ret;
++}
++
++IOReturn
++RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gGPULock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		b->seen = true;
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++		struct redwood_surface surface;
++		struct redwood_show show;
++		struct redwood_worked worked;
++	} r;
++	size_t size = args->structureInputSize;
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t zero = 0, patience, waitBegan;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!redwood_gpu_ready() && selector != kRedwoodShow) {
++		return kIOReturnNotReady;                       /* given back: the run is ending */
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	switch (selector) {
++	case kMsmGetParam:
++		ret = redwood_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:                              /* the program's name, for Linux's lists of who uses the GPU */
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
++		waitBegan = mach_absolute_time();
++		IOLockLock(gGPULock);
++		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
++		if (!gpuWait(redwood_gpu_last(), patience)) {
++			ret = kIOReturnBusy;
++			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
++				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
++			}
++		}
++		/*
++		 * kitty (cached buffers): what the GPU wrote is in memory; lines of the buffer this
++		 * processor holds from before are stale. freedreno asks this before it reads a
++		 * buffer (fd_bo_cpu_prep), as Linux's msm syncs a cached buffer for the CPU here.
++		 */
++		if (ret == kIOReturnSuccess && gGPUCached && (b = buffer(r.cpuPrep.handle)) != NULL) {
++			redwood_gpu_to_memory(b->kernel, b->size);
++		}
++		IOLockUnlock(gGPULock);
++		slowWait("cpu-prep", waitBegan);
++		break;
++	case kMsmGemSubmit:
++		ret = submit(&r.submit);
++		break;
++	case kMsmWaitFence:
++		waitBegan = mach_absolute_time();
++		IOLockLock(gGPULock);
++		patience = millisecondsUntil(&r.waitFence.timeout);
++		if (!gpuWait(r.waitFence.fence, patience)) {
++			ret = kIOReturnTimeout;
++			if (patience == 0) {
++				waitOver(&r.waitFence.timeout, r.waitFence.fence);
++			}
++		}
++		IOLockUnlock(gGPULock);
++		slowWait("fence", waitBegan);
++		break;
++	case kMsmGemMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:                      /* how often the GPU has faulted on this client's commands */
++		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
++			copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
++		}
++		break;
++	case kDrmGemClose:
++		IOLockLock(gGPULock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++			reap();
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kRedwoodGPUWorked:
++		/*
++		 * Under gGPULock because redwood_gpu_worked() calls gpu_times(), which reads the
++		 * scratch page and advances the same counters the submit path advances -- and
++		 * submit() holds this lock while it does exactly that. The output goes back
++		 * through the common copy at the end of this method, so a caller that passes a
++		 * struct of this size in gets it filled on the way out; one that passes fewer
++		 * bytes gets as many as it asked for, and the rest of the numbers are lost with
++		 * the reset, which is the one way to misuse this request.
++		 */
++		IOLockLock(gGPULock);
++		redwood_gpu_worked(&r.worked.microseconds, &r.worked.submissions, r.worked.by);
++		IOLockUnlock(gGPULock);
++		break;
++	case kRedwoodSurface:                           /* K2 */
++	case kRedwoodShow:
++		ret = kIOReturnUnsupported;
++		break;
++	default:
++		IOLog("RedwoodGPU: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t) size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * K1b self-test (boot-arg sweetk1b=2), run by bsd/dev/sweet_gpu.c before the service starts:
++ * what a program's GEM_NEW, SUBMIT and WAIT_FENCE do, from the kernel, since the phone has no
++ * shell to run a test program from yet.
++ *  - a 1 MiB buffer made as gemNew() makes one on kitty (cached kernel memory) and entered into
++ *    the GPU's address space page by page as newBuffer() does; the pages' physical addresses
++ *    are counted above and below 4 GiB, because that is what the TCR2 change (36-bit PA) is for;
++ *  - command buffer 1 (in the buffer itself, page 0) has the GPU write a word into each of the
++ *    other 255 pages; command buffer 2 one more word; submitted one after the other without
++ *    waiting (redwood_gpu_submit is asynchronous now), then the second fence waited for;
++ *  - every word checked by the CPU, the buffer taken out of the GPU's space and given back.
++ * "RedwoodGPU: K1b PASS" or "K1b FAILED" (then redwood_gpu_report says what the GPU and its
++ * SMMU context say: a fault at a high address with FSR set means the PA size is still wrong).
++ */
++#define K1B_TEST_BYTES          (1024u * 1024u)
++#define K1B_TEST_PAGES          (K1B_TEST_BYTES / 4096u)
++#define K1B_MAGIC(page)         (0x1b000000u | (page))
++#define K1B_MAGIC2              0x1b0f0f0fu
++
++/* a type-7 packet header, as bsd/dev/sweet_gpu.c (and the shim) make them: odd parity of count and opcode */
++static uint32_t
++k1bParity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++k1bType7(uint32_t op, uint32_t count)
++{
++	return (7u << 28) | count | (k1bParity(count) << 15) | ((op & 0x7fu) << 16) | (k1bParity(op) << 23);
++}
++#define K1B_CP_MEM_WRITE        0x3du
++
++int
++RedwoodGPUSelfTest(void)
++{
++	IOBufferMemoryDescriptor * memory;
++	volatile uint32_t * k;
++	uint64_t address, lowest = ~0ull, highest = 0;
++	uint32_t high = 0, good = 0, n = 0, f1 = 0, f2 = 0, waited = 0;
++	bool mapped = true, done = false;
++
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    K1B_TEST_BYTES, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("RedwoodGPU: K1b FAILED: no memory for the test buffer\n");
++		return 0;
++	}
++	k = (volatile uint32_t *) memory->getBytesNoCopy();
++	address = redwood_gpu_address(K1B_TEST_BYTES);
++	for (uint64_t offset = 0; address != 0 && offset < K1B_TEST_BYTES && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		lowest = phys < lowest ? phys : lowest;
++		highest = phys > highest ? phys : highest;
++		high += phys >= (1ull << 32);
++		mapped = phys != 0 && redwood_gpu_map(address + offset, phys, false);
++	}
++	redwood_gpu_mapped();
++	IOLog("RedwoodGPU: K1b test buffer: GPU %#llx, physical %#llx..%#llx, %u of %u pages above 4 GiB, mapped %s\n",
++	    address, lowest, highest, high, K1B_TEST_PAGES, mapped ? "yes" : "NO");
++	if (address == 0 || !mapped) {
++		goto out;
++	}
++
++	/* the words to be written start as zero; command buffer 1 at byte 0, 2 at byte 0x2000 (both in page 0..2) */
++	for (uint32_t p = 0; p < K1B_TEST_PAGES; p++) {
++		k[p * 1024 + 4] = 0;
++		k[p * 1024 + 5] = 0;
++	}
++	for (uint32_t p = 3; p < K1B_TEST_PAGES; p++) {
++		uint64_t at = address + p * 4096ull + 16;
++
++		k[n++] = k1bType7(K1B_CP_MEM_WRITE, 3);
++		k[n++] = (uint32_t) at;
++		k[n++] = (uint32_t) (at >> 32);
++		k[n++] = K1B_MAGIC(p);
++	}
++	{
++		uint64_t at = address + 3 * 4096ull + 20;
++		volatile uint32_t * ib2 = k + 0x2000 / 4;
++
++		ib2[0] = k1bType7(K1B_CP_MEM_WRITE, 3);
++		ib2[1] = (uint32_t) at;
++		ib2[2] = (uint32_t) (at >> 32);
++		ib2[3] = K1B_MAGIC2;
++	}
++	redwood_gpu_to_memory((void *) k, K1B_TEST_BYTES);     /* the commands and the zeroes out of the cache */
++	{
++		uint64_t ib1 = address, ib2 = address + 0x2000;
++		uint32_t w1 = n, w2 = 4;
++
++		f1 = redwood_gpu_submit(&ib1, &w1, 1);
++		f2 = f1 != 0 ? redwood_gpu_submit(&ib2, &w2, 1) : 0;
++	}
++	for (waited = 0; f2 != 0 && waited < 1000; waited++) {
++		if ((done = redwood_gpu_done(f2))) {
++			break;
++		}
++		IOSleep(1);
++	}
++	redwood_gpu_to_memory((void *) k, K1B_TEST_BYTES);     /* forget what the cache held: read what the GPU wrote */
++	for (uint32_t p = 3; p < K1B_TEST_PAGES; p++) {
++		good += k[p * 1024 + 4] == K1B_MAGIC(p);
++	}
++	IOLog("RedwoodGPU: K1b submissions %u and %u (%u words), done %s after ~%u ms, first done %s; "
++	    "%u of %u pages written, second word %#x (want %#x)\n", f1, f2, n, done ? "yes" : "NO", waited,
++	    f1 != 0 && redwood_gpu_done(f1) ? "yes" : "NO", good, K1B_TEST_PAGES - 3, k[3 * 1024 + 5], K1B_MAGIC2);
++out:
++	bool pass = done && good == K1B_TEST_PAGES - 3 && k[3 * 1024 + 5] == K1B_MAGIC2;
++	if (!pass) {
++		redwood_gpu_report("K1b self-test");
++	}
++	if (address != 0) {
++		if (pass || !redwood_gpu_ready() || f2 == 0 || done) {
++			redwood_gpu_unmap(address, K1B_TEST_BYTES);
++			redwood_gpu_address_free(address, K1B_TEST_BYTES);
++			memory->release();
++		} else {
++			IOLog("RedwoodGPU: the GPU did not finish: the test buffer stays its own\n");
++		}
++	} else {
++		memory->release();
++	}
++	IOLog("RedwoodGPU: %s\n", pass ? "K1b PASS -- kernel buffers above 4 GiB, async submit, fences" : "K1b FAILED");
++	return pass;
++}
++
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..df7d0bf 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,4 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp

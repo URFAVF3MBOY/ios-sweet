@@ -1,0 +1,48 @@
+0005: stubs for two functions xnu-12377 takes from Apple's closed per-SoC library (none exists for SWEET).
+
+ml_device_is_prod_fused() (kern_mib.c) answers TRUE like a retail phone; tb_transport_startup() (Tightbeam for
+Exclaves, called at EARLY_BOOT from exclaves.c) does nothing: the SM8150 has no exclaves. Both were in build 7's
+undefined-symbol list.
+
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index fbf45a4..05ff427 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -67,6 +67,7 @@ osfmk/arm/machine_cpuid.c	standard
+ osfmk/arm/machine_routines_common.c		standard
+ osfmk/arm64/lock_ticket_pv.c		optional config_pv_ticket
+ osfmk/arm64/machine_routines.c		standard
++osfmk/arm64/sweet_closed_stubs.c	standard
+ osfmk/arm64/machine_routines_asm.s	optional nos_arm_asm
+ osfmk/arm64/machine_task.c		standard
+ osfmk/arm/machine_routines_apple.c	optional nos_arm_asm
+diff --git a/osfmk/arm64/sweet_closed_stubs.c b/osfmk/arm64/sweet_closed_stubs.c
+new file mode 100644
+index 0000000..f249131
+--- /dev/null
++++ b/osfmk/arm64/sweet_closed_stubs.c
+@@ -0,0 +1,24 @@
++/*
++ * SWEET: functions xnu-12377 calls that Apple only ships in its closed per-SoC KernelSupport library
++ * (libT8xxx.os.CONFIG.a), which does not exist for this board (see 0002).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <mach/boolean.h>
++#include <arm/machine_routines.h>
++
++/* Production-fused part: report what a retail phone reports. */
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	return TRUE;
++}
++
++/* Tightbeam transport for Exclaves (osfmk/kern/exclaves.c startup): the SM8150 has no exclaves. */
++void tb_transport_startup(void);
++void
++tb_transport_startup(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

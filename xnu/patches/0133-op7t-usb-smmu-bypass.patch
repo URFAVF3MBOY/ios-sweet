@@ -1,0 +1,132 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 02:40:00 +0000
+Subject: [PATCH] op7t-0133: SMMU bypass for USB (SID 0x140) before the USB start-up
+
+kern.sweetsmmu (0132) on the booted 7T, 2026-10-25: no SMR matches USB stream
+ID 0x140 and sCR0.USFCFG = 1 (unmatched streams fault). So the first USB DMA
+faults, which is the crashdump 0092 was chasing. Before sweet_usb_gadget_start
+(sweetusb=2), take a free SMR and set it to bypass for 0x140 (S2CR first,
+then SMR, like Linux arm-smmu). sweetusbsmmu=0 skips it. By hand:
+  sysctl kern.sweetsmmu_bypass=0x140      then  sysctl kern.sweetsmmu
+Log: "HOTDOGB SMMU: ..." and "HOTDOGB USB: SMMU bypass ...".
+
+Apply after 0092 and 0132.
+---
+ bsd/dev/sweet_smmu.c | 70 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_usb.c  | 17 +++++++++++++
+ 2 files changed, 87 insertions(+)
+
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 11f2bbb..fa135d8 100755
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -118,4 +118,74 @@ sysctl_sweetsmmu SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetsmmu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweetsmmu, "A",
+     "apps SMMU stream mapping for USB (0132, read only)");
++
++/*
++ * 0133: let a stream ID through the SMMU untranslated (bypass), as Linux's arm-smmu does when a
++ * device attaches. Booted state on the 7T (0132, 2026-10-25): no SMR matches USB's 0x140 and
++ * sCR0.USFCFG = 1, so the controller's first DMA faults -> the crashdump of 0092's start-up.
++ * Takes the highest free SMR, writes S2CR (TYPE 1 = bypass, all other attributes "use incoming")
++ * and then the SMR (VALID | ID, mask 0), in arm_smmu_write_sme's order. An SMR that already
++ * matches the SID is left alone. Returns the SMR index, or -1.
++ */
++int sweet_smmu_bypass(uint32_t sid);
++static int smmu_bypass_last = -1;
++
++int
++sweet_smmu_bypass(uint32_t sid)
++{
++	if (sid > 0x7fffu) {
++		return -1;
++	}
++	if (smmu == 0) {
++		smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++		if (smmu == 0) {
++			return -1;
++		}
++	}
++	uint32_t nsmr = smmu_rd(0x20) & 0xffu, free_smr = 0xffffffffu;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = smmu_rd(0x800 + 4 * i);
++		uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++		if (!(smr & (1u << 31))) {
++			free_smr = i;
++			continue;
++		}
++		if (((sid ^ id) & ~mask & 0x7fffu) == 0) {
++			printf("HOTDOGB SMMU: SID %#x already matched by SMR[%u] %08x (S2CR %08x): left alone\n", sid, i, smr,
++			    smmu_rd(0xc00 + 4 * i));
++			return (int)i;
++		}
++	}
++	if (free_smr == 0xffffffffu) {
++		printf("HOTDOGB SMMU: no free SMR for SID %#x\n", sid);
++		return -1;
++	}
++	*(volatile uint32_t *)(smmu + 0xc00 + 4 * free_smr) = 1u << 16;        /* S2CR: bypass */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(smmu + 0x800 + 4 * free_smr) = (1u << 31) | sid; /* SMR: valid, mask 0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t smr = smmu_rd(0x800 + 4 * free_smr), s2cr = smmu_rd(0xc00 + 4 * free_smr);
++	bool ok = smr == ((1u << 31) | sid) && ((s2cr >> 16) & 3u) == 1u;
++	printf("HOTDOGB SMMU: SID %#x -> SMR[%u] %08x S2CR %08x: bypass %s\n", sid, free_smr, smr, s2cr,
++	    ok ? "set" : "NOT taken (read back differs)");
++	return ok ? (int)free_smr : -1;
++}
++
++/* sysctl kern.sweetsmmu_bypass=0x140: the same by hand (root); reading gives the last result */
++static int
++sysctl_sweetsmmu_bypass SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = smmu_bypass_last, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	smmu_bypass_last = sweet_smmu_bypass((uint32_t)value);
++	return smmu_bypass_last >= 0 ? 0 : EIO;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetsmmu_bypass, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweetsmmu_bypass, "I", "write a stream ID: SMMU bypass for it (0133)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 91fe5e3..ea1cc46 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -45,6 +45,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t thread_terminate(thread_t);
+ static vm_offset_t ud_start_dwc;
+ static void ud_start_thread(void *arg, wait_result_t wr);
++extern int sweet_smmu_bypass(uint32_t sid);    /* sweet_smmu.c, 0133 */
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -913,6 +914,22 @@ ud_start_thread(void *arg, wait_result_t wr)
+ 	for (int s = 0; s < wait_s; s++) {
+ 		delay(1000 * 1000);
+ 	}
++	/*
++	 * 0133: on the 7T, USB (SID 0x140) has no SMMU stream match and unmatched streams fault
++	 * (sysctl kern.sweetsmmu, 2026-10-25): its first DMA would fault. Let it through first.
++	 * sweetusbsmmu=0 skips this (the 0092 behaviour).
++	 */
++	int smmu_bypass = 1;
++	PE_parse_boot_argn("sweetusbsmmu", &smmu_bypass, sizeof(smmu_bypass));
++	if (smmu_bypass) {
++		int smr = sweet_smmu_bypass(0x140);
++		printf("HOTDOGB USB: SMMU bypass for SID 0x140: %s (SMR %d)\n", smr >= 0 ? "ok" : "FAILED", smr);
++		if (smr < 0) {
++			printf("HOTDOGB USB: not starting: its DMA would fault\n");
++			thread_terminate(current_thread());
++			return;
++		}
++	}
+ 	sweet_usb_gadget_start(ud_start_dwc);
+ 	thread_terminate(current_thread());
+ }

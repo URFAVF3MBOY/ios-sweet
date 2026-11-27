@@ -1,0 +1,106 @@
+0011: map and slide iOS 27.2's dyld shared cache.
+
+Boot 27g: "initproc failed to start -- exit reason namespace 6 subcode 0x1 Library not loaded:
+/usr/lib/libSystem.B.dylib Referenced from /sbin/launchd (no such file, no dyld cache)".
+- shared_region.h: the 27.2 cache needs 0x190254000 bytes from 0x180000000; SWEET's region is 8 GiB (ios-guacamole
+  found the same).
+- vm_shared_region.c: slide info v3/v5 rebase authenticated slots but store them only under ptrauth_calls; on this
+  kernel every auth pointer kept its raw chain word. Store them unsigned.
+- vm_dyld_pager.c: page-in linking handles the arm64e chained formats without PAC (unsigned targets).
+
+--- a/osfmk/mach/shared_region.h
++++ b/osfmk/mach/shared_region.h
+@@ -88,7 +88,15 @@
+ /* ARM64_TODO: move to higher memory */
+ #endif
+ #define SHARED_REGION_BASE_ARM64                0x180000000ULL
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: iOS 27.2's iPhone15,2 cache spans 0x190254000 bytes from 0x180000000, more than 6 GiB: the map failed and
++ * dyld had "no dyld cache" (boot 27g: launchd, libSystem.B.dylib not loaded). 8 GiB; the commpage stays far above.
++ */
++#define SHARED_REGION_SIZE_ARM64                0x200000000ULL
++#else
+ #define SHARED_REGION_SIZE_ARM64                0x180000000ULL
++#endif
+ #define SHARED_REGION_NESTING_BASE_ARM64        SHARED_REGION_BASE_ARM64
+ #define SHARED_REGION_NESTING_SIZE_ARM64        SHARED_REGION_SIZE_ARM64
+ #define SHARED_REGION_NESTING_MIN_ARM64         ?
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -3345,6 +3345,9 @@
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* __has_feature(ptrauth_calls) */
++			/* No PAC on this kernel (SWEET): the rebased value was computed but never stored; store it unsigned. */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
+@@ -3564,6 +3567,9 @@
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* __has_feature(ptrauth_calls) */
++			/* No PAC on this kernel (SWEET): the rebased value was computed but never stored; store it unsigned. */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// the value already has the correct low bits, so just add in the high8 if it exists
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -60,7 +60,7 @@
+ 
+ #include <sys/kdebug_triage.h>
+ #include <mach-o/fixup-chains.h>
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <ptrauth.h>
+ #include <arm/misc_protos.h>
+ #endif /* defined(HAS_APPLE_PAC) */
+@@ -557,7 +557,26 @@
+ 	return KERN_SUCCESS;
+ }
+ 
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
++#if !defined(HAS_APPLE_PAC)
++/*
++ * SWEET: no pointer authentication. The lowered arm64e userland still uses the arm64e chained-fixup formats, so
++ * page-in linking must apply them ("unknown pointer_format 1" otherwise); targets stay unsigned.
++ */
++static kern_return_t
++signPointer(
++	uint64_t         unsignedAddr,
++	__unused void    *loc,
++	__unused bool    addrDiv,
++	__unused uint16_t diversity,
++	__unused ptrauth_key key,
++	__unused dyld_pager_t pager,
++	uint64_t         *signedAddr)
++{
++	*signedAddr = unsignedAddr;
++	return KERN_SUCCESS;
++}
++#else
+ /*
+  * Sign a pointer needed for fixups.
+  */
+@@ -602,6 +621,7 @@
+ 	}
+ 	return KERN_SUCCESS;
+ }
++#endif /* !defined(HAS_APPLE_PAC) */
+ 
+ /*
+  * Apply fixups to a page used by a 64 bit process using pointer authentication.
+@@ -922,7 +942,7 @@
+ 	 * Route to the appropriate fixup routine
+ 	 */
+ 	switch (hdr->mwli_pointer_format) {
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
+ 	case DYLD_CHAINED_PTR_ARM64E:
+ 		fixupPageAuth64(userVA, contents, pager, segInfo, pageIndex, false);
+ 		break;

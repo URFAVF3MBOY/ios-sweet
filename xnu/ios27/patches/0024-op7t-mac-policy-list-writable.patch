@@ -1,0 +1,26 @@
+0024: the MAC policy list stays writable on SWEET.
+
+Boot 28b: "Unexpected fault in kernel static region at pc mac_policy_register+0x350, far mac_policy_list+0x14"
+(__DATA_CONST) <- sweet_amfi_policy_register <- bsd_init. iOS keeps the list read-only after lockdown; my built-in
+policies register later.
+
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -250,7 +250,16 @@
+ 
+ static int mac_policy_busy;
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX && defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0024: SWEET registers its built-in AMFI and Sandbox stand-ins from bsd_init(), after lockdown; read-only-late
++ * placement made that a write to __DATA_CONST (boot 28b, first iPhoneOS-config kernel: "Unexpected fault in kernel
++ * static region" in mac_policy_register <- sweet_amfi_policy_register <- bsd_init). Writable here, as on macOS;
++ * the static 8-entry array is kept.
++ */
++mac_policy_list_t mac_policy_list;
++static struct mac_policy_list_element mac_policy_static_entries[MAC_POLICY_LIST_CHUNKSIZE];
++#elif !XNU_TARGET_OS_OSX
+ SECURITY_READ_ONLY_LATE(mac_policy_list_t) mac_policy_list;
+ SECURITY_READ_ONLY_LATE(static struct mac_policy_list_element) mac_policy_static_entries[MAC_POLICY_LIST_CHUNKSIZE];
+ #else

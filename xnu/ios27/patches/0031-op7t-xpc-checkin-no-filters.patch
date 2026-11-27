@@ -1,0 +1,33 @@
+0031: XPC check-ins work without Sandbox message filters.
+
+xnu-12377's mach_port_is_connection_for_service() returns KERN_NOT_SUPPORTED when no message filter callbacks are
+registered (the Sandbox kext registers them; SWEET has none). iOS 27's libxpc then drops every check-in to a
+new-style XPC listener (ios-guacamole, iOS 26 log: "Failed to verify check-in connection port ... kr=46"), clients
+get XPC_INTERRUPTED_REPLY and container lookups fail. Boot 28m: appprotectiond, deviceaccessd,
+ManagedSettingsAgent, passd and lsd crash-loop, nothing opens the framebuffer.
+- mach_port.c: on SWEET skip the early return; with no filters no service port has a sandbox label, so the
+  function answers KERN_SUCCESS, filter policy 0.
+
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2970,9 +2970,20 @@
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+ 		return KERN_NOT_SUPPORTED;
+ 	}
++#else
++	/*
++	 * 0031: no Sandbox kext registers message filter callbacks on SWEET, so this returned KERN_NOT_SUPPORTED
++	 * (46) and iOS 27's libxpc dropped every check-in to a new-style listener ("Failed to verify check-in
++	 * connection port was derived from the listener connection port (kr=46)", ios-guacamole on iOS 26).
++	 * Clients then get XPC_INTERRUPTED_REPLY: container lookups fail and appprotectiond, deviceaccessd,
++	 * ManagedSettingsAgent, passd and lsd crash-loop (boot 28m). Without callbacks no service port carries a
++	 * sandbox label, so the code below answers KERN_SUCCESS with filter policy 0.
++	 */
++#endif
+ 
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 	if (ret) {

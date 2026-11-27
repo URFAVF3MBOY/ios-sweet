@@ -1,0 +1,66 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 -0500
+Subject: [PATCH] op7t-0190: vsync notifications carry the refresh period
+
+CoreAnimation's CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2,
+a3, refcon) takes a2 = the vsync's host time and a2 + a3 = the next vsync
+(QuartzCore 16.5 at 0x1882b1800: `add x22, x21, x22` then
+CATimeWithHostTime). AppleCLCD::vsyncFired always sent a3 = 0, so every
+frame's deadline looked already past to CA. ios-flame (Pixel 4, same
+SM8150) found the same in its 0121; their swipe benchmark went 15.8 -> 21
+fps with it.
+
+Now a3 = the vsync period (0141's sweet_vsync_period, follows
+kern.sweetvsync_hz), and a2 = the tick's scheduled time (0141's absolute
+deadline) instead of when the timer thread ran, so the stamps are evenly
+spaced. Boot-arg sweetvsyncperiod=0 restores the old values.
+
+Apply after 0148 (touches only SweetFramebuffer.cpp).
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e3100f2..3d2a008 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,6 +174,7 @@ static AppleCLCD *sweet_fb_instance;
+  * a run that shows how many frames the pipeline can make (headroom), then back to 60.
+  */
+ static volatile uint64_t sweet_vsync_period;    /* mach absolute time units */
++static uint32_t sweet_vsync_send_period = 1;   /* 0190: boot-arg sweetvsyncperiod */
+ static volatile uint32_t sweet_vsync_hz = 60;
+ 
+ extern "C" uint32_t sweet_vsync_hz_get(void);
+@@ -317,6 +318,7 @@ AppleCLCD::start(IOService *provider)
+ 	scanSetup();
+ 	uint32_t vsync_hz = 60;
+ 	PE_parse_boot_argn("sweetvsync_hz", &vsync_hz, sizeof(vsync_hz));
++	PE_parse_boot_argn("sweetvsyncperiod", &sweet_vsync_send_period, sizeof(sweet_vsync_send_period));
+ 	if (sweet_vsync_hz_set(vsync_hz) != 0) {        /* (out of range: 60) */
+ 		(void)sweet_vsync_hz_set(60);
+ 	}
+@@ -350,10 +352,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * 0190: CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon) (QuartzCore 16.5,
++	 * 0x1882b1800: `add x22, x21, x22` -> CATimeWithHostTime) takes a2 = this vsync's host time and
++	 * a2 + a3 = the next one, so a3 is the refresh period. It was 0: every frame's deadline looked
++	 * already past to CoreAnimation (ios-flame 0121 found the same; their swipe test 15.8 -> 21 fps).
++	 * a2 is the tick's scheduled time (0141's absolute deadline, not yet advanced here) rather than
++	 * when the timer thread got to run, so the timestamps CA sees are evenly spaced.
++	 * Boot-arg sweetvsyncperiod=0 sends 0 and the wake-up time as before.
++	 */
++	uint64_t period = sweet_vsync_send_period ? sweet_vsync_period : 0;
++	uint64_t stamp = now;
++	if (period != 0 && fb->fNextVsync != 0 && fb->fNextVsync <= now && now - fb->fNextVsync < period) {
++		stamp = fb->fNextVsync;
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)stamp, (uint32_t)(stamp >> 32),
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);

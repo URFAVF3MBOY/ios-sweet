@@ -1,0 +1,52 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Fri, 13 Nov 2026 00:30:00 -0500
+Subject: [PATCH] op7t-0214: camera camnoc_axi at 150 MHz, actuator power on
+
+Found on 0212 with kern.sweetmmio (2026-11-12): IFE0's write master wrote
+only ~1.3 KB of each capture and then hung (no WM done, WM0 status 0),
+although CSID0 RDI0 counted 0x123180 = 1620 x 736 bytes per frame. The
+camera NoC clock was still at XO (19.2 MHz, set by kern.sweetcam=2).
+camnoc_axi_src = PLL0 even 600 MHz / 4 = 150 MHz (downstream table:
+19.2/150/266/320/400/480) -> whole frames: WM0 done, 1201152 bytes =
+736 rows x 1632 (the WM pads each 1620-byte RAW10 line to 16 bytes).
+Now set in the =4 arm path with the other IFE/CSID clocks.
+
+=2 also drives TLMM gpio25 high: CAM_VAF_0, the enable of actuator_rear_0
+(hotdogb camera DT; VAF supply = PM8150L BOB, already on). The LC898217XC
+focus actuator then answers at 0x72 (chip id 0xf0 = 0x72; position 0x84/
+0x85; focus at ~0x100 for a ceiling 2 m away).
+
+The report no longer calls SMMU FSR 0x400 a stopped write (it is the
+FORMAT field only).
+
+Apply after 0213.
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -484,6 +484,7 @@ cam_power_and_scan(void)
+ 	cam_say("  ldof1 (vdig) 1104 mV: %d", sweet_rpmh_cam_rail("ldof1", 1104));
+ 	cam_pin(TLMM_NORTH, 11, PIN_OUT, 1);
+ 	cam_pin(TLMM_EAST, 29, PIN_OUT, 1);
++	cam_pin(TLMM_EAST, 25, PIN_OUT, 1);     /* 0214: CAM_VAF_0 (actuator_rear_0, LC898217XC at 0x72; VAF = BOB) */
+ 	delay(2000);
+ 	cam_stage = 2;
+ 
+@@ -1010,6 +1011,8 @@ cam_live_arm(void)
+ 	    !cam_rcg_cfg("ife_0_csid_src 400 MHz", 0xa03c, (3u << 8) | 1u) ||
+ 	    !cam_rcg_cfg("ife_0_src 400 MHz", 0xa010, (6u << 8) | 1u) ||
+ 	    !cam_rcg_cfg("csi1phytimer_src 300 MHz", 0x6028, (2u << 8) | 3u) ||
++	    /* 0214: at XO (=2's setting) IFE0's write master hangs after ~1.3 KB; PLL0 even 600 / 4 */
++	    !cam_rcg_cfg("camnoc_axi_src 150 MHz", 0xc170, (2u << 8) | 7u) ||
+ 	    !cam_branch_on(cam_cc, "ife_0", 0xa028, true) || !cam_branch_on(cam_cc, "ife_0_csid", 0xa054, true) ||
+ 	    !cam_branch_on(cam_cc, "ife_0_cphy_rx", 0xa07c, true) || !cam_branch_on(cam_cc, "ife_0_axi", 0xa080, true) ||
+ 	    !cam_branch_on(cam_cc, "csi1phytimer", 0x6040, true) || !cam_branch_on(cam_cc, "csiphy1", 0x6044, true)) {
+@@ -1190,7 +1193,7 @@ cam_live_stop(void)
+ 	    rd32(cam_ife, VFE_BUS_WM_STATUS0(0)), rd32(cam_ife, VFE_BUS_WM_STATUS1(0)));
+ 	if (sweet_smmu_bank_fault(cam_live_bank, &fsr, &far) == 0) {
+ 		cam_say("  SMMU window bank %d: FSR %#010x FAR %#llx%s", cam_live_bank, fsr, far,
+-		    fsr ? " (a write outside the buffer was stopped)" : "");
++		    (fsr & ~0x600u) ? " (fault)" : " (no fault; 0x400 = format field)");
+ 	}
+ 	wr32(cam_csid, CSID_RDI0_CTRL, 0);
+ 	wr32(cam_ife, VFE_BUS_WM_CFG(0), 0);

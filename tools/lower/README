@@ -1,0 +1,16 @@
+arm64e -> arm64 lowering for the iOS 27.2 userland (the Kryo 485 has no pointer authentication).
+
+The scripts here are from UniXNU-zeta (https://github.com/none24smu/UniXNU-zeta, commit eb48928,
+scripts/), BSD-2-Clause-Patent, see LICENSE.UniXNU-zeta. They prove every changed word is code
+before lowering it (capstone 5 + llvm-mc) and redo the code-page hashes.
+
+My change: rewrite-zeta-userland.py keeps each image's CodeDirectory flags and platform byte
+(zeta adds CS_RUNTIME and platform 26 for macOS's AMFI; my kernel has its own AMFI).
+
+Needs (WSL): python3 venv with capstone==5.0.3 and numpy, llvm-mc on PATH.
+  root tree:   rewrite-zeta-userland-tree.py --root ROOT --output OUT --apple-trust-cache TC.im4p --report R.json
+  dyld cache:  prove-zeta-dyld-cache.py, then rewrite-zeta-dyld-cache.py
+
+Fast dyld cache pass (mine): fast-dyld-cache.py lowers every PAC word in the instruction sections without the
+proof and writes the same work dir as prove-zeta-dyld-cache.py, then rewrite-zeta-dyld-cache.py applies it.
+27.2 24B119: 34,315,608 edits (incl. 36 stub islands), 1 refused, 1.5 min.

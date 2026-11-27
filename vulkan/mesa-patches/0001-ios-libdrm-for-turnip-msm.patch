@@ -1,0 +1,14 @@
+diff --git a/meson.build b/meson.build
+index 3aed8ca168d..d6e2c0ee024 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1915,7 +1915,8 @@ endif
+ allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
+ 
+ with_gallium_drisw_kms = false
+-if system_has_kms_drm
++# iOS: Turnip's msm backend over sweetdrm, a libdrm for RedwoodGPU (no DRM/KMS otherwise)
++if system_has_kms_drm or (host_machine.system() == 'darwin' and freedreno_kmds.contains('msm'))
+   dep_libdrm = dependency(
+     'libdrm', version : '>=' + _drm_ver,
+     required : with_dri2 or with_dri or with_gbm,

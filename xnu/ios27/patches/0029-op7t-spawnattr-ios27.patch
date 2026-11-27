@@ -1,0 +1,42 @@
+0029: read iOS 27's 256-byte posix_spawnattr.
+
+iOS 27's libsystem_kernel sends a 256-byte _posix_spawnattr; xnu-12377's is 248 and its fields after
+psa_launch_type sit 8 bytes earlier. Read as is, launchd's throttle timeout becomes the kqworkloop hard limit and
+daemons are SIGKILLed through the task fatal port (ios-guacamole, 7 Pro, the boot after the lockdown fix).
+- kern_exec.c: posix_spawn takes crash_count, throttle_timeout, kqworkloop limits and the conclave limit from the
+  iOS 27 offsets when attr_size is 256 (static asserts pin this kernel's layout).
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4452,6 +4452,31 @@
+ 			if ((error = copyin(px_args.attrp, &px_sa, px_sa_offset)) != 0) {
+ 				goto bad;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/*
++			 * 0029: iOS 27's libsystem_kernel sends a 256-byte _posix_spawnattr; xnu-12377's is 248. Both
++			 * agree up to psa_launch_type (u8 @168). After it, iOS 27 has a u32 security policy @172, a u8
++			 * @176, then crash_count @180, throttle_timeout @184, kqworkloop soft/hard @188/@192 and the
++			 * conclave memory limit @196, each 8 bytes later than here (crash_count @172 .. conclave @188).
++			 * Read with this kernel's layout, launchd's throttle timeout lands in the kqworkloop hard limit
++			 * and spawned daemons get SIGKILLed through the task fatal port (ios-guacamole found this on the
++			 * 7 Pro). Take the tail from the iOS 27 offsets; psa_sec_flags stays 0 (bits not checked).
++			 */
++			_Static_assert(offsetof(struct _posix_spawnattr, psa_crash_count) == 172, "spawnattr layout");
++			_Static_assert(offsetof(struct _posix_spawnattr, psa_ports) == 192, "spawnattr layout");
++			if (px_args.attr_size == 256 && px_sa_offset == 192) {
++				uint32_t t27[7];        /* iOS 27 offsets 172..199 */
++				if ((error = copyin(px_args.attrp + 172, t27, sizeof(t27))) != 0) {
++					goto bad;
++				}
++				px_sa.psa_sec_flags = 0;
++				px_sa.psa_crash_count = t27[2];
++				px_sa.psa_throttle_timeout = t27[3];
++				px_sa.psa_kqworkloop_soft_limit = t27[4];
++				px_sa.psa_kqworkloop_hard_limit = t27[5];
++				px_sa.psa_conclave_mem_limit = t27[6];
++			}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ 			imgp->ip_px_sa = &px_sa;
+ 		}

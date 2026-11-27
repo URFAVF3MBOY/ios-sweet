@@ -1,0 +1,47 @@
+0016: the sandbox stand-in answers "no container expected".
+
+Boot 27n (after 0015 the cache maps and launchd runs): "pid 1 exited -- exit reason namespace 18 subcode 0x2,
+_container_init(): sandbox_get_container_expected() failed: -1". Op 0x43 returned ENOENT, which iOS 16 accepted.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -484,6 +484,28 @@
+ 	return a.handle == 0 ? 0 : copyout(&handle, (user_addr_t)a.handle, sizeof(handle));
+ }
+ 
++/*
++ * 0016: sandbox_get_container_expected (op 0x43): args { u64 *expected, u64 *flag }. iOS 27.2's _container_init()
++ * (libsystem) treats a failure as fatal; boot 27n: launchd "_container_init(): sandbox_get_container_expected()
++ * failed: -1" (exit namespace 18 subcode 0x2). This stand-in keeps no containers: answer "none expected" (0, 0),
++ * as the real Sandbox does for an uncontainerized process (ios-guacamole found the same on iOS 26).
++ */
++static int
++sweet_sandbox_container_expected(user_addr_t arg)
++{
++	uint64_t args[2];
++	const uint64_t no = 0;
++	int error = copyin(arg, args, sizeof(args));
++
++	if (error == 0 && args[0] != 0) {
++		error = copyout(&no, (user_addr_t)args[0], sizeof(no));
++	}
++	if (error == 0 && args[1] != 0) {
++		error = copyout(&no, (user_addr_t)args[1], sizeof(no));
++	}
++	return error;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+@@ -500,8 +522,8 @@
+ 		return sweet_sandbox_extension_consume(arg);
+ 	case 4:         /* container path (audit token / pid) (0177) */
+ 		return sweet_sandbox_container_path(arg);
+-	case 0x43:      /* container expected */
+-		return ENOENT;
++	case 0x43:      /* container expected (0016) */
++		return sweet_sandbox_container_expected(arg);
+ 	default:
+ 		return 0;
+ 	}

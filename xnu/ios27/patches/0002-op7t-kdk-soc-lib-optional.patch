@@ -1,0 +1,20 @@
+0002: link Apple's closed per-SoC library only when the KDK has one.
+
+xnu-12377 force-loads $(KDKROOT)/System/Library/KernelSupport/lib<MACHINE>.os.<CONFIG>.a for every machine config.
+There is none for SWEET, so the kernel link stopped at "ld: library ... libSWEET.os.DEVELOPMENT.a not found"
+(build 6, everything else compiled). On xnu-8796 my 0004 skipped it for SWEET; the line moved in 12377.
+
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1152,8 +1152,11 @@
+
+ # Link binary support library
+ ifneq ($(CURRENT_MACHINE_CONFIG),NONE)
++# SWEET: Apple's closed per-SoC library exists only for Apple boards; link it only when the KDK has it.
++ifneq ($(wildcard $(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a),)
+         LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ endif
++endif
+
+ #
+ # Derive SPTM/TXM and Exclaves enablement from the EDM properties.

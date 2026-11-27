@@ -1,0 +1,125 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 25 Oct 2026 03:00:00 +0000
+Subject: [PATCH] op7t-0134: choose the cores for ordinary threads (sysctl kern.sweetcores)
+
+Home-screen swipe on 0131 (2026-10-25): median ~41 fps, ~17.5 ms a frame in
+backboardd's GL path of which ~1 ms waits for the GPU: CPU-bound. The ADT
+makes all eight cores one homogeneous cluster, so the render thread lands on
+the A55s (cpu0-3) as often as on the A76s (cpu4-7). This exposes xnu's own
+perf-controller hook to test that at runtime:
+  sysctl kern.sweetcores=0xf1     A76s (+ boot cpu0) for ordinary threads
+  sysctl kern.sweetcores=0xff     all again
+  sweetcores=0xf1                 boot-arg, applied in bsd_init
+Cores left out are only not recommended; nothing is powered off.
+
+Apply after 0131 and 0133.
+---
+ bsd/conf/files        |  1 +
+ bsd/dev/sweet_cores.c | 72 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ bsd/kern/bsd_init.c   |  3 +++
+ 3 files changed, 76 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b927265..1563cfb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_clock.c			standard
+ bsd/dev/sweet_smmu.c			standard
++bsd/dev/sweet_cores.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_cores.c b/bsd/dev/sweet_cores.c
+new file mode 100755
+index 0000000..b75b19e
+--- /dev/null
++++ b/bsd/dev/sweet_cores.c
+@@ -0,0 +1,72 @@
++/*
++ * 0134: which cores ordinary threads may run on (OnePlus 7T), for fps experiments.
++ *
++ * The 7T has four Cortex-A55 (cpu0-3) and four Cortex-A76 (cpu4-6 2.42 GHz, cpu7 2.96 GHz), but
++ * the ADT describes one homogeneous cluster (0078), so the scheduler puts backboardd's render
++ * thread on a small core as readily as on a big one. Swiping the home screen (2026-10-25,
++ * redwood-gl): ~17.5 ms a frame of which only ~1 ms waits for the GPU -> CPU-bound, ~41 fps.
++ *   sysctl kern.sweetcores=0xf1     ordinary threads on the A76s (+ cpu0, the boot CPU)
++ *   sysctl kern.sweetcores=0xff     every core again
++ *   sweetcores=0xf1 (boot-arg)      the same from boot (bsd_init, before launchd)
++ * It is xnu's own perf-controller hook (sched_perfcontrol_update_recommended_cores, what CLPC
++ * calls on Apple SoCs): cores left out are only "not recommended" -- bound and kernel threads
++ * still run there, nothing is powered off, and xnu adds the boot CPU back if the mask would
++ * leave no core. Its failsafe re-enables all cores if a realtime thread starves.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++void sweet_cores_boot(void);
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++
++extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
++
++static uint32_t sweet_cores_mask = 0xffu;
++
++static int
++sweet_cores_set(uint32_t mask)
++{
++	mask &= 0xffu;
++	if (mask == 0) {
++		return EINVAL;
++	}
++	sched_perfcontrol_update_recommended_cores(mask == 0xffu ? 0xffffffffu : mask);
++	sweet_cores_mask = mask;
++	printf("HOTDOGB CORES: recommended cores now %#x\n", mask);
++	return 0;
++}
++
++void
++sweet_cores_boot(void)
++{
++	uint32_t mask = 0;
++	if (PE_parse_boot_argn("sweetcores", &mask, sizeof(mask)) && mask != 0) {
++		(void)sweet_cores_set(mask);
++	}
++}
++
++static int
++sysctl_sweetcores SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)sweet_cores_mask, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	return sweet_cores_set((uint32_t)value);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetcores, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetcores, "I",
++    "cores recommended for ordinary threads, bit n = cpu n (0134)");
++#else
++void
++sweet_cores_boot(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 274430f..d62e416 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1042,6 +1042,9 @@ bsd_init(void)
+ 	/* 0131 (OnePlus 7T): the wall clock from the PMIC RTC, before launchd and its daemons start */
+ 	extern void sweet_clock_boot(void);
+ 	sweet_clock_boot();
++	/* 0134 (OnePlus 7T): sweetcores= boot-arg, cores for ordinary threads */
++	extern void sweet_cores_boot(void);
++	sweet_cores_boot();
+ 
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");

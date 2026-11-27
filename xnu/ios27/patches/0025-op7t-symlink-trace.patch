@@ -1,0 +1,144 @@
+0025: trace symlink follows during path lookup.
+
+Boot 28g (sweetsystrace=tzinit,dirs_cleaner): every path through /var fails with ENOENT (open /var/db/timezone/,
+symlink -> /var/db/timezone/zoneinfo, getattrlist /var/run, open_dprotected_np /var/logs/AKSSetup.log), while the
+same directories as /private/var/... exist (mkdir EEXIST). The link on disk is right (var -> private/var, 11 bytes,
+mode 120777 in the HFS catalog). lookup_handle_symlink returns ENOENT for a zero-length readlink or a missing root.
+- vfs_lookup.c: boot-arg sweetlinktrace=N logs the first N symlink follows (link text, length, rest of the path,
+  error and where it failed: mac_readlink, readlink, no_rootdir or ok); sweetlinkproc=NAME[,NAME...] limits it
+  to those processes (boot 28h: the first boot tasks' FeatureFlags lookups used all 200 lines). For them, a failed
+  component lookup (name cache or VNOP_LOOKUP) also logs SWEETLOOKUP with the directory, the rest of the path and
+  the error (boot 28i: tzinit and dirs_cleaner never reached the symlink code).
+
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -96,6 +96,79 @@
+ #include <os/atomic_private.h>
+ 
+ #include <sys/paths.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++
++/*
++ * 0025: boot-arg sweetlinktrace=N logs the first N symlink follows in lookup_handle_symlink():
++ * "SWEETLINK name[pid] 'link text' len L rest 'remaining path' err E at STAGE".
++ * sweetlinkproc=NAME[,NAME...] limits it to processes with exactly those names (boot 28h: all 200 lines went to
++ * FeatureFlags lookups of the first boot tasks). For the same processes, a failed component lookup logs
++ * "SWEETLOOKUP name[pid] in 'DIR' (root R) at 'rest of path' err E from cache|vnop" (boot 28i: tzinit and
++ * dirs_cleaner never reached the symlink code for /var/...).
++ */
++static bool
++sweet_trace_pick(char *name, size_t namelen)
++{
++	static int lt_max = -1;
++	static int lt_count;
++	if (lt_max < 0) {
++		int n = 0;
++		lt_max = PE_parse_boot_argn("sweetlinktrace", &n, sizeof(n)) ? n : 0;
++	}
++	if (lt_count >= lt_max) {
++		return false;
++	}
++	static char lt_procs[64];
++	static int lt_procs_state;      /* 0 unparsed, 1 all processes, 2 only the listed ones */
++	if (lt_procs_state == 0) {
++		lt_procs_state = (PE_parse_boot_argn("sweetlinkproc", lt_procs, sizeof(lt_procs)) && lt_procs[0]) ? 2 : 1;
++	}
++	proc_selfname(name, (int)namelen);
++	if (lt_procs_state == 2) {
++		bool match = false;
++		for (const char *w = lt_procs; *w && !match;) {
++			size_t len = 0;
++			while (w[len] && w[len] != ',') {
++				len++;
++			}
++			match = len > 0 && strncmp(name, w, len) == 0 && (name[len] == 0 || len >= MAXCOMLEN);
++			w += len + (w[len] == ',');
++		}
++		if (!match) {
++			return false;
++		}
++	}
++	lt_count++;
++	return true;
++}
++
++static void
++sweet_link_trace(const char *cp, u_int linklen, const char *rest, int error, const char *stage)
++{
++	char name[MAXCOMLEN + 1];
++	if (!sweet_trace_pick(name, sizeof(name))) {
++		return;
++	}
++	printf("SWEETLINK %s[%d] '%.*s' len %u rest '%.64s' err %d at %s\n", name, proc_selfpid(),
++	    (int)(cp ? MIN(linklen, 96) : 0), cp ? cp : "", linklen, rest ? rest : "", error, stage);
++}
++
++static void
++sweet_lookup_trace(vnode_t dvp, const char *rest, int error, const char *from)
++{
++	char name[MAXCOMLEN + 1];
++	if (error == 0 || error == EJUSTRETURN || !sweet_trace_pick(name, sizeof(name))) {
++		return;
++	}
++	const char *dname = dvp ? vnode_getname(dvp) : NULL;
++	printf("SWEETLOOKUP %s[%d] in '%s' (root %d) at '%.64s' err %d from %s\n", name, proc_selfpid(),
++	    dname ? dname : "?", dvp != NULLVP && dvp == rootvnode, rest ? rest : "", error, from);
++	if (dname) {
++		vnode_putname(dname);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ #if NAMEDRSRCFORK
+ #include <sys/xattr.h>
+@@ -1480,6 +1553,9 @@
+ 	ndp->ni_vp = NULLVP;
+ 
+ 	if ((error = cache_lookup_path(ndp, cnp, dp, ctx, &dp_authorized, last_dp))) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_lookup_trace(ndp->ni_dvp, cnp->cn_nameptr, error, "cache");
++#endif
+ 		dp = NULLVP;
+ 		goto bad;
+ 	}
+@@ -1694,6 +1770,9 @@
+ 	 */
+ 
+ 	error = VNOP_LOOKUP(dp, &ndp->ni_vp, cnp, ctx);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_lookup_trace(dp, cnp->cn_nameptr, error, "vnop");
++#endif
+ 
+ 	if (error) {
+ lookup_error:
+@@ -2088,6 +2167,9 @@
+ 	}
+ #if CONFIG_MACF
+ 	if ((error = mac_vnode_check_readlink(ctx, ndp->ni_vp)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_link_trace(NULL, 0, ndp->ni_next, error, "mac_readlink");
++#endif
+ 		return error;
+ 	}
+ #endif /* MAC */
+@@ -2139,6 +2221,9 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_link_trace(cp, linklen, ndp->ni_next, error, error ? "readlink" : "ok");
++#endif
+ 	if (error) {
+ 		if (need_newpathbuf) {
+ 			namei_free(cp, cplen);
+@@ -2199,6 +2284,9 @@
+ 			vnode_put(dp); /* ALWAYS have a dvp for a symlink */
+ 			dp_has_iocount = false;
+ 			if ((dp = ndp->ni_rootdir) == NULLVP) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				sweet_link_trace(cnp->cn_nameptr, 0, NULL, ENOENT, "no_rootdir");
++#endif
+ 				return ENOENT;
+ 			}
+ 		}

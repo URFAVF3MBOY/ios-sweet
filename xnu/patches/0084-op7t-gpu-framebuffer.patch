@@ -1,0 +1,489 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,8 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	/* GPU framebuffer blitting (bsd/dev/sweet_gpu.c; off unless sweetgpu4=1). */
++	sweet_gpu_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,457 @@
++/*
++ * OnePlus 7T (hotdogb, SM8150) Adreno 640: GPU framebuffer blitting under XNU.
++ *
++ * The shim (shim/gpu.c, sweetgpu=15) brings the GPU fully up before XNU and
++ * leaves it running: GMU booted, GX powered, the command processor started,
++ * the ring at GPU VA 0x01010000 live, the 3D-core SMMU context (SID 0, CB)
++ * in place, and -- as of G3 (boot 21) -- OUT OF SECURE MODE via the zap
++ * shader. XNU has no GPU driver of its own and never touches the GPU clocks,
++ * so that state survives into the kernel. The GPU buffers live in scratch RAM
++ * at 0xB0000000, outside the ADT dram range, so XNU's VM never hands them out.
++ *
++ * This driver re-attaches to that running GPU from XNU and uses its 2D engine
++ * (BLIT_OP_SCALE, proven in the shim as G3) to copy into the panel framebuffer
++ * -- the work the CPU does today in AppleCLCD::present (SweetFramebuffer.cpp).
++ *
++ * G4a (this file, boot-arg sweetgpu4=1, default off):
++ *   - map the GPU registers and the shim's scratch RAM;
++ *   - read CP_RB_RPTR/WPTR: the shim left them equal and non-zero (the CP
++ *     drained everything). That is the live ring tail; we append from it;
++ *   - map the whole framebuffer (PA 0x9C000000, 1080x2400x4) into the GPU
++ *     context at a fresh GPU VA, in new L3 tables written into the shim's
++ *     page tables (GPU_PT_PA);
++ *   - CP_MEM_WRITE a fence  = the GPU still takes our commands under XNU;
++ *   - 2D-blit a gradient into a corner of the panel, CPU verifies the pixels
++ *     = the GPU draws the panel from XNU.
++ * G4b (next) hooks AppleCLCD::present to blit each iOS surface instead of the
++ * CPU memcpy; that needs per-surface SMMU mapping of the (scattered) surface
++ * pages, done here from the kernel.
++ *
++ * All register values, the SMMU/ring layout and the blit command stream are
++ * the shim's, proven on hardware; see shim/gpu.c and 7T-GPU-NOTES.md.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_gpu_init(void);
++
++/* ---- MMIO / memory (shim/gpu.c) ---- */
++#define GPU3D_PA		0x02c00000UL
++#define GPU3D_LEN		0x40000UL
++#define SCRATCH_PA		0xb0000000UL
++/*
++ * Boot 22/23: ml_io_map panics (kmem_alloc KERN_NO_SPACE) when the kernel's I/O
++ * map space runs out: a 6 MiB scratch map + a 10 MB, then a 1.1 MB panel map
++ * did. Map only the three small slices of scratch we touch (~0.4 MB):
++ */
++#define SL_PT_PA		(SCRATCH_PA + 0x100000UL)	/* GPU page tables + ring/scratch pages */
++#define SL_PT_LEN		0x30000UL
++#define SL_IB_PA		(SCRATCH_PA + 0x250000UL)	/* our IB (shim IB area + 0x50000) */
++#define SL_IB_LEN		0x1000UL
++#define SL_OWN_PA		(SCRATCH_PA + 0x400000UL)	/* our source image + FB L3 tables */
++#define SL_OWN_LEN		0x30000UL
++#define FB_PA			0x9c000000UL
++#define FB_W			1080U
++#define FB_H			2400U
++#define FB_STRIDE		4320U
++
++#define GPU_PT_PA		(SCRATCH_PA + 0x100000UL)
++#define GPU_BUF_PA		(SCRATCH_PA + 0x110000UL)
++#define GPU_IB_PA		(SCRATCH_PA + 0x200000UL)
++#define GPU_VA_BASE		0x01000000U
++#define GPU_VA_RB		(GPU_VA_BASE + 0x10000U)
++#define GPU_VA_SCR		(GPU_VA_BASE + 0x11000U)
++
++/* our own region in scratch, past everything the shim uses (G3 dst ends +0x360000) */
++#define G4_SRC_PA		(SCRATCH_PA + 0x400000UL)	/* gradient source, 64 KiB + guard */
++#define G4_L3_PA		(SCRATCH_PA + 0x420000UL)	/* framebuffer L3 tables */
++#define G4_SRC_W		128U
++#define G4_SRC_H		128U
++#define G4_SRC_PITCH		512U
++/*
++ * Source in the shim's L3 at index 0x90.. -- a range the GPU has never used.
++ * (The first version used 0x01030000 = L3 0x30..0x43, which overlaps G3's
++ * source guard and destination pages: the SMMU TLB may still hold those old
++ * translations, and the GPU would read G3's image instead. Shim L3 indices in
++ * use: 0..0x11 SQE/ring/scratch, 0x20..0x33 G3 src, 0x40..0x83 G3 dst,
++ * 0x100..0x1ff IB.)
++ */
++#define G4_SRC_VA		0x01090000U
++/* whole framebuffer, mapped fresh: VA 0x02000000, L2 entries 16.. (L1[0] exists) */
++#define G4_FB_VA		0x02000000U
++#define G4_FB_BYTES		(FB_STRIDE * FB_H)		/* 0x9E3900 */
++#define G4_FB_PAGES		((G4_FB_BYTES + 0xfffU) / 0x1000U)	/* 2532 */
++#define G4_FB_L3S		((G4_FB_PAGES + 511U) / 512U)		/* 5 */
++#define G4_CHECK_ROWS		64U	/* the CPU paints and checks rows 0..63 of the 256 */
++#define G4_CHECK_BYTES		(((G4_CHECK_ROWS * FB_STRIDE) + 0xfffU) & ~0xfffU)	/* ~0.28 MB */
++
++/* ---- registers (a6xx.xml; dword offsets) ---- */
++#define A6XX_CP_RB_RPTR		0x0806U
++#define A6XX_CP_RB_WPTR		0x0807U
++#define A6XX_CP_HW_FAULT	0x0821U
++#define A6XX_CP_INTERRUPT_STATUS	0x0823U
++#define A6XX_RBBM_STATUS	0x0210U
++#define GPU3D_REG(d)		(gpu + ((uint32_t)(d) << 2))
++
++/* ---- packets (adreno_pm4.xml) ---- */
++#define CP_OP_MEM_WRITE		0x3dU
++#define CP_OP_INDIRECT_BUFFER_PFE	0x3fU
++#define CP_OP_EVENT_WRITE	0x46U
++#define CP_OP_SET_MARKER	0x65U
++#define CP_OP_BLIT		0x2cU
++#define CP_OP_WAIT_FOR_IDLE	0x26U
++#define CP_BLIT_OP_SCALE	3U
++#define RM6_BLIT2DSCALE		12U
++#define EV_CCU_INV_DEPTH	0x18U
++#define EV_CCU_INV_COLOR	0x19U
++#define EV_CCU_FLUSH_DEPTH_TS	0x1cU
++#define EV_CCU_FLUSH_COLOR_TS	0x1dU
++#define EV_CACHE_FLUSH_TS	0x04U
++#define EV_CACHE_INVALIDATE	0x31U
++#define EV_DEBUG_LABEL		0x3fU
++
++/* ---- 2D-engine registers / field values (shim G3) ---- */
++#define R_GRAS_A2D_BLT_CNTL	0x8400U
++#define R_GRAS_A2D_SRC_XMIN	0x8401U
++#define R_GRAS_A2D_DEST_TL	0x8405U
++#define R_RB_A2D_BLT_CNTL	0x8c00U
++#define R_RB_A2D_PIXEL_CNTL	0x8c01U
++#define R_RB_A2D_DEST_INFO	0x8c17U
++#define R_RB_CCU_CNTL		0x8e07U
++#define R_SP_A2D_OUTPUT_INFO	0xacc0U
++#define R_TPL1_A2D_SRC_INFO	0xb4c0U
++#define R_TPL1_A2D_SRC_FLAG	0xb4caU
++#define FMT6_8888		0x30U
++#define G4_BLT_CNTL		((FMT6_8888 << 8) | (0xfU << 20))
++#define G4_SP_OUT		((FMT6_8888 << 3) | (0xfU << 12))
++#define G4_TEX_INFO		(FMT6_8888 | (1U << 16) | (1U << 20) | (1U << 22))
++#define G4_DST_INFO		FMT6_8888
++#define G4_CCU_BYPASS		0x10000000U
++
++/* scratch-page words (dword indices into GPU_VA_SCR page) */
++#define G4_FENCE_OFF		0x160U
++#define G4_MARK_OFF		0x168U
++#define G4_FENCE_MAGIC		0x6004faceU
++#define G4_MARK_MAGIC		0x6004b00bU
++
++/* PTE attributes (shim): Normal non-cacheable, outer shareable, unpriv RW */
++#define PTE_PAGE		3ULL
++#define PTE_TABLE		3ULL
++#define PTE_ATTR		((1ULL << 2) | (1ULL << 6) | (2ULL << 8) | (1ULL << 10))
++
++static vm_offset_t gpu, sl_pt, sl_ib, sl_own;	/* kernel mappings */
++static int sweet_gpu_started;
++static int gpu_sleep_chan;
++
++static inline uint32_t grd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)GPU3D_REG(off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++static inline void gwrr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)GPU3D_REG(off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* scratch PA -> kernel VA, through whichever slice holds it */
++static int sl_bad;
++static vm_offset_t sp(uintptr_t pa)
++{
++	if (pa >= SL_PT_PA && pa < SL_PT_PA + SL_PT_LEN)
++		return sl_pt + (pa - SL_PT_PA);
++	if (pa >= SL_IB_PA && pa < SL_IB_PA + SL_IB_LEN)
++		return sl_ib + (pa - SL_IB_PA);
++	if (pa >= SL_OWN_PA && pa < SL_OWN_PA + SL_OWN_LEN)
++		return sl_own + (pa - SL_OWN_PA);
++	sl_bad++;
++	return sl_own;	/* never used for a real access: callers check sl_bad */
++}
++static inline volatile uint32_t *sp32(uintptr_t pa)
++{
++	return (volatile uint32_t *)sp(pa);
++}
++static inline volatile uint64_t *sp64(uintptr_t pa)
++{
++	return (volatile uint64_t *)sp(pa);
++}
++/* ring/scratch GPU VA (0x010xxxxx) -> its scratch PA -> kernel VA */
++static inline volatile uint32_t *gva32(uint32_t va)
++{
++	return sp32(GPU_BUF_PA + (va - GPU_VA_BASE));
++}
++
++static void gpu_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t pm4_parity(uint32_t v)
++{
++	return (0x9669U >> (0xfU & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^
++				    (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1U;
++}
++static uint32_t cp_type7(uint32_t op, uint32_t cnt)
++{
++	return (7U << 28) | cnt | (pm4_parity(cnt) << 15) |
++	       ((op & 0x7fU) << 16) | (pm4_parity(op) << 23);
++}
++static uint32_t cp_type4(uint32_t reg, uint32_t cnt)
++{
++	return (4U << 28) | cnt | (pm4_parity(cnt) << 7) |
++	       ((reg & 0x3ffffU) << 8) | (pm4_parity(reg) << 27);
++}
++
++/* ---- IB builder (identical shape to shim G3) ---- */
++struct ib { volatile uint32_t *p; uint32_t n, max; };
++static void ib_put(struct ib *b, uint32_t v) { if (b->n < b->max) b->p[b->n] = v; b->n++; }
++static void ib_reg1(struct ib *b, uint32_t reg, uint32_t v) { ib_put(b, cp_type4(reg, 1)); ib_put(b, v); }
++static void ib_regs(struct ib *b, uint32_t reg, uint32_t cnt, const uint32_t *v)
++{
++	ib_put(b, cp_type4(reg, cnt));
++	for (uint32_t i = 0; i < cnt; i++) ib_put(b, v[i]);
++}
++static void ib_ev(struct ib *b, uint32_t ev) { ib_put(b, cp_type7(CP_OP_EVENT_WRITE, 1)); ib_put(b, ev); }
++static void ib_ev_ts(struct ib *b, uint32_t ev, uint32_t scr_off, uint32_t val)
++{
++	ib_put(b, cp_type7(CP_OP_EVENT_WRITE, 4));
++	ib_put(b, ev); ib_put(b, GPU_VA_SCR + scr_off); ib_put(b, 0); ib_put(b, val);
++}
++
++struct blit {
++	uint32_t src_va, src_w, src_h, src_pitch, sx0, sy0, sx1, sy1;
++	uint32_t dst_va, dst_pitch, dx0, dy0, dx1, dy1;
++};
++
++/* one BLIT_OP_SCALE, exactly as the shim's ib_blit (Mesa handle_rgba_blit) */
++static void ib_blit(struct ib *b, const struct blit *s, uint32_t ccu)
++{
++	uint32_t v[5];
++	ib_ev_ts(b, EV_CCU_FLUSH_COLOR_TS, 0x120, 0xa0000001U);
++	ib_ev_ts(b, EV_CCU_FLUSH_DEPTH_TS, 0x128, 0xa0000002U);
++	ib_ev(b, EV_CCU_INV_COLOR);
++	ib_ev(b, EV_CCU_INV_DEPTH);
++	ib_ev(b, EV_CACHE_INVALIDATE);
++	ib_put(b, cp_type7(CP_OP_WAIT_FOR_IDLE, 0));
++	ib_put(b, cp_type7(CP_OP_SET_MARKER, 1)); ib_put(b, RM6_BLIT2DSCALE);
++	ib_reg1(b, R_RB_CCU_CNTL, ccu);
++	v[0] = s->sx0 << 8; v[1] = (s->sx1 - 1U) << 8; v[2] = s->sy0 << 8; v[3] = (s->sy1 - 1U) << 8;
++	ib_regs(b, R_GRAS_A2D_SRC_XMIN, 4, v);
++	v[0] = s->dx0 | (s->dy0 << 16); v[1] = (s->dx1 - 1U) | ((s->dy1 - 1U) << 16);
++	ib_regs(b, R_GRAS_A2D_DEST_TL, 2, v);
++	ib_reg1(b, R_RB_A2D_BLT_CNTL, G4_BLT_CNTL);
++	ib_reg1(b, R_GRAS_A2D_BLT_CNTL, G4_BLT_CNTL);
++	ib_reg1(b, R_SP_A2D_OUTPUT_INFO, G4_SP_OUT);
++	ib_reg1(b, R_RB_A2D_PIXEL_CNTL, 0);
++	v[0] = G4_TEX_INFO; v[1] = s->src_w | (s->src_h << 15); v[2] = s->src_va; v[3] = 0;
++	v[4] = (s->src_pitch >> 6) << 9;
++	ib_regs(b, R_TPL1_A2D_SRC_INFO, 5, v);
++	v[0] = v[1] = v[2] = 0; ib_regs(b, R_TPL1_A2D_SRC_FLAG, 3, v);
++	v[0] = G4_DST_INFO; v[1] = s->dst_va; v[2] = 0; v[3] = s->dst_pitch >> 6;
++	ib_regs(b, R_RB_A2D_DEST_INFO, 4, v);
++	ib_ev(b, EV_DEBUG_LABEL);
++	ib_put(b, cp_type7(CP_OP_BLIT, 1)); ib_put(b, CP_BLIT_OP_SCALE);
++	ib_ev_ts(b, EV_CCU_FLUSH_COLOR_TS, 0x120, 0xa0000003U);
++	ib_ev_ts(b, EV_CCU_FLUSH_DEPTH_TS, 0x128, 0xa0000004U);
++	ib_ev_ts(b, EV_CACHE_FLUSH_TS, 0x130, 0xa0000005U);
++	ib_put(b, cp_type7(CP_OP_WAIT_FOR_IDLE, 0));
++}
++
++/* append dwords to the live ring and poll one scratch word; 1 if it lands */
++static int ring_submit(const uint32_t *dw, uint32_t n, uint32_t scr_off, uint32_t magic)
++{
++	volatile uint32_t *ring = gva32(GPU_VA_RB);
++	volatile uint32_t *scr = gva32(GPU_VA_SCR);
++	uint32_t w = grd(A6XX_CP_RB_WPTR) & 1023U;
++	uint32_t rptr = grd(A6XX_CP_RB_RPTR) & 1023U;
++	uint32_t free = (rptr - w - 1U) & 1023U;
++	if (n + 4U > free)
++		return -1;			/* would overrun the CP */
++	scr[scr_off / 4] = 0;
++	for (uint32_t i = 0; i < n; i++)
++		ring[(w + i) & 1023U] = dw[i];
++	__asm__ volatile("dsb sy" ::: "memory");
++	w = (w + n) & 1023U;
++	gwrr(A6XX_CP_RB_WPTR, w);
++	for (unsigned t = 0; t < 200000; t += 10) {
++		if (scr[scr_off / 4] == magic || grd(A6XX_CP_HW_FAULT))
++			return scr[scr_off / 4] == magic;
++		delay(10);
++	}
++	return 0;
++}
++
++/* add PTEs: map G4_FB_PAGES of the framebuffer at G4_FB_VA, in fresh L3 tables */
++static void map_framebuffer(void)
++{
++	uintptr_t l2 = GPU_PT_PA + 0x1000;	/* shim's L2 for VA 0..1GB (L1[0]) */
++	for (uint32_t t = 0; t < G4_FB_L3S; t++) {
++		uintptr_t l3 = G4_L3_PA + (uintptr_t)t * 0x1000;
++		for (uint32_t i = 0; i < 512; i++)
++			*sp64(l3 + (uintptr_t)i * 8) = 0;
++		uint32_t l2i = ((G4_FB_VA >> 21) & 0x1ffU) + t;
++		*sp64(l2 + (uintptr_t)l2i * 8) = (uint64_t)l3 | PTE_TABLE;
++		for (uint32_t i = 0; i < 512; i++) {
++			uint32_t page = t * 512U + i;
++			if (page >= G4_FB_PAGES)
++				break;
++			*sp64(l3 + (uintptr_t)i * 8) =
++			    (FB_PA + (uint64_t)page * 0x1000) | PTE_PAGE | PTE_ATTR;
++		}
++	}
++	/* add the gradient source into the shim's existing L3 (idx 0x30..) */
++	uintptr_t l3src = GPU_PT_PA + 0x2000;
++	for (uint32_t i = 0; i < 16U + 4U; i++)
++		*sp64(l3src + (uintptr_t)(((G4_SRC_VA >> 12) & 0x1ffU) + i) * 8) =
++		    (G4_SRC_PA + (uint64_t)i * 0x1000) | PTE_PAGE | PTE_ATTR;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void sweet_gpu_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 8;
++	(void)arg; (void)result;
++	(void)PE_parse_boot_argn("sweetgpu4delay", &delay_s, sizeof(delay_s));
++	printf("HOTDOGB GPU4: starting in %u s\n", delay_s);
++	gpu_wait(delay_s * 1000U);
++
++	gpu = ml_io_map(GPU3D_PA, GPU3D_LEN);
++	sl_pt = ml_io_map(SL_PT_PA, SL_PT_LEN);
++	sl_ib = ml_io_map(SL_IB_PA, SL_IB_LEN);
++	sl_own = ml_io_map(SL_OWN_PA, SL_OWN_LEN);
++	if (!gpu || !sl_pt || !sl_ib || !sl_own) {
++		printf("HOTDOGB GPU4: MMIO map failed\n");
++		goto out;
++	}
++	uint32_t rptr = grd(A6XX_CP_RB_RPTR), wptr = grd(A6XX_CP_RB_WPTR);
++	uint32_t rbbm = grd(A6XX_RBBM_STATUS), cpint = grd(A6XX_CP_INTERRUPT_STATUS);
++	printf("HOTDOGB GPU4: rptr=%#x wptr=%#x rbbm=%#x cpint=%#x\n", rptr, wptr, rbbm, cpint);
++	if (rptr != wptr) {
++		printf("HOTDOGB GPU4: ring not idle (shim did not finish?); stopping\n");
++		goto out;
++	}
++
++	/* 1. GPU alive under XNU: a plain fence */
++	uint32_t fence[4];
++	fence[0] = cp_type7(CP_OP_MEM_WRITE, 3);
++	fence[1] = GPU_VA_SCR + G4_FENCE_OFF;
++	fence[2] = 0;
++	fence[3] = G4_FENCE_MAGIC;
++	int alive = ring_submit(fence, 4, G4_FENCE_OFF, G4_FENCE_MAGIC);
++	printf("HOTDOGB GPU4: fence %s (hwfault=%#x)\n", alive == 1 ? "landed -- GPU ALIVE under XNU" :
++	    "MISSING", grd(A6XX_CP_HW_FAULT));
++	if (alive != 1)
++		goto out;
++
++	/* 2. map the framebuffer, build a gradient, blit it to the top-left corner */
++	map_framebuffer();
++	volatile uint32_t *src = sp32(G4_SRC_PA);
++	for (uint32_t y = 0; y < G4_SRC_H; y++)
++		for (uint32_t x = 0; x < G4_SRC_W; x++)
++			src[y * (G4_SRC_PITCH / 4) + x] = 0xff800000U | ((y * 2U) << 8) | (x * 2U);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	static uint32_t ibuf[256];
++	struct ib b = { ibuf, 0, sizeof(ibuf) / 4 };
++	struct blit s;
++	s.src_va = G4_SRC_VA; s.src_w = G4_SRC_W; s.src_h = G4_SRC_H; s.src_pitch = G4_SRC_PITCH;
++	s.sx0 = 0; s.sy0 = 0; s.sx1 = G4_SRC_W; s.sy1 = G4_SRC_H;
++	s.dst_va = G4_FB_VA; s.dst_pitch = FB_STRIDE;	/* a multiple of 64 only for even rows; see below */
++	s.dx0 = 0; s.dy0 = 0; s.dx1 = 256; s.dy1 = 256;
++	/*
++	 * The panel pitch 4320 is not a multiple of 64 (G3's finding). For a
++	 * top-left 256x256 we use the same even/odd split: even rows pitch 8640
++	 * from row 0, odd rows pitch 8640 from 32 bytes before row 1.
++	 */
++	s.dst_pitch = 2U * FB_STRIDE; s.dy1 = 128;
++	s.dst_va = G4_FB_VA; s.dx0 = 0; s.dx1 = 256;
++	ib_blit(&b, &s, G4_CCU_BYPASS);
++	s.dst_va = G4_FB_VA + FB_STRIDE - 32U; s.dx0 = 8U; s.dx1 = 8U + 256U;
++	ib_blit(&b, &s, G4_CCU_BYPASS);
++	if (b.n > b.max || sl_bad) {
++		printf("HOTDOGB GPU4: IB overflow %u/%u or slice miss %d\n", b.n, b.max, sl_bad);
++		goto out;
++	}
++	/* copy the IB into GPU memory (reuse the shim IB area), then call it */
++	volatile uint32_t *ibmem = sp32(GPU_IB_PA + 0x50000U);
++	for (uint32_t i = 0; i < b.n; i++)
++		ibmem[i] = ibuf[i];
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	uint32_t call[8];
++	call[0] = cp_type7(CP_OP_INDIRECT_BUFFER_PFE, 3);
++	call[1] = GPU_VA_BASE + 0x100000U + 0x50000U;	/* GPU_VA_IB + 0x50000 */
++	call[2] = 0;
++	call[3] = b.n;
++	call[4] = cp_type7(CP_OP_MEM_WRITE, 3);
++	call[5] = GPU_VA_SCR + G4_MARK_OFF;
++	call[6] = 0;
++	call[7] = G4_MARK_MAGIC;
++	/*
++	 * Paint the corner black first, so a visible gradient can only be the GPU's.
++	 * The CPU maps only the 256 rows it checks (~1.1 MB): boot 22 panicked in
++	 * kmem_alloc mapping the whole 10 MB panel (KERN_NO_SPACE). The GPU itself
++	 * reaches the whole panel through its own page tables (map_framebuffer).
++	 */
++	volatile uint32_t *panel = (volatile uint32_t *)ml_io_map(FB_PA, (vm_size_t)G4_CHECK_BYTES);
++	if (panel) {
++		for (uint32_t y = 0; y < G4_CHECK_ROWS; y++)
++			for (uint32_t x = 0; x < 256; x++)
++				panel[y * (FB_STRIDE / 4) + x] = 0xff000000U;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	int drew = ring_submit(call, 8, G4_MARK_OFF, G4_MARK_MAGIC);
++	uint32_t good = 0;
++	if (panel && drew == 1) {
++		for (uint32_t y = 0; y < G4_CHECK_ROWS; y++)
++			for (uint32_t x = 2; x < 254; x++) {
++				uint32_t v = panel[y * (FB_STRIDE / 4) + x];
++				uint32_t ex0 = x, ex1 = (y >> 1) * 2U;
++				uint32_t b0 = v & 0xffU, b1 = (v >> 8) & 0xffU, b2 = (v >> 16) & 0xffU;
++				uint32_t d0 = b0 > ex0 ? b0 - ex0 : ex0 - b0;
++				uint32_t d1 = b1 > ex1 ? b1 - ex1 : ex1 - b1;
++				if (d0 <= 2U && d1 <= 2U && (b2 > 0x7eU && b2 < 0x82U))
++					good++;
++			}
++	}
++	printf("HOTDOGB GPU4: blit %s mark=%#x hwfault=%#x green=%u/%u\n",
++	    drew == 1 ? "done" : "MISSING", drew == 1 ? G4_MARK_MAGIC : 0,
++	    grd(A6XX_CP_HW_FAULT), good, G4_CHECK_ROWS * 252U);
++	if (drew == 1 && good == G4_CHECK_ROWS * 252U)
++		printf("HOTDOGB GPU4: THE GPU DREW THE PANEL FROM XNU -- gradient in the top-left corner\n");
++out:
++	printf("HOTDOGB GPU4: thread exiting\n");
++	thread_terminate(current_thread());
++}
++
++void sweet_gpu_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (sweet_gpu_started)
++		return;
++	sweet_gpu_started = 1;
++	(void)PE_parse_boot_argn("sweetgpu4", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("HOTDOGB GPU4: off (sweetgpu4=0)\n");
++		return;
++	}
++	if (kernel_thread_start(sweet_gpu_thread, NULL, &thread) == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("HOTDOGB GPU4: thread start failed\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

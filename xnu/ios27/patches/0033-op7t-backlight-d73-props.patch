@@ -1,0 +1,59 @@
+0033: AppleARMBacklight carries the iPhone 14 Pro backlight tables.
+
+Boot 28n: backboardd opens the framebuffer, then crashes twice with SIGSEGV, far 0, in CoreBrightness (ios-guacamole,
+7 Pro: a NULL float array; iOS 27's CoreBrightness reads bright-dot-mitigation-nits1/2, aml-table, EDR*, rtplc-*
+and aab-* from the backlight and the iOS 16 service has none of them).
+- SweetBacklight.cpp: when AppleARMBacklight is published, every property of the ADT node /sweet-backlight is
+  copied onto it. The node is the IPSW's own D73 /backlight, added by tools/adt_copy_node.py.
+
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -32,6 +32,7 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -396,6 +397,40 @@
+ 	svc->fValue = SWEET_BL_SCALE / 2;
+ 	svc->publishParameters();
+ 	svc->setProperty("backlight-control", true);
++	/*
++	 * 0033: iOS 27's CoreBrightness reads the panel tables (bright-dot-mitigation-nits1/2, aml-table, EDR*,
++	 * rtplc-*, aab-*) from the backlight service and backboardd crashes on the missing ones (boot 28n: SIGSEGV
++	 * with far 0 in CoreBrightness, a NULL float array; ios-guacamole found the same on the 7 Pro). The ADT
++	 * carries the iPhone 14 Pro's /backlight as /sweet-backlight (tools/adt_copy_node.py); its properties are
++	 * copied here. Without that node nothing changes.
++	 */
++	{
++		IORegistryEntry *dt = IORegistryEntry::fromPath("/sweet-backlight", gIODTPlane);
++		unsigned copied = 0;
++
++		if (dt != NULL) {
++			OSDictionary *props = dt->dictionaryWithProperties();
++			OSCollectionIterator *it = props != NULL ? OSCollectionIterator::withCollection(props) : NULL;
++			const OSSymbol *key;
++
++			while (it != NULL && (key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++				if (key->isEqualTo("name") || key->isEqualTo("AAPL,phandle")) {
++					continue;
++				}
++				if (svc->setProperty(key, props->getObject(key))) {
++					copied++;
++				}
++			}
++			if (it != NULL) {
++				it->release();
++			}
++			if (props != NULL) {
++				props->release();
++			}
++			dt->release();
++		}
++		LOG("AppleARMBacklight: %u properties from /sweet-backlight", copied);
++	}
+ 	if (!svc->attach(sweet_bl_fb)) {
+ 		svc->release();
+ 		return ENXIO;

@@ -1,0 +1,119 @@
+0020: see why a boot task fails: syscall error trace and a hold before launchd's userspace panic.
+
+Boot 27r (new root, right owners): "userspace panic: boot task failure: tzinit - exited due to exit(2)", before USB.
+tzinit has everything on disk (zoneinfo.default, icu/icutzformat.txt, /var/db/timezone), so a syscall fails.
+- kern_shutdown.c: reboot(RB_PANIC) first holds sweetinitwait seconds, replaying the console to the USB log at 30 s,
+  before the shutdown steps stop USB (boot 27s held after them: nothing arrived).
+- systemcalls.c: sweetsystrace=NAME[,NAME...] logs failing syscalls of matching processes (ios-guacamole's idea).
+
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -65,6 +65,7 @@
+ #include <mach/task.h>                  /* for task_suspend() */
+ #include <sys/sysproto.h>               /* abused for sync() */
+ #include <kern/clock.h>                 /* for delay_for_interval() */
++#include <pexpert/pexpert.h>
+ #include <libkern/OSAtomic.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOMessage.h>
+@@ -182,11 +183,47 @@
+ extern int vm_swapfile_gc_thread_running;
+ extern uint32_t cl_sparse_push_error;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0020: launchd panics through reboot(RB_PANIC) (boot 27r: "userspace panic: boot task failure: tzinit - exited due
++ * to exit(2)"). Hold first, while USB and the live log still run (the shutdown steps below stop them; boot 27s held
++ * after them and sent nothing): sweetinitwait seconds (default 20) as for initproc's death (0013), and 30 s in the
++ * USB log replays the console (0014).
++ */
++static void
++sweet_userpanic_hold(const char *message)
++{
++	extern void sweet_usblog_replay(uint64_t back);  /* bsd/dev/sweet_usb.c */
++	uint32_t secs = 20;
++
++	PE_parse_boot_argn("sweetinitwait", &secs, sizeof(secs));
++	if (secs > 300) {
++		secs = 300;
++	}
++	if (secs == 0) {
++		return;
++	}
++	printf("HOTDOGB: userspace panic requested (%s); panic in %u s\n", message ? message : "", secs);
++	uint32_t first = secs < 30 ? secs : 30;
++	delay((int)(first * 1000000));
++	sweet_usblog_replay(4u << 20);
++	if (secs > first) {
++		delay((int)((secs - first) * 1000000));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ int
+ reboot_kernel(int howto, char *message)
+ {
+ 	int hostboot_option = 0;
+ 	uint64_t startTime;
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (howto & RB_PANIC) {
++		sweet_userpanic_hold(message);
++	}
++#endif
+ 
+ 	if ((howto & (RB_PANIC | RB_QUICK)) == (RB_PANIC | RB_QUICK)) {
+ 		panic_kernel(howto, message);
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -180,6 +180,50 @@
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0020: boot-arg sweetsystrace=NAME[,NAME...] logs the first 600 failing BSD syscalls of processes whose name
++	 * contains one of the NAMEs: "SYSERR name[pid] sc N err E a0 a1 a2 'str0' 'str1'" (a0/a1 shown as strings when
++	 * they point at one). For daemons that fail before logd runs (boot 27r: tzinit exit(2); keybagd stalls for
++	 * minutes). Idea from ios-guacamole's systrace.
++	 */
++	if (__improbable(error != 0 && error != ERESTART && error != EJUSTRETURN)) {
++		static char st_list[64];
++		static int st_state;            /* 0 unparsed, 1 off, 2 on */
++		static unsigned st_count;
++		if (st_state == 0) {
++			st_state = (PE_parse_boot_argn("sweetsystrace", st_list, sizeof(st_list)) && st_list[0]) ? 2 : 1;
++		}
++		bool st_match = false;
++		for (const char *w = st_list; st_state == 2 && st_count < 600 && *w && !st_match;) {
++			size_t len = 0;
++			while (w[len] && w[len] != ',') {
++				len++;
++			}
++			char word[MAXCOMLEN + 1];
++			if (len > 0 && len < sizeof(word)) {
++				memcpy(word, w, len);
++				word[len] = 0;
++				st_match = strnstr(proc->p_comm, word, sizeof(proc->p_comm)) != NULL;
++			}
++			w += len + (w[len] == ',');
++		}
++		if (st_match) {
++			char s0[96] = "", s1[96] = "";
++			size_t n;
++			uint64_t a0 = uthread->uu_arg[0], a1 = uthread->uu_arg[1], a2 = uthread->uu_arg[2];
++			if (a0 > 0x100000000ULL && a0 < 0x8000000000ULL && copyinstr((user_addr_t)a0, s0, sizeof(s0), &n) != 0) {
++				s0[0] = 0;
++			}
++			if (a1 > 0x100000000ULL && a1 < 0x8000000000ULL && copyinstr((user_addr_t)a1, s1, sizeof(s1), &n) != 0) {
++				s1[0] = 0;
++			}
++			st_count++;
++			printf("SYSERR %s[%d] sc %d err %d a0 %#llx a1 %#llx a2 %#llx '%s' '%s'\n", proc->p_comm, pid, code,
++			    error, a0, a1, a2, s0, s1);
++		}
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ #if CONFIG_MACF
+ skip_syscall:

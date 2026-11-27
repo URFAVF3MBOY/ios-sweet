@@ -1,0 +1,27 @@
+0015: map a shared cache that root does not own.
+
+Boot 27m (the replayed log, 0014): "shared_region: map('dyld_shared_cache_arm64e'): not in trust cache",
+"owned by uid=1000 instead of 0", then dyld "syscall to map cache into shared region failed" and launchd's
+"no dyld cache". The macOS config accepts a non-root cache only through a trust cache, and SWEET has none.
+
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -1658,6 +1658,18 @@
+ 				error));
+ 			goto done;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET: no trust caches (no AppleImage4/AMFI), so the cache is only accepted when root owns it; the 27.2
++		 * root built on Linux has it owned by the build user (boot 27m: "owned by uid=1000 instead of 0", dyld
++		 * "syscall to map cache into shared region failed"). The volume is ours; accept any owner and say so.
++		 */
++		if (va.va_uid != 0) {
++			printf("HOTDOGB: shared cache '%s' owned by uid %d: mapped anyway (no trust caches here)\n",
++			    srfmp->vp->v_name, va.va_uid);
++			va.va_uid = 0;
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 		if (va.va_uid != 0) {
+ 			SHARED_REGION_TRACE_ERROR(
+ 				("shared_region: %p [%d(%s)] map(%p:'%s'): "

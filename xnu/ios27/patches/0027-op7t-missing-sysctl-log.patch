@@ -1,0 +1,66 @@
+0027: log sysctl names that do not exist.
+
+Boot 28l (sweetsystrace=launchd, disk log): after "Early boot complete" launchd aborts in os_lockdown_mode_enabled()
+(sampler backtrace), right after `__sysctl` with a 2-entry MIB returns ENOENT, the name-to-OID lookup {0,3}. The
+name is in newp, so the SYSERR line does not show it; security.mac.lockdown_mode_state itself exists.
+- kern_newsysctl.c: "SWEET SYSCTL: no 'NAME' (proc[pid])" for a failed name lookup ({0,3} and sysctlbyname), the
+  first 120 per boot; boot-arg sweetsysctl=0 turns it off.
+
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -131,6 +131,31 @@
+ STATIC int sysctl_old_kernel(struct sysctl_req *req, const void *p, size_t l);
+ STATIC int sysctl_new_kernel(struct sysctl_req *req, void *p, size_t l);
+ STATIC int name2oid(char *name, int *oid, size_t *len);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0027: log sysctl names that do not exist: "SWEET SYSCTL: no 'NAME' (proc[pid])", the first 120 per boot
++ * (boot-arg sweetsysctl=0 turns it off). Boot 28l: launchd aborts in os_lockdown_mode_enabled() right after an
++ * ENOENT from __sysctl {0,3} (name to OID), whose name travels in newp and so is not in the SYSERR line.
++ */
++static void
++sweet_sysctl_missing(const char *name)
++{
++	static int ss_on = -1;
++	static int ss_count;
++	if (ss_on < 0) {
++		int v = 1;
++		PE_parse_boot_argn("sweetsysctl", &v, sizeof(v));
++		ss_on = v != 0;
++	}
++	if (!ss_on || ss_count >= 120) {
++		return;
++	}
++	ss_count++;
++	char comm[MAXCOMLEN + 1];
++	proc_selfname(comm, sizeof(comm));
++	printf("SWEET SYSCTL: no '%.96s' (%s[%d])\n", name, comm, proc_selfpid());
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ STATIC int sysctl_sysctl_name2oid(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req);
+ STATIC int sysctl_sysctl_next(struct sysctl_oid *oidp, void *arg1, int arg2,
+     struct sysctl_req *req);
+@@ -1233,6 +1258,11 @@
+ 	lck_rw_lock_shared(&sysctl_geometry_lock);
+ 	error = name2oid(p, oid, &len);
+ 	lck_rw_done(&sysctl_geometry_lock);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == ENOENT) {
++		sweet_sysctl_missing(p);
++	}
++#endif
+ 
+ 	kfree_data(p, req->newlen + 1);
+ 
+@@ -1753,6 +1783,11 @@
+ 		/* namestring is actually canonical, name/namelen needs to be populated */
+ 		error = name2oid(namestring, name, &namelen);
+ 		if (error) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			if (error == ENOENT) {
++				sweet_sysctl_missing(namestring);
++			}
++#endif
+ 			goto err;
+ 		}
+ 	}

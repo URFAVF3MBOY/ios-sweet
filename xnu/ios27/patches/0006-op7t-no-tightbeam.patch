@@ -1,0 +1,25 @@
+0006: no Tightbeam on SWEET.
+
+12377 force-loads the KDK's libTightbeam.a and exports its tb_* symbols to kexts. That library is arm64e (Apple's
+PAC ABI) and the SWEET kernel is plain arm64, so the linker leaves it out and the export step then failed with
+"exported name not in import list: _tb_..." (80 names, build 8). Tightbeam only talks to Exclaves, which the SM8150
+does not have (0005 already stubs tb_transport_startup).
+
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1190,12 +1190,15 @@
+ endif # !EXCLAVES_ENABLED
+ 
+ 
++# SWEET: plain arm64 kernel, no Exclaves: the KDK's arm64e Tightbeam library cannot be linked or exported.
++ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+ ifneq ($(wildcard $(SDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+ XNU_CONFIG_TIGHTBEAM := 1
+ TIGHTBEAM_IN_SDK := 1
+ else ifneq ($(wildcard $(KDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+ XNU_CONFIG_TIGHTBEAM := 1
+ endif
++endif
+ ifeq ($(XNU_CONFIG_TIGHTBEAM),1)
+   ifeq ($(TIGHTBEAM_IN_SDK),1)
+     # Force-import the Tightbeam static lib so that all of its symbols can be exported to kexts

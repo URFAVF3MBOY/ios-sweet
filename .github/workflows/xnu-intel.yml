@@ -1,0 +1,264 @@
+name: xnu-intel
+# iOS 27.2 kernel: xnu-12377.121.6 (macOS 26.5) + xnu/ios27/patches.
+# On this branch xnu.yml builds the iOS 27 kernel; the iOS 16 one is xnu.yml on main.
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG (VMAPPLE = stock tree check, SWEET once the port has it)
+        default: SWEET
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+concurrency:
+  group: xnu-intel-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "26.5"
+  KDK_BUILD: 25F71
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+  CCACHE_LOGFILE: ${{ github.workspace }}/ccache.log
+jobs:
+  build:
+    # Intel pool: the arm64 macOS pool queues for a long time (Nov 2026)
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 26.5 patch dir = the build script's 26.0 fixes, then mine (zz- prefix: applied after them)
+          mkdir -p dxb/patches/26.5
+          cp dxb/patches/26.0/* dxb/patches/26.5/
+          for p in xnu/ios27/patches/*.patch; do
+            [ -f "$p" ] || continue
+            cp "$p" "dxb/patches/26.5/zz-$(basename "$p")"
+          done
+          # plain arm64 kernel (no PAC on the Kryo 485)
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          # a patch of mine that does not apply stops the build (the script only warns)
+          perl -0pi -e 's/(\n(\s*)warning "Skipping patch \$\{PATCH\}[^\n]*\n)/$1$2case "\$PATCH" in *\/zz-*) error "patch did not apply: \$PATCH"; exit 1;; esac\n/' dxb/build.sh
+          grep -n 'patch did not apply' dxb/build.sh
+          # iOS 27 runs on an iOS-configured kernel (0022): the kernel itself builds against the iPhoneOS SDK
+          # (XNU_TARGET_OS_IOS); headers, mig and the kernel libs still come from dxb's macOS fakeroot
+          sed -i '' 's/SDKROOT=macosx TARGET_CONFIGS=/SDKROOT=iphoneos TARGET_CONFIGS=/g' dxb/build.sh
+          grep -c 'SDKROOT=iphoneos TARGET_CONFIGS=' dxb/build.sh
+          # the kernel links libfirehose_kernel.a, built with the macOS SDK; re-label it iOS right after dxb builds it
+          # (ld refuses a macOS object in an iOS kernel; tools/ci/firehose-ios.sh)
+          perl -pi -e 'if (m{mv "\$\{FAKEROOT_DIR\}/usr/local/lib/kernel/liblibfirehose_kernel\.a"}) { $_ .= "        bash \"$ENV{GITHUB_WORKSPACE}/tools/ci/firehose-ios.sh\" \"\${FAKEROOT_DIR}/usr/local/lib/kernel/libfirehose_kernel.a\"\n" }' dxb/build.sh
+          grep -n 'firehose-ios.sh' dxb/build.sh
+          ls dxb/patches/26.5
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja ccache zstd
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
+          echo "Using Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          mkdir -p /tmp/ccache-bin
+          # tools/ci/ccache-wrap.sh drops xnu's -MJ (ccache refused every compile because of it)
+          printf '#!/bin/sh\nexec bash "%s" "%s" "$@"\n' "$GITHUB_WORKSPACE/tools/ci/ccache-wrap.sh" "$(xcrun --find clang)" > /tmp/ccache-bin/clang
+          printf '#!/bin/sh\nexec bash "%s" "%s" "$@"\n' "$GITHUB_WORKSPACE/tools/ci/ccache-wrap.sh" "$(xcrun --find clang++)" > /tmp/ccache-bin/clang++
+          chmod +x /tmp/ccache-bin/clang /tmp/ccache-bin/clang++
+          ccache -z
+
+      # The kernel build only reads a few small parts of the KDK (Kernel.framework headers, KernelSupport headers,
+      # usr/local/lib/kernel, System.kext's Info.plist). Those are cached as a slim tar; the full dmg + Apple's
+      # installer (~3 min) only run when that cache is missing.
+      - name: Restore slim KDK
+        id: kdkslim
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/kdk-slim.tar
+          key: kdk-slim-${{ env.KDK_BUILD }}-v1
+
+      - name: Restore KDK cache
+        id: kdkcache
+        if: steps.kdkslim.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-${{ env.KDK_BUILD }}
+
+      - name: Install KDK
+        id: kdk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo mkdir -p /Library/Developer/KDKs
+          if [ -f /tmp/kdk-slim.tar ]; then
+            sudo tar -xf /tmp/kdk-slim.tar -C /Library/Developer/KDKs
+          else
+            mkdir -p /tmp/kdk-cache
+            if ! ls /tmp/kdk-cache/*.dmg >/dev/null 2>&1; then
+              gh release download "$KDK_BUILD" -R dortania/KdkSupportPkg -p '*.dmg' -D /tmp/kdk-cache --clobber
+            fi
+            DMG=$(ls /tmp/kdk-cache/*.dmg | head -1)
+            hdiutil attach "$DMG" -nobrowse
+            PKG=$(echo /Volumes/Kernel*/KernelDebugKit.pkg)
+            sudo installer -pkg "$PKG" -target /
+            hdiutil detach "$(dirname "$PKG")" || true
+            K=$(basename "$(ls -d /Library/Developer/KDKs/KDK_*_${KDK_BUILD}.kdk | head -1)")
+            du -sh "/Library/Developer/KDKs/$K" || true
+            ls "/Library/Developer/KDKs/$K" "/Library/Developer/KDKs/$K/System/Library" || true
+            # whole KDK minus what the kernel build never reads: debug kernels, dSYMs, per-SoC closed libraries
+            (cd /Library/Developer/KDKs && sudo tar -cf /tmp/kdk-slim.tar --exclude '*.dSYM' \
+              --exclude "$K/System/Library/Kernels" --exclude '*.os.*.a' "$K")
+            sudo chown "$(id -u)" /tmp/kdk-slim.tar
+            # an empty/truncated slim KDK would silently drop headers from the kernel build: refuse it
+            SZ=$(stat -f%z /tmp/kdk-slim.tar)
+            echo "slim KDK: $SZ bytes"
+            if [ "$SZ" -lt 10000000 ]; then echo "slim KDK too small, not caching it"; rm -f /tmp/kdk-slim.tar; fi
+          fi
+          ls -la /tmp/kdk-slim.tar || true
+          [ -f /tmp/kdk-slim.tar ] && echo "slim_ok=1" >> "$GITHUB_OUTPUT"
+          FOUND=$(ls -d /Library/Developer/KDKs/KDK_*_${KDK_BUILD}.kdk | head -1)
+          test -d "$FOUND"
+          echo "KDKROOT=$FOUND" >> "$GITHUB_ENV"
+          echo "KDK: $FOUND"
+
+      - name: Save slim KDK
+        if: steps.kdkslim.outputs.cache-hit != 'true' && steps.kdk.outputs.slim_ok == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/kdk-slim.tar
+          key: kdk-slim-${{ env.KDK_BUILD }}-v1
+
+      - name: Save KDK cache
+        if: steps.kdkslim.outputs.cache-hit != 'true' && steps.kdkcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-${{ env.KDK_BUILD }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: xnu27-intel-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            xnu27-intel-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      # build.sh skips mig, the ctf tools, AvailabilityVersions, Libsystem/libsyscall headers, libplatform and
+      # libfirehose when they are already in dxb/fakeroot: keep that folder between runs (Xcode builds ccache can't
+      # cache). xnu's own headers are reinstalled every run (marker removed), and no old kernel is kept.
+      - name: Restore build tools
+        id: toolcache
+        uses: actions/cache/restore@v4
+        with:
+          path: dxb/fakeroot
+          key: xnu27-tools-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-v2
+
+      - name: Prepare cached tools
+        if: steps.toolcache.outputs.cache-hit == 'true'
+        run: |
+          rm -f dxb/fakeroot/.xnu_headers_installed
+          rm -f dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a   # macOS copy from older caches
+          rm -rf dxb/fakeroot/System/Library/Kernels
+          ls dxb/fakeroot/usr/local/bin | head -20
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }} CC=/tmp/ccache-bin/clang CXX=/tmp/ccache-bin/clang++
+        run: |
+          echo "KDKROOT=$KDKROOT"
+          ccache -z   # stats per run (the restored cache carries the old counters)
+          # the raw output is ~1 GB of warnings: keep it as an artifact, print only what matters
+          set +e
+          bash build.sh > "$GITHUB_WORKSPACE/build.log" 2>&1
+          rc=$?
+          set -e
+          B="$GITHUB_WORKSPACE/build.log"
+          echo "== build.sh exit $rc, $(wc -l < "$B") lines"
+          echo "== errors (unique):"
+          grep -a -o -E "(fatal )?error: .{0,200}" "$B" | grep -v -e "patch failed" -e "patch does not apply" | sort | uniq -c | sort -rn | head -80 || true
+          echo "== failing objects:"
+          grep -a -o -E '[*]{3} \[[^]]+\] Error [0-9]+' "$B" | sort | uniq -c | head -60 || true
+          echo "== linker:"
+          grep -a -B40 "linker command failed" "$B" | grep -a -v "ld: warning" | head -80 || true
+          echo "== last lines:"
+          grep -a -v "ld: warning" "$B" | tail -40
+          zstd -q -19 -T0 "$B" -o "$B.zst" || true
+          exit $rc
+
+      - name: ccache statistics
+        if: always()
+        run: |
+          ccache -sv
+          echo "== options ccache refused:"
+          grep -o -E "Compiler option [^ ]+ is unsupported|unsupported compiler option[^,]*" ccache.log 2>/dev/null | sort | uniq -c | sort -rn | head -20 || true
+
+      - name: Save build tools
+        if: success() && steps.toolcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: dxb/fakeroot
+          key: xnu27-tools-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-v2
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: xnu27-intel-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          # an iOS-configured kernel installs elsewhere: take it (and its .unstripped) from the build objects
+          if ! ls out/kernel.* >/dev/null 2>&1; then
+            cfg=$(echo "$KERNEL_CONFIG.$MACHINE_CONFIG" | tr A-Z a-z)
+            k=""
+            for c in "dxb/fakeroot/mach.$cfg" dxb/build/xnu.obj/*_SWEET/mach.$cfg "dxb/fakeroot/kernel.$cfg"; do
+              [ -e "$c" ] && { k=$c; break; }
+            done
+            echo "kernel found at: ${k:-none}"
+            if [ -n "$k" ]; then
+              cp -L "$k" "out/kernel.$cfg"
+              u=$(ls dxb/build/xnu.obj/*_SWEET/mach.$cfg.unstripped 2>/dev/null | head -1)
+              [ -n "$u" ] && cp -L "$u" "out/kernel.$cfg.unstripped" || true
+            fi
+          fi
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log.zst
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu27-intel-kernel
+          path: out/
+          if-no-files-found: warn

@@ -1,0 +1,57 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 9 Nov 2026 21:30:00 -0500
+Subject: [PATCH] op7t-0164: Wi-Fi: boot-arg sweetbdf= picks the board data file
+
+The Wi-Fi bars stayed grey while joined (2026-11-09). wifid's own log after
+a restart: "Join candidate 'Naja2025' is not allowed (error=1 'Below
+minimum RSSI threshold')", and every network scanned at -82..-94 dBm a
+few metres from the router (en0 answers RSSI -75 for the joined BSS).
+The conversion is ath10k's (SNR - 95); the radio itself hears too little.
+The firmware reports board id 0xff, so bdwlan.bin was loaded: a generic
+reference board data file, not the 7T's antenna/power calibration (also
+a likely reason the 2.4 GHz BSSID never answered auth, 0161).
+The modem partition has OnePlus's files for board ids 0x0a/0x0c, plain
+and with the prefixes 4/5/0/1 that OnePlus's driver picks by model.
+sweetbdf=FILE (e.g. sweetbdf=4bdwlan.b0a) loads image/FILE instead; a
+name that is not there falls back to the old choice. Logged as
+"wlfw: board id .., board data image/FILE (sweetbdf)".
+
+Apply after 0163.
+---
+diff --git a/iokit/Kernel/arm/SweetModem.cpp b/iokit/Kernel/arm/SweetModem.cpp
+index 54b48aa..de323ed 100644
+--- a/iokit/Kernel/arm/SweetModem.cpp
++++ b/iokit/Kernel/arm/SweetModem.cpp
+@@ -2409,6 +2409,24 @@ w_start_bdf(void)
+ 		return;
+ 	}
+ 	w_bdf_started = true;
++	/*
++	 * 0164: boot-arg sweetbdf=FILE (e.g. 4bdwlan.b0a) picks the board data in image/ by name. The 7T's
++	 * firmware reports board id 0xff, so bdwlan.bin was loaded: a generic reference file. With it every
++	 * network was heard at -82..-94 dBm a few metres from the router (2026-11-09: iOS refused to auto-join,
++	 * "Below minimum RSSI threshold", and showed the Wi-Fi bars grey), and the 2.4 GHz BSSID never answered
++	 * auth (0161). The modem partition has OnePlus's files for board ids 0x0a/0x0c, plain and with the
++	 * prefixes 4/5/0/1 that OnePlus's own driver chooses by model: which one the 7T wants is to be found
++	 * by trying them. A name that is not there falls back to the old choice.
++	 */
++	char want[32] = "";
++	if (PE_parse_boot_argn("sweetbdf", want, sizeof(want)) && want[0] != '\0') {
++		snprintf(name, sizeof(name), "image/%s", want);
++		if (fw_all_find(name) >= 0) {
++			LOG("wlfw: board id %x, board data %s (sweetbdf)", w_board, name);
++			goto chosen;
++		}
++		LOG("wlfw: sweetbdf=%s: no such file in image/, using the default", want);
++	}
+ 	if (w_board == 0xFF) {
+ 		snprintf(name, sizeof(name), "image/bdwlan.bin");
+ 	} else if (w_board < 0x100) {
+@@ -2416,6 +2434,7 @@ w_start_bdf(void)
+ 	} else {
+ 		snprintf(name, sizeof(name), "image/bdwlan.%03x", w_board);
+ 	}
++chosen:
+ 	w_bdf_fi = fw_all_find(name);
+ 	if (w_bdf_fi < 0) {
+ 		LOG("wlfw: %s missing, using bdwlan.bin", name);

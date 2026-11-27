@@ -1,0 +1,122 @@
+0021: print what the threads of a hung process wait on.
+
+Boot 27t: keybagd (keybag boot task) blocked 7+ minutes, no failing syscall, never reached AppleKeyStore.
+sweethangdump=SECONDS + sweetsystrace=NAMES: every 30 s print state, block hint, wait event, user pc/lr and the shared
+cache slide of each thread of those processes.
+
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1519,3 +1519,113 @@
+ 		return KERN_FAILURE;
+ 	}
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0021: what a hung process waits on. Boot 27t: keybagd (launchd's keybag boot task) blocked for 7+ minutes without
++ * a failing syscall and without reaching AppleKeyStore. Boot-arg sweethangdump=SECONDS: from that many seconds after
++ * boot, every 30 s (20 times) print each thread of the processes named in sweetsystrace=NAME[,NAME...]:
++ *   "HANG name[pid] tid T state S hint H wait E pc P lr L slide X"
++ * hint = block_hint (2 port receive, 3 port-set receive, 4 port send, 6 semaphore, 0xe condvar, 0x10 workloop...),
++ * pc/lr = user registers, slide = the shared cache slide (look the pc up in the cache at pc - slide).
++ */
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_shared_region_xnu.h>
++
++extern void proc_name_kdp(struct proc *p, char *buf, int size);
++
++static thread_call_t sweet_hang_call;
++static char sweet_hang_names[64];
++static unsigned sweet_hang_rounds;
++
++#define SWEET_HANG_NAME 33
++
++static bool
++sweet_hang_has(const char *name, const char *word)
++{
++	size_t n = strlen(word);
++	for (const char *c = name; *c; c++) {
++		if (strncmp(c, word, n) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++sweet_hang_match(const char *name)
++{
++	for (const char *w = sweet_hang_names; *w;) {
++		size_t len = 0;
++		while (w[len] && w[len] != ',') {
++			len++;
++		}
++		char word[SWEET_HANG_NAME];
++		if (len > 0 && len < sizeof(word)) {
++			memcpy(word, w, len);
++			word[len] = 0;
++			if (sweet_hang_has(name, word)) {
++				return true;
++			}
++		}
++		w += len + (w[len] == ',');
++	}
++	return false;
++}
++
++static void
++sweet_hang_dump(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	task_t task;
++	thread_t thread;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *bsd = get_bsdtask_info(task);
++		if (bsd == NULL) {
++			continue;
++		}
++		char name[SWEET_HANG_NAME] = "";
++		proc_name_kdp(bsd, name, sizeof(name));
++		if (!sweet_hang_match(name)) {
++			continue;
++		}
++		uint32_t slide = task->shared_region ? task->shared_region->sr_slide : 0;
++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
++			uint64_t pc = 0, lr = 0;
++			if (thread->machine.upcb != NULL) {
++				pc = get_saved_state_pc(thread->machine.upcb);
++				lr = get_saved_state_lr(thread->machine.upcb);
++			}
++			printf("HANG %s[%d] tid %llu state %#x hint %#x wait %#llx pc %#llx lr %#llx slide %#x\n", name,
++			    task_pid(task), thread->thread_id, thread->state, (unsigned)thread->block_hint,
++			    (unsigned long long)thread->wait_event, pc, lr, slide);
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	if (++sweet_hang_rounds < 20) {
++		uint64_t abs;
++		nanoseconds_to_absolutetime(30ull * NSEC_PER_SEC, &abs);
++		thread_call_enter_delayed(sweet_hang_call, mach_absolute_time() + abs);
++	}
++}
++
++static void
++sweet_hang_start(void)
++{
++	uint32_t secs = 0;
++	uint64_t abs;
++
++	if (!PE_parse_boot_argn("sweethangdump", &secs, sizeof(secs)) || secs == 0 ||
++	    !PE_parse_boot_argn("sweetsystrace", sweet_hang_names, sizeof(sweet_hang_names)) || !sweet_hang_names[0]) {
++		return;
++	}
++	sweet_hang_call = thread_call_allocate_with_options(sweet_hang_dump, NULL, THREAD_CALL_PRIORITY_KERNEL,
++	    THREAD_CALL_OPTIONS_ONCE);
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &abs);
++	thread_call_enter_delayed(sweet_hang_call, mach_absolute_time() + abs);
++	printf("HOTDOGB: hang dump of '%s' from %u s\n", sweet_hang_names, secs);
++}
++STARTUP(THREAD_CALL, STARTUP_RANK_LAST, sweet_hang_start);
++#endif /* ARM64_BOARD_CONFIG_SWEET */

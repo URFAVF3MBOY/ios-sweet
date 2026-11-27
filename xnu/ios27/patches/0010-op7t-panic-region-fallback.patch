@@ -1,0 +1,39 @@
+0010: a panic log buffer when the bootloader has no panic region.
+
+Boot 27f ended in "Nested panic count exceeds limit 5": launchd exited (proc_prepareexit panic), then every nested
+panic hit pe_init.c:722 assert(panic_info) because the ADT has no /pram, so the first panic string scrolled away.
+
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -138,6 +138,21 @@
+ 	uintptr_t const *reg_prop;
+ 	uint32_t const *panic_region_length;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: the bootloader has no iBoot panic region (/pram, embedded-panic-log-size). Without one panic_info stays
++	 * NULL and every panic nests on the assert in PE_update_panicheader_nestedpanic(), which hides the first panic
++	 * string (boot 27f: launchd exited, then "Nested panic count exceeds limit"). Use a kernel buffer instead; it does
++	 * not survive a reset, but the panic text reaches the screen intact.
++	 */
++	static uint8_t sweet_panic_region[64 * 1024] __attribute__((aligned(64)));
++	if (kSuccess != SecureDTLookupEntry(0, "pram", &entry)) {
++		gPanicBase = (vm_offset_t)sweet_panic_region;
++		gPanicSize = sizeof(sweet_panic_region);
++		panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);
++		goto sweet_panic_region_set;
++	}
++#endif
+ 	/*
+ 	 * DT properties for the panic region are populated by UpdateDeviceTree() in iBoot:
+ 	 *
+@@ -189,6 +204,9 @@
+ 	}
+ #endif /* DEVELOPMENT && defined(XNU_TARGET_OS_BRIDGE) */
+ 
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(PLATFORM_PANIC_LOG_PADDR)
++sweet_panic_region_set:
+ #endif
+ 	panic_info = (struct embedded_panic_header *)gPanicBase;
+ 

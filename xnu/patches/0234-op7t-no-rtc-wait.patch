@@ -1,0 +1,34 @@
+0234: skip IOKitInitializeTime's 30 s wait for an IORTC that the 7T does not have (boot-arg sweetrtcwait=SECONDS).
+
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 0f71f63..2da01a0 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -79,9 +79,27 @@ IOKitInitializeTime( void )
+ 
+ // RTC is not present on this target
+ #ifndef BCM2837
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0234: the 7T has no IORTC driver either, so this wait always ran its full 30 s (seen 2026-11-20 in a
++	 * boot log with msgbuf=1048576: "MAC Framework successfully initialized" ... 30.0 s ... "clock_initialize_calendar").
++	 * Skipped, as for BCM2837; boot-arg sweetrtcwait=SECONDS brings a wait back.
++	 */
++	{
++		uint32_t wait = 0;
++
++		(void) PE_parse_boot_argn("sweetrtcwait", &wait, sizeof(wait));
++		if (wait != 0) {
++			t.tv_sec = wait;
++			IOService::waitForService(
++				IOService::resourceMatching("IORTC"), &t );
++		}
++	}
++#else
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );

@@ -1,0 +1,96 @@
+0026: one-time repair of the /var link on the flashed iOS 27 root.
+
+Catalog read from TWRP (2026-11-26): /var on userdata is an empty directory, not var -> private/var. The root
+builder's tar step put it there (fixed for new images in commit 5d39f88). Every /var/... path is ENOENT and tzinit
+exits 2 (boots 28g-28i).
+- vfs_syscalls.c: sweet_fix_var_link() with boot-arg sweetfixvar=1: if /var is a directory and /private/var is
+  one too, rmdir /var (refused if not empty), symlink private/var -> /var, sync the root, log "SWEET FIXVAR: ...".
+- bsd_init.c: called from bsdinit_task() before launchd is loaded.
+
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1105,6 +1105,12 @@
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		extern void sweet_fix_var_link(void);
++		sweet_fix_var_link();           /* 0026, boot-arg sweetfixvar=1 */
++	}
++#endif
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -10898,6 +10898,69 @@
+ 	           CAST_USER_ADDR_T(uap->path), UIO_USERSPACE, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0026: one-time repair of the root's /var link, boot-arg sweetfixvar=1, called from bsdinit_task() before
++ * launchd. The first iOS 27 root (tools/mkios27root.sh before commit 5d39f88) has an empty directory at /var
++ * instead of the link var -> private/var (the bootstrap's tar entry "./var/" missed the --transform), so every
++ * /var/... path is ENOENT and tzinit exits 2 (boots 28g-28i; catalog read from TWRP: /var cnid 526621, valence 0).
++ * Only acts when /var is a directory and /private/var is one too; rmdir refuses a non-empty /var.
++ */
++void sweet_fix_var_link(void);
++
++void
++sweet_fix_var_link(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("sweetfixvar", &on, sizeof(on)) || !on) {
++		return;
++	}
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup("/var", VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		printf("SWEET FIXVAR: lookup /var: %d\n", error);
++		return;
++	}
++	enum vtype t = vnode_vtype(vp);
++	vnode_put(vp);
++	if (t != VDIR) {
++		printf("SWEET FIXVAR: /var is type %d, nothing to do\n", (int)t);
++		return;
++	}
++	error = vnode_lookup("/private/var", VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		printf("SWEET FIXVAR: lookup /private/var: %d, leaving /var alone\n", error);
++		return;
++	}
++	t = vnode_vtype(vp);
++	vnode_put(vp);
++	if (t != VDIR) {
++		printf("SWEET FIXVAR: /private/var is type %d, leaving /var alone\n", (int)t);
++		return;
++	}
++	error = rmdirat_internal(ctx, AT_FDCWD, CAST_USER_ADDR_T("/var"), UIO_SYSSPACE, 0);
++	if (error) {
++		printf("SWEET FIXVAR: rmdir /var: %d\n", error);
++		return;
++	}
++	error = symlinkat_internal(ctx, CAST_USER_ADDR_T("private/var"), AT_FDCWD, CAST_USER_ADDR_T("/var"),
++	    UIO_SYSSPACE);
++	if (error) {
++		printf("SWEET FIXVAR: symlink private/var -> /var: %d (/var is now missing)\n", error);
++		return;
++	}
++	VFS_SYNC(vnode_mount(rootvnode), MNT_WAIT, ctx);
++	error = vnode_lookup("/var/db/timezone", 0, &vp, ctx);
++	if (error == 0) {
++		t = vnode_vtype(vp);
++		vnode_put(vp);
++	}
++	printf("SWEET FIXVAR: /var is now the link to private/var; /var/db/timezone: err %d type %d\n", error,
++	    error ? 0 : (int)t);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /* Get direntry length padded to 8 byte alignment */
+ #define DIRENT64_LEN(namlen) \
+ 	((sizeof(struct direntry) + (namlen) - (MAXPATHLEN-1) + 7) & ~7)

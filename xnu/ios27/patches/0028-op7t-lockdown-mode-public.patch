@@ -1,0 +1,36 @@
+0028: security.mac.lockdown_mode_state_public for iOS 27.
+
+Boot 28l: launchd aborts right after "Early boot complete": abort <- libsystem_darwin dispatch_once (block at unslid
+0x23c542260) <- os_lockdown_mode_enabled+44 <- launchd, after a name-to-OID sysctl lookup fails with ENOENT. iOS 27
+asks for security.mac.lockdown_mode_state_public (u64); xnu-12377 has only lockdown_mode_state (name from
+ios-guacamole's notes, same address on the 7 Pro).
+- lockdown_mode.c: read-only u64 sysctl with the same value.
+
+--- a/bsd/kern/lockdown_mode.c
++++ b/bsd/kern/lockdown_mode.c
+@@ -40,6 +40,25 @@
+ SYSCTL_DECL(_security_mac);
+ SYSCTL_INT(_security_mac, OID_AUTO, lockdown_mode_state, CTLFLAG_RD | CTLFLAG_LOCKED, &lockdown_mode_state, 0, "Lockdown Mode state");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0028: iOS 27's libsystem_darwin asks for security.mac.lockdown_mode_state_public (a 64-bit value) in the
++ * dispatch_once of os_lockdown_mode_enabled() and aborts the caller when the name does not exist. xnu-12377 only
++ * has lockdown_mode_state. Boot 28l: launchd SIGABRT right after "Early boot complete" (sampler backtrace:
++ * abort <- os_lockdown_mode_enabled+44 <- launchd). Same value, read-only, readable by anybody.
++ */
++static int
++sweet_lockdown_mode_state_public SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t v = lockdown_mode_state ? 1 : 0;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_security_mac, OID_AUTO, lockdown_mode_state_public,
++    CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, NULL, 0,
++    sweet_lockdown_mode_state_public, "Q", "Lockdown Mode state, 64-bit (iOS 27 libsystem_darwin)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ __startup_func
+ void
+ lockdown_mode_init(void)

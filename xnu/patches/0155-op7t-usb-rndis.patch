@@ -1,0 +1,634 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Sun, 8 Nov 2026 06:00:00 -0500
+Subject: [PATCH] op7t-0155: USB RNDIS (sweetusb=3) so Windows can reach the phone without a driver
+
+The USB gadget is CDC ECM (sweetusb=2), which Linux and macOS drive in the
+box but Windows does not. sweetusb=3 runs the same data path as RNDIS, which
+Windows has built in ("Remote NDIS Compatible Device"):
+
+ - descriptors: device class 0xef/2/1 with an IAD, comm interface 0xe0/1/3
+   (what Windows matches), interrupt 0x82, data interface with bulk 0x81/0x01.
+   PID 0x0002 (ECM stays 0x0001) so a Windows that cached a failed
+   1209:0001 install starts clean.
+ - ep0: SEND_ENCAPSULATED_COMMAND now has an OUT data stage (up to 448
+   bytes); GET_ENCAPSULATED_RESPONSE answers it; the interrupt endpoint
+   carries an 8-byte RESPONSE_AVAILABLE per response.
+ - messages: INITIALIZE, QUERY (the OIDs Windows asks for: addresses, link
+   speed, media state, statistics, supported list), SET (packet filter,
+   lookahead, multicast list, power), RESET, KEEPALIVE, HALT.
+ - data: every bulk transfer is one RNDIS_PACKET_MSG (44-byte header, then
+   the Ethernet frame); the 512-byte pad byte of ECM goes inside the message.
+ - the link (frames to the host, live log, SIOCGIFMEDIA) comes up when the
+   host sets a non-zero packet filter, goes down on a bus reset.
+ - ECM (sweetusb=2) behaves exactly as before.
+
+Same ue0 and 192.168.7.2/24. Host: give the new adapter 192.168.7.1/24,
+then ssh root@192.168.7.2. The phone must not be bound in usbipd (a bound
+device gets usbipd's driver, not RNDIS).
+
+Apply after 0154.
+---
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 302c8b2..7618ff4 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,7 @@
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t thread_terminate(thread_t);
+ static vm_offset_t ud_start_dwc;
++static bool ud_rndis;                   /* 0155: sweetusb=3, RNDIS instead of CDC ECM (Windows) */
+ static void ud_start_thread(void *arg, wait_result_t wr);
+ extern int sweet_smmu_bypass(uint32_t sid);    /* sweet_smmu.c, 0133 */
+ extern int sweet_smmu_identity(uint32_t sid);  /* sweet_smmu.c, 0138 */
+@@ -86,7 +87,7 @@
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device (CDC ECM), 3 RNDIS (0155) */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+@@ -123,6 +124,7 @@
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
++		ud_rndis = (enabled == 3);      /* 0155 */
+ 		/*
+ 		 * OnePlus 7T (0092): not here. The probe runs inside the storage driver's init, before the
+ 		 * persistent log saves anything, and on the 7T the start-up below sent the phone to
+@@ -252,6 +254,9 @@
+ 	mbuf_t      txq[UD_TXQ];
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
++	bool        rndis_up;       /* 0155: host set a packet filter: data may flow */
++	bool        rn_cmd;         /* 0155: ep0 OUT data stage carries an RNDIS command */
++	uint32_t    out_trb_len;    /* 0155: ep0 OUT data TRB length */
+ 	uint64_t    rx_frames, tx_frames;
+ } ud;
+ 
+@@ -393,6 +398,304 @@
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
++/*
++ * 0155: sweetusb=3 -- the same data path as the CDC ECM function, but spoken as RNDIS, which
++ * Windows has in the box ("Remote NDIS Compatible Device", usbrndis6, matched by the interface
++ * class 0xe0/0x01/0x03 inside an IAD). Same endpoints (bulk 0x01/0x81, interrupt 0x82), same ue0
++ * and 192.168.7.2/24; the host side is a static 192.168.7.1/24 on the new Windows adapter.
++ *   - control: SEND_ENCAPSULATED_COMMAND (0x21/0x00, OUT data) takes an RNDIS message, the answer
++ *     waits in rn_resp until GET_ENCAPSULATED_RESPONSE (0xa1/0x01); the interrupt endpoint gets an
++ *     8-byte RESPONSE_AVAILABLE notification for it.
++ *   - messages: INITIALIZE, QUERY, SET, RESET, KEEPALIVE, HALT (RNDIS 1.0 as in Linux rndis.c).
++ *   - data: every bulk transfer carries one RNDIS_PACKET_MSG: a 44-byte header, then the frame.
++ *   - the link is "up" (frames are sent) once the host has set a non-zero packet filter.
++ * PID 0x0002 (ECM keeps 0x0001) so a Windows that cached a failed 1209:0001 install starts clean.
++ */
++static const uint8_t ud_dev_desc_rndis[18] = {
++	18, 1, 0x00, 0x02, 0xef, 0x02, 0x01, 64,        /* class: miscellaneous, IAD */
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_cfg_desc_rndis[75] = {
++	9, 2, 75, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	8, 0x0b, 0, 2, 0xe0, 0x01, 0x03, 0,             /* IAD: interfaces 0-1, wireless controller / RNDIS */
++	9, 4, 0, 0, 1, 0xe0, 0x01, 0x03, 0,             /* comm interface 0: RNDIS, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                         /* call management, data on interface 1 */
++	4, 0x24, 0x02, 0x00,                            /* ACM */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 8, 0, 5,                      /* ep 0x82 interrupt IN, 8 bytes, 2^(5-1) uframes */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++/* RNDIS reports the HOST adapter's address: the same one the ECM descriptor gives (phone is ..:02). */
++static const uint8_t ud_host_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
++
++/* RNDIS-PURE-BEGIN */
++#define UD_RN_CMD_MAX           448
++#define RN_PKT_HDR              44
++#define RN_PACKET_MSG           0x00000001u
++#define RN_INITIALIZE           0x00000002u
++#define RN_HALT                 0x00000003u
++#define RN_QUERY                0x00000004u
++#define RN_SET                  0x00000005u
++#define RN_RESET                0x00000006u
++#define RN_KEEPALIVE            0x00000008u
++#define RN_CMPLT                0x80000000u
++#define RN_ST_OK                0x00000000u
++#define RN_ST_NOT_SUPPORTED     0xc00000bbu
++#define RN_ST_INVALID_DATA      0xc0010015u
++
++static uint8_t rn_resp[512];
++static uint32_t rn_resp_len;
++static bool rn_notify_more;
++static uint32_t rn_filter;
++
++static uint32_t
++rn_get(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++rn_put(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++
++/* OID_* query: the value into d (at most max bytes); its length, or -1 = not supported. */
++static int
++rn_query(uint32_t oid, uint8_t *d, uint32_t max)
++{
++	static const uint32_t supported[] = {
++		0x00010101, 0x00010102, 0x00010103, 0x00010104, 0x00010105, 0x00010106, 0x00010107,
++		0x00010108, 0x00010109, 0x0001010a, 0x0001010b, 0x0001010c, 0x0001010d, 0x0001010e,
++		0x0001010f, 0x00010110, 0x00010111, 0x00010112, 0x00010113, 0x00010114, 0x00010115,
++		0x00010116, 0x00020101, 0x00020102, 0x00020103, 0x00020104, 0x00020105,
++		0x01010101, 0x01010102, 0x01010103, 0x01010104, 0x01010105,
++		0x01020101, 0x01020102, 0x01020103,
++	};
++	uint32_t v = 0;
++
++	if (max < 16) {
++		return -1;
++	}
++	switch (oid) {
++	case 0x00010101:                                /* GEN_SUPPORTED_LIST */
++		if (sizeof(supported) > max) {
++			return -1;
++		}
++		for (unsigned i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
++			rn_put(d + 4 * i, supported[i]);
++		}
++		return (int)sizeof(supported);
++	case 0x00010102: v = 0; break;                  /* HARDWARE_STATUS: ready */
++	case 0x00010103: v = 0; break;                  /* MEDIA_SUPPORTED: 802.3 */
++	case 0x00010104: v = 0; break;                  /* MEDIA_IN_USE: 802.3 */
++	case 0x00010105: v = 1500; break;               /* MAXIMUM_LOOKAHEAD */
++	case 0x00010106: v = 1500; break;               /* MAXIMUM_FRAME_SIZE */
++	case 0x00010107: v = 4800000; break;            /* LINK_SPEED, 100 bit/s units = 480 Mbit/s */
++	case 0x00010108: v = 0x10000; break;            /* TRANSMIT_BUFFER_SPACE */
++	case 0x00010109: v = 0x10000; break;            /* RECEIVE_BUFFER_SPACE */
++	case 0x0001010a: v = 1514; break;               /* TRANSMIT_BLOCK_SIZE */
++	case 0x0001010b: v = 1514; break;               /* RECEIVE_BLOCK_SIZE */
++	case 0x0001010c: v = 0x1209; break;             /* VENDOR_ID */
++	case 0x0001010d:                                /* VENDOR_DESCRIPTION (ASCII, NUL-terminated) */
++		memcpy(d, "ios-sweet", 10);
++		return 10;
++	case 0x0001010e: v = rn_filter; break;          /* CURRENT_PACKET_FILTER */
++	case 0x0001010f: v = 1500; break;               /* CURRENT_LOOKAHEAD */
++	case 0x00010110: v = 1; break;                  /* DRIVER_VERSION */
++	case 0x00010111: v = RN_PKT_HDR + 1514; break;  /* MAXIMUM_TOTAL_SIZE */
++	case 0x00010112: v = 0; break;                  /* PROTOCOL_OPTIONS */
++	case 0x00010113: v = 0x804; break;              /* MAC_OPTIONS: receive serialized, full duplex */
++	case 0x00010114: v = 0; break;                  /* MEDIA_CONNECT_STATUS: connected */
++	case 0x00010115: v = 1; break;                  /* MAXIMUM_SEND_PACKETS */
++	case 0x00010116: v = 0; break;                  /* VENDOR_DRIVER_VERSION */
++	case 0x00010202: v = 0; break;                  /* PHYSICAL_MEDIUM: unspecified */
++	case 0x00020101: v = (uint32_t)ud.tx_frames; break;     /* XMIT_OK */
++	case 0x00020102: v = (uint32_t)ud.rx_frames; break;     /* RCV_OK */
++	case 0x00020103: case 0x00020104: case 0x00020105:      /* XMIT_ERROR, RCV_ERROR, RCV_NO_BUFFER */
++		v = 0;
++		break;
++	case 0x01010101:                                /* 802_3_PERMANENT_ADDRESS */
++	case 0x01010102:                                /* 802_3_CURRENT_ADDRESS */
++		memcpy(d, ud_host_mac, 6);
++		return 6;
++	case 0x01010103:                                /* 802_3_MULTICAST_LIST: none */
++		return 0;
++	case 0x01010104: v = 32; break;                 /* 802_3_MAXIMUM_LIST_SIZE */
++	case 0x01010105: v = 0; break;                  /* 802_3_MAC_OPTIONS */
++	case 0x01020101: case 0x01020102: case 0x01020103:
++		v = 0;
++		break;
++	default:
++		return -1;
++	}
++	rn_put(d, v);
++	return 4;
++}
++
++/* One RNDIS control message in (len bytes); the answer into out (max bytes); its length, 0 = none. */
++static uint32_t
++rn_handle(const uint8_t *in, uint32_t len, uint8_t *out, uint32_t max)
++{
++	uint32_t type, mlen, reqid, status, total;
++
++	if (len < 12 || max < 52) {
++		return 0;
++	}
++	type = rn_get(in);
++	mlen = rn_get(in + 4);
++	if (mlen < 12 || mlen > len) {
++		return 0;
++	}
++	reqid = rn_get(in + 8);
++	bzero(out, 52);
++	switch (type) {
++	case RN_INITIALIZE:
++		if (mlen < 24) {
++			return 0;
++		}
++		rn_filter = 0;
++		rn_put(out, RN_INITIALIZE | RN_CMPLT);
++		rn_put(out + 4, 52);
++		rn_put(out + 8, reqid);
++		rn_put(out + 12, RN_ST_OK);
++		rn_put(out + 16, 1);                    /* major */
++		rn_put(out + 20, 0);                    /* minor */
++		rn_put(out + 24, 1);                    /* DeviceFlags: connectionless */
++		rn_put(out + 28, 0);                    /* Medium: 802.3 */
++		rn_put(out + 32, 1);                    /* MaxPacketsPerMessage */
++		rn_put(out + 36, UD_FRAME_MAX);         /* MaxTransferSize = the receive buffer */
++		rn_put(out + 40, 2);                    /* PacketAlignmentFactor: 4 bytes */
++		return 52;
++	case RN_QUERY: {
++		int n;
++		if (mlen < 28) {
++			return 0;
++		}
++		n = rn_query(rn_get(in + 12), out + 24, max - 24);
++		total = n < 0 ? 24 : 24 + (uint32_t)n;
++		rn_put(out, RN_QUERY | RN_CMPLT);
++		rn_put(out + 4, total);
++		rn_put(out + 8, reqid);
++		rn_put(out + 12, n < 0 ? RN_ST_NOT_SUPPORTED : RN_ST_OK);
++		rn_put(out + 16, n < 0 ? 0 : (uint32_t)n);
++		rn_put(out + 20, n <= 0 ? 0 : 16);      /* offset from byte 8 */
++		return total;
++	}
++	case RN_SET: {
++		uint32_t oid, ilen, ioff;
++		status = RN_ST_OK;
++		if (mlen < 28) {
++			status = RN_ST_INVALID_DATA;
++		} else {
++			oid = rn_get(in + 12);
++			ilen = rn_get(in + 16);
++			ioff = rn_get(in + 20) + 8;
++			if (ioff > mlen || ilen > mlen - ioff) {
++				status = RN_ST_INVALID_DATA;
++			} else if (oid == 0x0001010e) {         /* CURRENT_PACKET_FILTER */
++				if (ilen >= 4) {
++					rn_filter = rn_get(in + ioff);
++				} else {
++					status = RN_ST_INVALID_DATA;
++				}
++			} else if (oid == 0x0001010f || oid == 0x01010103 || oid == 0xfd010101) {
++				/* CURRENT_LOOKAHEAD, 802_3_MULTICAST_LIST, PNP_SET_POWER: accepted */
++			} else {
++				status = RN_ST_NOT_SUPPORTED;
++			}
++		}
++		rn_put(out, RN_SET | RN_CMPLT);
++		rn_put(out + 4, 16);
++		rn_put(out + 8, reqid);
++		rn_put(out + 12, status);
++		return 16;
++	}
++	case RN_RESET:
++		rn_filter = 0;
++		rn_put(out, RN_RESET | RN_CMPLT);
++		rn_put(out + 4, 16);
++		rn_put(out + 8, RN_ST_OK);
++		rn_put(out + 12, 1);                    /* AddressingReset */
++		return 16;
++	case RN_KEEPALIVE:
++		rn_put(out, RN_KEEPALIVE | RN_CMPLT);
++		rn_put(out + 4, 16);
++		rn_put(out + 8, reqid);
++		rn_put(out + 12, RN_ST_OK);
++		return 16;
++	case RN_HALT:
++		rn_filter = 0;
++		return 0;
++	default:
++		return 0;
++	}
++}
++/* RNDIS-PURE-END */
++
++static void ud_tx_kick_locked(void);
++static void ud_link_event(bool up);
++
++/* Frames may flow: ECM after SET_INTERFACE/SET_CONFIGURATION, RNDIS once the host set a packet filter. */
++static inline bool
++ud_tx_ready(void)
++{
++	return ud.configured && (!ud_rndis || ud.rndis_up);
++}
++
++/* RESPONSE_AVAILABLE on the interrupt endpoint (one at a time; a second one waits for the first). */
++static void
++ud_rn_notify(void)
++{
++	if (ud_active[EP_INT]) {
++		rn_notify_more = true;
++		return;
++	}
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	bzero(n, 8);
++	n[0] = 1;
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++static void
++ud_rndis_command(const uint8_t *cmd, uint32_t len)
++{
++	static uint8_t local[UD_RN_CMD_MAX];
++	static unsigned logged;
++	uint32_t type, n;
++	bool up, changed;
++
++	if (len < 12) {
++		return;
++	}
++	memcpy(local, cmd, len);
++	type = rn_get(local);
++	n = rn_handle(local, len, rn_resp, sizeof(rn_resp));
++	if (logged++ < 60) {
++		printf("HOTDOGB USB: rndis msg 0x%x (%u bytes) oid 0x%x -> %u bytes\n", type, len,
++		    len >= 16 ? rn_get(local + 12) : 0, n);
++	}
++	up = rn_filter != 0;
++	lck_mtx_lock(ud.lock);
++	changed = ud.rndis_up != up;
++	ud.rndis_up = up;
++	if (up) {
++		ud_tx_kick_locked();
++	}
++	lck_mtx_unlock(ud.lock);
++	if (changed) {
++		printf("HOTDOGB USB: rndis link %s (packet filter 0x%x)\n", up ? "up" : "down", rn_filter);
++		ud_link_event(up);
++	}
++	if (n != 0) {
++		rn_resp_len = n;
++		ud_rn_notify();
++	}
++}
++
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+ {
+@@ -403,7 +706,7 @@
+ 	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
+ 		return 0;
+ 	}
+-	const char *str = ud_strings[idx];
++	const char *str = (ud_rndis && idx == 2) ? "Sweet iOS (USB RNDIS)" : ud_strings[idx];
+ 	uint32_t n = 2;
+ 	for (; *str && n < 126; str++) {
+ 		out[n++] = (uint8_t)*str;
+@@ -442,8 +745,8 @@
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
+-	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | ((ud_rndis ? 8u : 16u) << 3) | (2u << 17),
++	    (1u << 8) | ((ud_rndis ? 4u : 8u) << 16) | ((uint32_t)EP_INT << 25), 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("HOTDOGB USB: data endpoints setup failed\n");
+ 		return;
+@@ -454,7 +757,7 @@
+ 	ud_tx_kick_locked();                    /* 0151: whatever was queued meanwhile goes now */
+ 	lck_mtx_unlock(ud.lock);
+ 	ud_rx_arm();
+-	printf("HOTDOGB USB: ECM endpoints configured\n");
++	printf("HOTDOGB USB: %s endpoints configured\n", ud_rndis ? "RNDIS" : "ECM");
+ }
+ 
+ static void
+@@ -471,14 +774,37 @@
+ 
+ 	printf("HOTDOGB USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
++	ud.out_trb_len = 64;
++	ud.rn_cmd = false;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++		if (ud_rndis && req == 0x00 && !ud.data_in) {           /* SEND_ENCAPSULATED_COMMAND */
++			ok = (length >= 8 && length <= UD_RN_CMD_MAX);
++			ud.rn_cmd = ok;
++			ud.out_trb_len = ((uint32_t)length + 63u) & ~63u;
++		} else if (ud_rndis && req == 0x01 && ud.data_in) {     /* GET_ENCAPSULATED_RESPONSE */
++			if (rn_resp_len != 0) {
++				memcpy(data, rn_resp, rn_resp_len);
++				n = rn_resp_len;
++				rn_resp_len = 0;
++			} else {
++				data[0] = 0;
++				n = 1;
++			}
++		} else {
++			ok = (length == 0);
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1:
++			if (ud_rndis) { memcpy(data, ud_dev_desc_rndis, sizeof(ud_dev_desc_rndis)); n = sizeof(ud_dev_desc_rndis); }
++			else { memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); }
++			break;
++		case 2:
++			if (ud_rndis) { memcpy(data, ud_cfg_desc_rndis, sizeof(ud_cfg_desc_rndis)); n = sizeof(ud_cfg_desc_rndis); }
++			else { memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); }
++			break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -524,7 +850,7 @@
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		ud_start(0, UD_DATA, ud.out_trb_len, TRBCTL_DATA);      /* OUT data: only RNDIS commands (0155) */
+ 	}
+ }
+ 
+@@ -536,13 +862,10 @@
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
++/* One received Ethernet frame (at frame, len bytes) up the stack as ue0 input. */
+ static void
+-ud_rx_done(void)
++ud_rx_frame(const void *frame, uint32_t len)
+ {
+-	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+-	ud_sync(UD_TRB_RX, 16);
+-	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+-	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -554,7 +877,7 @@
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			memcpy(mbuf_data(m), frame, len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -570,6 +893,34 @@
+ 			mbuf_freem(m);
+ 		}
+ 	}
++}
++
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (!ud_rndis) {
++		ud_rx_frame((const void *)(ud.dma + UD_RX), len);
++	} else {
++		/* 0155: RNDIS_PACKET_MSG(s): [44-byte header][Ethernet frame] */
++		const uint8_t *p = (const uint8_t *)(ud.dma + UD_RX);
++		uint32_t off = 0, doff, dlen;
++		while (off + RN_PKT_HDR <= len) {
++			uint32_t mlen = rn_get(p + off + 4);
++			if (rn_get(p + off) != RN_PACKET_MSG || mlen < RN_PKT_HDR || off + mlen > len) {
++				break;
++			}
++			doff = rn_get(p + off + 8) + 8;
++			dlen = rn_get(p + off + 12);
++			if (doff >= RN_PKT_HDR && doff + dlen <= mlen) {
++				ud_rx_frame(p + off + doff, dlen);
++			}
++			off += mlen;
++		}
++	}
+ 	ud_rx_arm();
+ }
+ 
+@@ -577,7 +928,7 @@
+ static void
+ ud_tx_kick_locked(void)
+ {
+-	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++	while (!ud.tx_busy && ud.txq_count > 0 && ud_tx_ready()) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+ 		ud.txq_count--;
+@@ -586,12 +937,29 @@
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+-		mbuf_freem(m);
+-		/* A frame of a multiple of 512 bytes would need a zero-length
+-		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		if (ud_rndis) {
++			/* 0155: RNDIS_PACKET_MSG header, then the frame; the pad byte is inside the message. */
++			uint8_t *tx = (uint8_t *)(ud.dma + UD_TX);
++			uint32_t total = RN_PKT_HDR + (uint32_t)len;
++			if ((total % 512) == 0) {
++				total++;
++			}
++			bzero(tx, total);
++			rn_put(tx, RN_PACKET_MSG);
++			rn_put(tx + 4, total);
++			rn_put(tx + 8, RN_PKT_HDR - 8);
++			rn_put(tx + 12, (uint32_t)len);
++			mbuf_copydata(m, 0, len, tx + RN_PKT_HDR);
++			mbuf_freem(m);
++			len = total;
++		} else {
++			mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++			mbuf_freem(m);
++			/* A frame of a multiple of 512 bytes would need a zero-length
++			 * packet to end it; one pad byte does the same (IP ignores it). */
++			if ((len % 512) == 0) {
++				((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++			}
+ 		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+@@ -603,7 +971,7 @@
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
+-	if (ud.txq_count == UD_TXQ || !ud.configured) {
++	if (ud.txq_count == UD_TXQ || !ud_tx_ready()) {
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+@@ -642,9 +1010,9 @@
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+ 		int media = IFM_ETHER | IFM_AUTO;
+ 		ifmr->ifm_current = media;
+-		ifmr->ifm_active = ud.configured ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		ifmr->ifm_active = ud_tx_ready() ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
+ 		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID | (ud.configured ? IFM_ACTIVE : 0);
++		ifmr->ifm_status = IFM_AVALID | (ud_tx_ready() ? IFM_ACTIVE : 0);
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+ 			ifmr->ifm_count = 1;
+ 			return copyout(&media, list, sizeof(media));
+@@ -778,6 +1146,10 @@
+ 	 */
+ 	lck_mtx_lock(ud.lock);
+ 	ud.configured = false;
++	ud.rndis_up = false;            /* 0155 */
++	rn_resp_len = 0;
++	rn_notify_more = false;
++	rn_filter = 0;
+ 	ud.tx_busy = false;
+ 	unsigned dropped = ud.txq_count;
+ 	while (ud.txq_count > 0) {
+@@ -839,6 +1211,10 @@
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	if (ud_rndis && ep == EP_INT && type == 1 && rn_notify_more) {
++		rn_notify_more = false;         /* 0155: a response arrived while the last notification was in flight */
++		ud_rn_notify();
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -855,6 +1231,14 @@
+ 			ud_setup();
+ 			break;
+ 		case EP0_DATA:
++			if (ud.rn_cmd) {        /* 0155: the RNDIS command is in; answer it */
++				volatile uint32_t *ot = (volatile uint32_t *)(ud.dma + UD_TRB_OUT);
++				ud_sync(UD_TRB_OUT, 16);
++				uint32_t got = ud.out_trb_len - (ot[2] & 0xffffff);
++				ud_sync(UD_DATA, 512);
++				ud.rn_cmd = false;
++				ud_rndis_command((const uint8_t *)(ud.dma + UD_DATA), got > UD_RN_CMD_MAX ? UD_RN_CMD_MAX : got);
++			}
+ 			ud.state = EP0_WAIT_STATUS3;
+ 			break;
+ 		case EP0_STATUS:
+@@ -925,7 +1309,7 @@
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured) {
++		if (!ud_tx_ready()) {
+ 			continue;
+ 		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+@@ -984,7 +1368,7 @@
+ 	PE_parse_boot_argn("sweetusbdelay", &wait_s, sizeof(wait_s));
+ 	PE_parse_boot_argn("sweetusbstep", &ud_max_step, sizeof(ud_max_step));
+ 	PE_parse_boot_argn("sweetusbslow", &ud_slow, sizeof(ud_slow));
+-	printf("HOTDOGB USB: start-up in %d s\n", wait_s);
++	printf("HOTDOGB USB: mode %s, start-up in %d s\n", ud_rndis ? "RNDIS (Windows)" : "CDC ECM", wait_s);
+ 	for (int s = 0; s < wait_s; s++) {
+ 		delay(1000 * 1000);
+ 	}

@@ -1,0 +1,77 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Thu, 12 Nov 2026 19:45:00 -0500
+Subject: [PATCH] op7t-0222: an empty IOAcceleratorES (Safari's 30 s first page)
+
+0221 booted: no more NECP delegation refusals, but Safari's first page
+still arrived 30.60 s / 30.43 s late. Spindump 10 s into the black
+(logs/spin0221): the WebKit GPU process's "RemoteRenderingBackend work
+queue" waits on thread "CA::CG::Queue", which is in QuartzCore's
+___CAMetalContextCreate_block_invoke (called from
+CA::CG::AccelRenderer::acquire <- CA::CG::ContextDelegate::operation_).
+That block (16.5 20F66, 0x1885356b8) matches IOServices of class
+"IOAcceleratorES" -- a real iPhone's GPU driver -- and retries 300 times
+with usleep(100000): up to 30 s, then gives up on Metal. Our kernel has
+no such service.
+
+RedwoodGPU.cpp now also publishes an empty IOAcceleratorES on the platform
+(no user client, no MetalPluginName: Metal still finds no device). Boot-arg
+sweetaccstub=0 leaves it out. Checked with tools/xnu-cc.py (CI flags).
+
+Apply after 0221.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 95880a7..9a317fb 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -491,6 +491,43 @@ RedwoodGPU::start(IOService * provider)
+ 	return true;
+ }
+ 
++/*
++ * 0222: an empty IOAcceleratorES. QuartzCore's CAMetalContextCreate (16.5 20F66, the block at 0x1885356b8) waits
++ * for a service of this class -- a real iPhone's GPU driver -- 300 times 100 ms, i.e. up to 30 s, before it gives up
++ * on Metal. WebKit's GPU process draws web content through CA::CG::AccelRenderer, which calls it: Safari's first
++ * page arrived ~30 s late (spindump 2026-11-12: "RemoteRenderingBackend work queue" waiting on thread "CA::CG::Queue"
++ * in that loop). Published here it ends the wait at once; it has no user client and no MetalPluginName, so Metal
++ * still finds no device and CA draws another way. Boot-arg sweetaccstub=0: not published.
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++SweetAcceleratorStub(IOService * provider)
++{
++	uint32_t on = 1;
++	IOAcceleratorES * acc;
++
++	(void) PE_parse_boot_argn("sweetaccstub", &on, sizeof(on));
++	if (!on || provider == NULL) {
++		return;
++	}
++	acc = OSTypeAlloc(IOAcceleratorES);
++	if (acc == NULL || !acc->init() || !acc->attach(provider)) {
++		OSSafeReleaseNULL(acc);
++		IOLog("RedwoodGPU: no IOAcceleratorES stand-in\n");
++		return;
++	}
++	acc->setName("IOAcceleratorES");
++	acc->registerService();
++	acc->release();
++	IOLog("RedwoodGPU: IOAcceleratorES stand-in published (QuartzCore's 30 s Metal wait)\n");
++}
++
+ void
+ RedwoodGPUStart(void)
+ {
+@@ -520,6 +557,7 @@ RedwoodGPUStart(void)
+ 		IOLog("RedwoodGPU: the service did not start\n");
+ 	}
+ 	gpu->release();
++	SweetAcceleratorStub(provider);
+ }
+ 
+ /* The run is ending (redwood_adreno.c): nobody is in the middle of anything when the GPU goes. */

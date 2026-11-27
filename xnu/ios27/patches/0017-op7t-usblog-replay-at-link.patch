@@ -1,0 +1,29 @@
+0017: the live UDP log re-sends the boot once the PC can receive it.
+
+Boot 27o: launchd no longer dies, so 0014's replay (in the initproc hold) never ran, and the log began ~18 s in
+again (datagrams sent before Windows configures RNDIS are lost). 20 s after the link is first ready, the log
+thread replays the console ring from its oldest byte (up to 4 MiB), once.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1343,6 +1343,20 @@
+ 		if (!ud_tx_ready()) {
+ 			continue;
+ 		}
++		/*
++		 * 0017: whatever went out before Windows configured its RNDIS adapter was lost (the first ~18 s of every
++		 * boot: launchd's start). 20 s after the link is first ready, re-send the console ring from its oldest
++		 * byte (the whole boot while it is under 4 MiB), once. Boot-arg sweetusblogreplay=0 turns it off.
++		 */
++		static int ready_ticks;
++		static int replay_on = -1;
++		if (replay_on < 0) {
++			replay_on = 1;
++			PE_parse_boot_argn("sweetusblogreplay", &replay_on, sizeof(replay_on));
++		}
++		if (replay_on && ready_ticks <= 200 && ++ready_ticks == 200) {
++			sweet_usblog_replay(4u << 20);
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;

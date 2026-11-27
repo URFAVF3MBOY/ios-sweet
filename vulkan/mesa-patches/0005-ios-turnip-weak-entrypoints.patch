@@ -1,0 +1,24 @@
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index d6c8a053d52..38a722745bb 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -198,6 +198,10 @@ if cpp.get_id() == 'gcc'
+   tu_cpp_args += cpp.get_supported_arguments(['-Wno-misleading-indentation'])
+ endif
+ 
++# Mach-O (iOS): Mesa's optional entrypoints are weak references that may stay undefined (NULL); Apple's
++# linker needs dynamic_lookup to allow that. Only on this library, so configure checks stay honest.
++tu_macho_link_args = host_machine.system() == 'darwin' ? ['-Wl,-undefined,dynamic_lookup'] : []
++
+ libvulkan_freedreno = shared_library(
+   'vulkan_freedreno',
+   [libtu_files, tu_drirc, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv],
+@@ -225,7 +229,7 @@ libvulkan_freedreno = shared_library(
+   c_args : [no_override_init_args, tu_flags, soong_compat_c_args],
+   cpp_args : [tu_cpp_args, tu_flags, soong_compat_cpp_args],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id, tu_macho_link_args],
+   link_depends : vulkan_icd_link_depends,
+   install : true,
+ )

@@ -1,0 +1,9 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios, arm64e-ios ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1319
+exports:
+  - targets:     [ arm64-ios, arm64e-ios ]
+    symbols:     [ _dlsym, _dlopen, _open, _write, _close, _snprintf, _strncmp, _strcmp, _strlen, _free, _malloc, _calloc, _realloc, _posix_memalign, _malloc_zone_malloc, _malloc_zone_calloc, _malloc_zone_memalign, _malloc_zone_realloc, _backtrace, _malloc_size, _getpid, _strstr, _usleep, _sysctlbyname, _access, _pthread_create, _pthread_detach, ___stack_chk_fail, ___stack_chk_guard, dyld_stub_binder ]
+...

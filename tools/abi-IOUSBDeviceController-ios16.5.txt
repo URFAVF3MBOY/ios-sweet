@@ -1,0 +1,70 @@
+# IOUSBDeviceController vtable, iOS 16.5 (iPhone X kernelcache, IOUSBDeviceFamily 2.0.0)
+# Slot = index from the first virtual (vtable + 16). Slots 0-167 = IOService (identical to the 0216 kernel).
+# Names from the macOS 13.5 KDK IOUSBDeviceFamily (slot - 104 = iOS slot: macOS keeps 104 padding slots),
+# pure-virtual names from the KDK AppleUSBXDCI (DWC3 backend) overrides. Pattern of pure slots checked equal
+# in both binaries. P = pure virtual (a backend must implement it). Size of IOUSBDeviceController on iOS 16.5: 504.
+
+168   10createPipeER21tCreatePipeParameters
+169   12activatePipeEP15IOUSBDevicePipe
+170   14deactivatePipeEP15IOUSBDevicePipe
+171   10getAddressEv
+172   15createPipeGatedER21tCreatePipeParametersRP15IOUSBDevicePipe
+173   17activatePipeGatedEP15IOUSBDevicePipe
+174   19deactivatePipeGatedEP15IOUSBDevicePipe
+175 P 14softDisconnectEN21IOUSBDeviceController41IOUSBDeviceControllerSoftDisconnectReasonE
+176   15endpointTimeoutEi
+177 P 7goOnBusEb
+178   21handleUserlandCommandEP8OSStringP8OSObject
+179 P ___cxa_pure_virtual
+180 P 19handleStallEndpointEib
+181 P 19handleAbortEndpointEi
+182 P 30handleSetAddressPreStatusPhaseEi
+183 P 31handleSetAddressPostStatusPhaseEi
+184 P 18getConnectionSpeedEv
+185 P 34provideEndpointIDsForConfigurationEP7OSArrayPh
+186 P 20prepareConfigurationEP7OSArray
+187 P 16activateEndpointEiiii33tIOUSBDeviceInterfacePipeProperty
+188 P 18deactivateEndpointEi
+189 P 14createIOBufferEjy
+190   15setCurrentLimitEj
+191   15getCurrentLimitEj
+192 P 17isEndpointStalledEi
+193 P 23resetEndpointDataToggleEi
+194   14handleTestModeEh
+195   16handleUSBSuspendEv
+196   14handleUSBResetEv
+197   15handleUSBResumeEv
+198 P 18forceReEnumerationEv
+199   21forceControllerReinitEv
+200   22handleSetConfigurationEj
+201 P 17doRemoteWakeGatedEv
+202   25doFunctionRemoteWakeGatedEi
+203   21handleUSBCableConnectEv
+204   24handleUSBCableDisconnectEv
+205   23handleUSBSoftDisconnectEv
+206   21getMaxSpeedCapabilityEv
+207   16getDeviceAddressEv
+208   18enablePacketFilterEPFvPS_P24_IOUSBDeviceIORequestTag38tAppleUSBDevicePacketFilterRequestTypeiE
+209   19disablePacketFilterEv
+210   12filterPacketEP24_IOUSBDeviceIORequestTag38tAppleUSBDevicePacketFilterRequestTypei
+211   27addDevCapabilityDescriptorsEv
+212   17hardwareExceptionEiPKc
+213   31handleControlRequestStateChangeEN25IOUSBDeviceControlRequest20tControlRequestStateES1_
+214   16gotoPoweredStateEv
+215   16gotoDefaultStateEv
+216   19gotoConfiguredStateEi
+217   21gotoDisconnectedStateEv
+218   15gotoDeviceStateENS_12kDeviceStateE
+219   13startUSBStackEv
+220   18setupDriverRequestEv
+221   27createControlRequestTrackerEv
+222   22systemPowerDownHandlerEPvjP9IOServiceS0_m
+223   2ioEiP18IOMemoryDescriptoryP21IOUSBDeviceCompletionPyj
+224   2ioEiP18IOMemoryDescriptorjP20IOUSBDeviceIsocFrameP25IOUSBDeviceIsocCompletion
+225 P 7ioGatedEP24_IOUSBDeviceIORequestTag
+226   15allocateRequestEv
+227   11freeRequestEP24_IOUSBDeviceIORequestTag
+228   13getDMACommandEv
+229   23setupDeviceSetIsocDelayEv
+230   15updateLPMPolicyEN17IOUSBDeviceFamily25tUSBDeviceConnectionSpeedE13tUSBLinkState
+231   16getBufferOptionsERj

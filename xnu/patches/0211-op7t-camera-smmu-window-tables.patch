@@ -1,0 +1,52 @@
+op7t-0211: SMMU window tables written cached and cleaned (they were wiped by KMA_ZERO's dirty lines)
+
+0210 (2026-11-12): C-PHY works: CSID RX 0x00400077, RDI0 0x1ff8, byte
+counters running, IFE irq0 0x08000220 / irq1 0x4 / bus 0x4: the IFE got the
+IMX586's frames and wrote, but the window bank reported FSR 0x402
+(translation fault) with FAR = 0xc7800000, the buffer's own first address:
+the tables it walked were empty. They were written through a second,
+write-combining mapping while kmem_alloc_contig's KMA_ZERO zeroes were still
+dirty in the cache under the cached address; evicted later, they wiped the
+entries. Now written through the cached address and cleaned with
+flush_dcache64 before the bank is set up.
+
+Apply after 0210.
+---
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index c32c3cc..352f71e 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -396,6 +396,7 @@ sweet_smmu_identity_group(uint32_t sid, uint32_t smask)
+  * Tables: one L1 page (T0SZ 25: 512 GiB, 1 GiB per entry) pointing at one L2 page with a single 2 MiB block.
+  */
+ int sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa);
++extern void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ 
+ int
+ sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa)
+@@ -419,10 +420,13 @@ sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa)
+ 			return -1;
+ 		}
+ 		tables_pa = ptoa_64(pn);
+-		tables_va = ml_io_map_wcomb((vm_offset_t)tables_pa, 2 * PAGE_SIZE);
+-		if (tables_va == 0) {
+-			return -1;
+-		}
++		/*
++		 * 0211: the tables are written through their cached kernel address and cleaned to memory. 0205-0210 wrote
++		 * them through a second (write-combining) mapping while KMA_ZERO's zeroes still sat dirty in the cache:
++		 * evicted later, they wiped the entries and the SMMU walked empty tables (0210: translation fault, FAR =
++		 * the buffer's own address).
++		 */
++		tables_va = kva;
+ 	}
+ 	volatile uint64_t *l1 = (volatile uint64_t *)tables_va;
+ 	volatile uint64_t *l2 = (volatile uint64_t *)(tables_va + PAGE_SIZE);
+@@ -432,6 +436,7 @@ sweet_smmu_window_group(uint32_t sid, uint32_t smask, uint64_t pa)
+ 	}
+ 	l1[(pa >> 30) & 511] = (tables_pa + PAGE_SIZE) | 3u;                     /* table */
+ 	l2[(pa >> 21) & 511] = pa | (1u << 10) | (2u << 8) | (1u << 6) | 1u;      /* 2 MiB block, as the identity map's */
++	flush_dcache64((addr64_t)tables_va, 2 * PAGE_SIZE, FALSE);               /* 0211: to memory, for the walk */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	int bank = smmu_identity_masked(sid, smask, tables_pa);
+ 	printf("HOTDOGB SMMU: window %#llx + 2 MiB for SID %#x/%#x (tables %#llx): bank %d\n", pa, sid, smask, tables_pa, bank);

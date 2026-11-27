@@ -1,0 +1,33 @@
+0013: keep launchd's last console lines on screen before the initproc panic.
+
+Boot 27h still ended in "no dyld cache"; the shared_region error that says why was printed but the panic report
+scrolled it away. Wait sweetinitwait seconds (default 20) before panicking when initproc exits.
+
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2005,6 +2005,25 @@
+ 		prefix_str = prefix_str_buf;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: the panic report scrolls the console off the screen, and the screen is all I can see of a failed
++	 * userland start (no UART, no live log that early). Hold the console with launchd's and dyld's last lines on it
++	 * before panicking. Boot-arg sweetinitwait=SECONDS (default 20, 0 = off, at most 300).
++	 */
++	if (p == initproc) {
++		uint32_t secs = 20;
++		PE_parse_boot_argn("sweetinitwait", &secs, sizeof(secs));
++		if (secs > 300) {
++			secs = 300;
++		}
++		if (secs != 0) {
++			printf("HOTDOGB: launchd is dying (lines above say why); panic in %u s\n", secs);
++			delay((int)(secs * 1000000));
++		}
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	proc_crash_coredump(p);
+ 
+ 	sync(p, (void *)NULL, (int *)NULL);

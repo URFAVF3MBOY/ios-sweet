@@ -1,0 +1,35 @@
+0019: a critical daemon's exit no longer panics (only launchd's does).
+
+Boot 27p: "tzinit[19] exited -- no exit reason available -- (signal 0, exit status 2)" panicked the phone before
+the USB log came up. Log it and continue; sweetcritpanic=1 for the stock behaviour.
+
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1988,6 +1988,27 @@
+ 		    exit_reason_desc : "none");
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0019: launchd marks some boot tasks and daemons "panic on crash / on non-zero exit". On this phone a helper
++	 * failing (boot 27p: "tzinit[19] exited -- no exit reason available -- (signal 0, exit status 2)") must not
++	 * take the system down while the port is incomplete: only launchd itself panics. Boot-arg sweetcritpanic=1
++	 * restores the stock behaviour.
++	 */
++	if (p != initproc) {
++		static int crit_panic = -1;
++		if (crit_panic < 0) {
++			crit_panic = 0;
++			PE_parse_boot_argn("sweetcritpanic", &crit_panic, sizeof(crit_panic));
++		}
++		if (!crit_panic) {
++			printf("HOTDOGB: %s[%d] exited (signal %d, exit status %d): launchd asked for a panic; continuing\n",
++			    p->p_name, proc_getpid(p), WTERMSIG(rv), WEXITSTATUS(rv));
++			return;
++		}
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	const char *prefix_str;
+ 	char prefix_str_buf[128];
+ 

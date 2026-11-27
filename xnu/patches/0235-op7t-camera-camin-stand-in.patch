@@ -1,0 +1,56 @@
+0235: a stand-in AppleH10CamIn service so iOS's camera stack looks for its plugin (boot-arg sweetcamin=1, off by default).
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 1ecae92..4b00898 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -515,6 +515,41 @@ class IOAcceleratorES : public IOService
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++/*
++ * 0235: a stand-in AppleH10CamIn (the iPhone X camera driver's class), so iOS looks for a camera at all.
++ * CMCapture's FigCaptureGetCaptureDeviceCreateFunction walks {AppleH13CamIn, AppleH10CamIn, AppleH9CamIn,
++ * AppleH6CamIn}: IOServiceGetMatchingService(IOServiceMatching(name)), and for the first that exists
++ * dlopen("/System/Library/MediaCapture/H10ISP.mediacapture") + dlsym("H10ISPCaptureDeviceCreate"). That
++ * plugin (mine, userland) does the rest; this object only has to exist. Boot-arg sweetcamin=1 (default 0).
++ */
++class AppleH10CamIn : public IOService
++{
++	OSDeclareDefaultStructors(AppleH10CamIn);
++};
++OSDefineMetaClassAndStructors(AppleH10CamIn, IOService);
++
++static void
++SweetCamInStub(IOService * provider)
++{
++	uint32_t on = 0;
++	AppleH10CamIn * cam;
++
++	(void) PE_parse_boot_argn("sweetcamin", &on, sizeof(on));
++	if (!on || provider == NULL) {
++		return;
++	}
++	cam = OSTypeAlloc(AppleH10CamIn);
++	if (cam == NULL || !cam->init() || !cam->attach(provider)) {
++		OSSafeReleaseNULL(cam);
++		IOLog("RedwoodGPU: no AppleH10CamIn stand-in\n");
++		return;
++	}
++	cam->setName("AppleH10CamIn");
++	cam->registerService();
++	cam->release();
++	IOLog("RedwoodGPU: AppleH10CamIn stand-in published (camera plugin H10ISP.mediacapture)\n");
++}
++
+ static void
+ SweetAcceleratorStub(IOService * provider)
+ {
+@@ -585,6 +620,7 @@ RedwoodGPUStart(void)
+ 	}
+ 	gpu->release();
+ 	SweetAcceleratorStub(provider);
++	SweetCamInStub(provider);
+ }
+ 
+ /* The run is ending (redwood_adreno.c): nobody is in the middle of anything when the GPU goes. */

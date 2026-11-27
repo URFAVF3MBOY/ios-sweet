@@ -1,0 +1,113 @@
+0226: SwapWait (IOMobileFramebuffer sel 6) waits until the swap is on the panel (or the display is off, or 50 ms); it answered at once, so CoreAnimation's Metal renderer drew into the buffer the panel still showed (two home-screen pages in one frame during swipes). Boot-arg sweetswapwait=0: as before.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e376867..c8ba640 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -140,6 +140,16 @@ public:
+ 	uint32_t      fBootAddr, fBootStride, fBootXY0, fBootXY1;
+ 	SweetSurface *fScanned;       /* the surface the pipes fetch now (held), NULL: the splash buffer */
+ 	uint32_t      fScanFlips, fScanCopies;
++	/*
++	 * 0226: SwapWait. CoreAnimation calls sel 6 [swap id, timeout, 0] before it draws into a buffer again; it
++	 * answered at once, while the swap only reaches the panel at the next vsync tick, so the window server
++	 * could draw the next frame into the buffer the panel still showed (seen with CA's Metal renderer: frames
++	 * of two home-screen pages at once during a swipe). Now it waits until that swap was presented (or the
++	 * display is off, or 50 ms). Boot-arg sweetswapwait=0: answer at once as before.
++	 */
++	uint32_t      fShownSwap;     /* the last swap id present() put on the panel */
++	uint32_t      fSwapWait;      /* sweetswapwait, default 1 */
++	uint32_t      fSwapWaits, fSwapWaitTimeouts;
+ 
+ 	/*
+ 	 * 0198 scaled scanout (boot-arg sweetscale, default 1; 0 = crop as before): each pipe's QSEED3
+@@ -164,6 +174,8 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void swapShown(uint32_t id);            /* 0226 */
++	void swapWait(uint32_t id);             /* 0226 */
+ 	void present(const uint8_t *rec);
+ };
+ 
+@@ -489,6 +501,40 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++void
++AppleCLCD::swapShown(uint32_t id)
++{
++	IOLockLock(fLock);
++	fShownSwap = id;
++	IOLockWakeup(fLock, &fShownSwap, false);
++	IOLockUnlock(fLock);
++}
++
++/* 0226: sel 6. kIOReturnSuccess once swap `id` is on the panel, the display is off, or after 50 ms. */
++void
++AppleCLCD::swapWait(uint32_t id)
++{
++	if (fSwapWait == 0) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++	IOLockLock(fLock);
++	fSwapWaits++;
++	while ((int32_t)(fShownSwap - id) < 0 && !fPowerOff && (int32_t)(fSwapID - id) >= 0) {
++		if (IOLockSleepDeadline(fLock, &fShownSwap, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			if (fSwapWaitTimeouts++ < 8) {
++				IOLog("HOTDOGB FB: SwapWait(%u) timed out, %u shown\n", id, fShownSwap);
++			}
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	if ((fSwapWaits % 5000) == 0) {
++		IOLog("HOTDOGB FB: %u SwapWaits, %u timed out\n", fSwapWaits, fSwapWaitTimeouts);
++	}
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -740,7 +786,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	uint32_t shown = get32(rec, 0x50);      /* 0226: this swap is on the panel once present() returns */
+ 	if (scanPresent(rec)) {
++		swapShown(shown);
+ 		if (sweet_fps_on && fScanned != NULL) {
+ 			/*
+ 			 * 0110: the counter on the surface the display now fetches (its panel window: the
+@@ -850,6 +898,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	for (uint32_t i = 0; i < nheld; i++) {
+ 		held[i]->release();
+ 	}
++	swapShown(shown);                       /* 0226 */
+ }
+ 
+ bool
+@@ -995,6 +1044,8 @@ void
+ AppleCLCD::scanSetup(void)
+ {
+ 	PE_parse_boot_argn("sweetscan", &fScanMode, sizeof(fScanMode));
++	fSwapWait = 1;                                  /* 0226 */
++	PE_parse_boot_argn("sweetswapwait", &fSwapWait, sizeof(fSwapWait));
+ 	if (fScanMode == 0) {
+ 		return;
+ 	}
+@@ -1280,7 +1331,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("HOTDOGB FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-	case kSweetFBSwapWait:
++	case kSweetFBSwapWait:                  /* 0226 */
++		if (args->scalarInputCount >= 1) {
++			fFB->swapWait((uint32_t)args->scalarInput[0]);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}

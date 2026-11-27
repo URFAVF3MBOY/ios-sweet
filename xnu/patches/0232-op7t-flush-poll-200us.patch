@@ -1,0 +1,32 @@
+0232: the flip's flush looked at every 200 us instead of sleeping 1 ms (IOSleep slept 1-2 ms: the buffer came back to the window server up to 2 ms after the refresh began, out of its ~16.7 ms for the next frame).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 36868d1..4800185 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1346,18 +1346,20 @@ AppleCLCD::scanPresent(const uint8_t *rec)
+ 	 * the screen (rows read last). At most 34 ms (two refreshes); on the flip thread (0229), not the caller's.
+ 	 */
+ 	{
++		/* 0232: looked at every 200 us (IOSleep(1) slept 1-2 ms: the buffer came back to the window server
++		 * up to 2 ms after the refresh began, out of its ~16.7 ms for the next frame) */
+ 		uint64_t began = mach_absolute_time(), ns;
+ 		uint32_t waited = 0;
+-		while ((fCtl0[CTL_FLUSH / 4] & CTL_FLUSH_VIGS) != 0 && waited < 34) {
+-			IOSleep(1);
++		while ((fCtl0[CTL_FLUSH / 4] & CTL_FLUSH_VIGS) != 0 && waited < 170) {
++			delay(200);
+ 			waited++;
+ 		}
+-		if (waited > 0 && waited < 34) {
+-			fTaken = mach_absolute_time();  /* 0231: a refresh began within the last millisecond */
++		if (waited > 0 && waited < 170) {
++			fTaken = mach_absolute_time();  /* 0231: a refresh began within the last 200 us */
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 		fFlushWaitNs += ns;
+-		if (waited >= 34 && fFlushTimeouts++ < 4) {
++		if (waited >= 170 && fFlushTimeouts++ < 4) {
+ 			IOLog("HOTDOGB SCAN: the flush of flip %u still pending after 34 ms (0x%x)\n", fScanFlips,
+ 			    fCtl0[CTL_FLUSH / 4]);
+ 		}

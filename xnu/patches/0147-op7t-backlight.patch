@@ -1,0 +1,645 @@
+From: fish <lunarisfelix02@gmail.com>
+Date: Mon, 26 Oct 2026 02:00:00 -0400
+Subject: [PATCH] op7t-0147: panel brightness (DSI DCS 0x51), from a shell and from iOS
+
+0113 (DSI brightness, ported from topaz) was a corrupt patch file, so it and
+0130 (its sysctl) were skipped by every build. Both are folded in here,
+against the current tree, and removed:
+  iokit/Kernel/arm/SweetBacklight.cpp: DCS 0x51 with an 11-bit DBV through
+    DSI0's command DMA (0113), mapped on first use, one request at a time
+    (0130); boot-args sweetbl=N (self-test), sweetbldsi=, sweetblcmd=.
+  bsd/dev/sweet_bl.c: sysctl kern.sweetbl=N (1..2047, root), as 0130.
+New, for the brightness slider. iOS 16's CoreBrightness names two ways
+(an AppleARMBacklight service with IODisplayParameters, and
+IOMFBBrightnessLevel on IOMobileFramebuffer); which one it takes here is
+not known yet, so:
+  - AppleCLCD::setProperties logs every key iOS sets ("HOTDOGB BL: iOS sets
+    ...") and maps IOMFBBrightnessLevel (nits, 16.16 when >= 0x10000) onto
+    DBV, full scale kern.sweetbl_nits (default 600);
+  - sysctl kern.sweetbl_svc=1 publishes AppleARMBacklight under the
+    framebuffer (IODisplayParameters brightness 0..1024, mapped onto DBV);
+    off by default, since a service CoreBrightness half understands could
+    take backboardd down; restart backboardd after it;
+  - selectors 50/66/67/68 (SetBrightnessCorrection, SPLCSet/GetBrightness,
+    SetParameter): their scalars logged, the first 40 calls.
+New files checked with g++ -Wall -Wextra on stubs; every libkern/IOKit
+call checked against its declaration in the tree.
+
+Apply after 0146.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9904f3b..a8dbd6d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -122,6 +122,7 @@ bsd/dev/sweet_cores.c			standard
+ bsd/dev/sweet_swipe.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_vsync.c			standard
++bsd/dev/sweet_bl.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_bl.c b/bsd/dev/sweet_bl.c
+new file mode 100644
+index 0000000..20372c5
+--- /dev/null
++++ b/bsd/dev/sweet_bl.c
+@@ -0,0 +1,81 @@
++/*
++ * 0147: panel brightness from a root shell (iokit/Kernel/arm/SweetBacklight.cpp does the work).
++ *   sysctl kern.sweetbl=N         DBV N (1..2047) to the panel at once (DCS 0x51 over DSI0);
++ *                                 reading gives the last value sent (0: none yet)
++ *   sysctl kern.sweetbl_nits=N    full scale for iOS's IOMFBBrightnessLevel (nits, default 600)
++ *   sysctl kern.sweetbl_svc=1     publish AppleARMBacklight for CoreBrightness (then restart
++ *                                 backboardd); reads 1 once published. It cannot be taken back.
++ * Writing needs root.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++
++extern int sweet_backlight_set(uint32_t level);
++extern uint32_t sweet_backlight_get(void);
++extern int sweet_backlight_nits_set(uint32_t nits);
++extern uint32_t sweet_backlight_nits_get(void);
++extern int sweet_backlight_service(void);
++extern uint32_t sweet_backlight_service_get(void);
++
++static int
++sysctl_sweetbl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)sweet_backlight_get(), changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value < 1 || value > 0x7ff) {
++		return EINVAL;
++	}
++	error = sweet_backlight_set((uint32_t)value);
++	printf("HOTDOGB BL: sysctl kern.sweetbl=%d -> %d\n", value, error);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetbl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbl, "I",
++    "panel brightness, DSI DCS 0x51 DBV 1..2047 (0147)");
++
++static int
++sysctl_sweetbl_nits SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)sweet_backlight_nits_get(), changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value < 0) {
++		return EINVAL;
++	}
++	return sweet_backlight_nits_set((uint32_t)value);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetbl_nits, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbl_nits, "I",
++    "nits that IOMFBBrightnessLevel maps to full brightness (0147)");
++
++static int
++sysctl_sweetbl_svc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)sweet_backlight_service_get(), changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != 1) {
++		return EINVAL;
++	}
++	error = sweet_backlight_service();
++	printf("HOTDOGB BL: sysctl kern.sweetbl_svc=1 -> %d\n", error);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetbl_svc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweetbl_svc, "I",
++    "1: publish AppleARMBacklight for CoreBrightness (0147)");
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+new file mode 100644
+index 0000000..91759a0
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,436 @@
++/*
++ * SWEET backlight: the OnePlus 7T panel's brightness over DSI (0147; 0113 and 0130 folded in --
++ * 0113 was a corrupt patch file, so neither was ever in a kernel).
++ *
++ * The panel (dsi_samsung_sofef03f_m_fhd_dsc_cmd) takes the MIPI DCS "set_display_brightness"
++ * (0x51) with an 11-bit DBV value (1..0x7ff, MSB first), sent as a long DCS write through DSI0's
++ * command-DMA path: a packet in a contiguous buffer below 4 GiB, DMA_BASE/DMA_LEN, software
++ * trigger, wait for CMD_DMA_DONE. Ported from topaz's working 0104-topaz-dsi-brightness
++ * (MakrSas/topaz-woa TopazGpuW disp.c); on SM8150 DSI0 is at 0x0AE94000. The panel is in
++ * command mode and refreshes itself, so this only borrows the command engine for a few hundred
++ * microseconds and restores every register it touches (CTRL, TRIG_CTRL, CMD_DMA_CTRL, INT_CTRL).
++ *
++ * From a root shell:   sysctl kern.sweetbl=512    DBV 512 at once; reading gives the last sent
++ * Boot-args:           sweetbl=N (self-test a few seconds after boot), sweetbldsi=0|1, sweetblcmd=0x51
++ *
++ * From iOS (CoreBrightness, in backboardd). Which way iOS 16 sends the slider here is not known
++ * yet -- its CoreBrightness names both -- so both are taken and logged ("HOTDOGB BL: iOS ..."):
++ *   - IOMFBBrightnessLevel set on the framebuffer (AppleCLCD::setProperties, SweetFramebuffer.cpp):
++ *     taken as nits, 16.16 fixed point when >= 0x10000, and mapped linearly onto DBV with
++ *     kern.sweetbl_nits (default 600) as full scale.
++ *   - an AppleARMBacklight service with IODisplayParameters (brightness min/max/value), which
++ *     is what CoreBrightness's findBacklight looks for by name. Published only on
++ *     `sysctl kern.sweetbl_svc=1` (then restart backboardd): a service CoreBrightness half
++ *     understands could take the window server down with it.
++ */
++#include <libkern/libkern.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
++
++#define LOG(fmt, ...)   IOLog("HOTDOGB BL: " fmt "\n", ##__VA_ARGS__)
++
++#define DSI0_PA         0x0AE94000UL
++#define DSI1_PA         0x0AE96000UL
++#define DSI_SIZE        0x1000u
++
++/* register offsets (already include the 6G v2 +4 shift; same as topaz 0104) */
++#define R_CTRL          0x004u   /* bit0 DSI_EN, bit2 CMD_MODE_EN */
++#define R_CMD_DMA_CTRL  0x03cu   /* bit26 LOW_POWER */
++#define R_DMA_BASE      0x048u
++#define R_DMA_LEN       0x04cu
++#define R_ACK_ERR       0x068u
++#define R_TRIG_CTRL     0x084u   /* bits0-2 DMA trigger (4 = SW) */
++#define R_TRIG_DMA      0x090u
++#define R_TPG_CTRL      0x15cu
++#define R_INT_CTRL      0x110u   /* bit0 CMD_DMA_DONE */
++
++#define DBV_MAX         0x7ffu
++
++static volatile uint8_t *sweet_dsi;
++static IOBufferMemoryDescriptor *sweet_dsi_buf;
++static uint64_t sweet_dsi_buf_phys;
++static unsigned sweet_bl_cmd = 0x51, sweet_bl_which;
++static IOLock *sweet_bl_lock;
++static uint32_t sweet_bl_last;
++static uint32_t sweet_bl_nits = 600;            /* full scale for IOMFBBrightnessLevel (kern.sweetbl_nits) */
++static uint32_t sweet_bl_ios_logged;
++static IOService *sweet_bl_fb;                  /* the framebuffer, AppleARMBacklight's provider */
++static IOService *sweet_bl_svc;
++
++static inline uint32_t dsi_rd(uint32_t o) { return *(volatile uint32_t *)(sweet_dsi + o); }
++static inline void dsi_wr(uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(sweet_dsi + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* DCS long write through the DSI command DMA path (topaz dsiDcsLong). */
++static bool
++sweet_dsi_dcs_long(const uint8_t *payload, uint32_t len)
++{
++	if (sweet_dsi == NULL || sweet_dsi_buf == NULL || len > 60) {
++		return false;
++	}
++	uint8_t *p = (uint8_t *)sweet_dsi_buf->getBytesNoCopy();
++	uint32_t size = (4 + len + 3) & ~3u;
++
++	memset(p, 0xff, 64);
++	p[0] = (uint8_t)len;            /* word count low */
++	p[1] = (uint8_t)(len >> 8);     /* word count high */
++	p[2] = 0x39;                    /* data type: long DCS write */
++	p[3] = 0xc0;                    /* last | long */
++	memcpy(p + 4, payload, len);
++	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++
++	uint32_t ctrl = dsi_rd(R_CTRL), trig = dsi_rd(R_TRIG_CTRL);
++	if ((trig & 7) != 4) {
++		dsi_wr(R_TRIG_CTRL, (trig & ~7u) | 4);  /* DMA trigger: software */
++	}
++	dsi_wr(R_CTRL, ctrl | 4 | 1);                   /* CMD_MODE_EN | DSI_EN */
++	dsi_wr(R_INT_CTRL, dsi_rd(R_INT_CTRL) | 1);     /* clear CMD_DMA_DONE */
++	dsi_wr(R_TPG_CTRL, 0);                          /* no test pattern */
++	dsi_wr(R_DMA_BASE, (uint32_t)sweet_dsi_buf_phys);
++	dsi_wr(R_DMA_LEN, size);
++	uint32_t dma = dsi_rd(R_CMD_DMA_CTRL);
++	dsi_wr(R_CMD_DMA_CTRL, dma & ~(1u << 26));      /* high speed */
++	dsi_wr(R_TRIG_DMA, 1);                          /* SW trigger */
++
++	bool done = false;
++	for (int i = 0; i < 50 && !done; i++) {
++		done = (dsi_rd(R_INT_CTRL) & 1) != 0;
++		if (!done) {
++			IODelay(1000);
++		}
++	}
++	dsi_wr(R_INT_CTRL, dsi_rd(R_INT_CTRL) | 1);
++	dsi_wr(R_CMD_DMA_CTRL, dma);
++	dsi_wr(R_CTRL, ctrl);
++	if (trig != dsi_rd(R_TRIG_CTRL)) {
++		dsi_wr(R_TRIG_CTRL, trig);
++	}
++	return done;
++}
++
++static bool
++sweet_bl_send(uint32_t level)
++{
++	uint8_t cmd[3] = { (uint8_t)sweet_bl_cmd, (uint8_t)(level >> 8), (uint8_t)level };  /* MSB first */
++	bool done = sweet_dsi_dcs_long(cmd, sizeof(cmd));
++
++	LOG("panel level %#x (cmd 0x%02x): %s, ack-err 0x%x", level, sweet_bl_cmd,
++	    done ? "done" : "NO DONE", dsi_rd(R_ACK_ERR));
++	return done;
++}
++
++/* map DSI and get the DMA buffer below 4 GiB, once */
++static bool
++sweet_bl_map(void)
++{
++	if (sweet_dsi != NULL && sweet_dsi_buf != NULL && sweet_dsi_buf_phys != 0) {
++		return true;
++	}
++	if (sweet_dsi == NULL) {
++		sweet_dsi = (volatile uint8_t *)ml_io_map(sweet_bl_which ? DSI1_PA : DSI0_PA, DSI_SIZE);
++	}
++	if (sweet_dsi_buf == NULL) {
++		sweet_dsi_buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 64, 0x00000000fffff000ull);
++		sweet_dsi_buf_phys = sweet_dsi_buf ? sweet_dsi_buf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++	}
++	if (sweet_dsi == NULL || sweet_dsi_buf == NULL || sweet_dsi_buf_phys == 0) {
++		LOG("could not map DSI%u (%p) or get a DMA buffer below 4 GiB (phys 0x%llx)",
++		    sweet_bl_which, (void *)sweet_dsi, (unsigned long long)sweet_dsi_buf_phys);
++		return false;
++	}
++	LOG("DSI%u mapped, DMA buffer at 0x%llx", sweet_bl_which, (unsigned long long)sweet_dsi_buf_phys);
++	return true;
++}
++
++/* for the sysctl (bsd/dev/sweet_bl.c) and iOS: 0 when the panel took it */
++extern "C" int
++sweet_backlight_set(uint32_t level)
++{
++	int err;
++
++	if (sweet_bl_lock == NULL) {
++		return ENXIO;
++	}
++	if (level < 1 || level > DBV_MAX) {
++		return EINVAL;
++	}
++	IOLockLock(sweet_bl_lock);
++	err = !sweet_bl_map() ? ENXIO : sweet_bl_send(level) ? 0 : EIO;
++	if (err == 0) {
++		sweet_bl_last = level;
++	}
++	IOLockUnlock(sweet_bl_lock);
++	return err;
++}
++
++extern "C" uint32_t
++sweet_backlight_get(void)
++{
++	return sweet_bl_last;
++}
++
++extern "C" uint32_t
++sweet_backlight_nits_get(void)
++{
++	return sweet_bl_nits;
++}
++
++extern "C" int
++sweet_backlight_nits_set(uint32_t nits)
++{
++	if (nits < 50 || nits > 2000) {
++		return EINVAL;
++	}
++	sweet_bl_nits = nits;
++	return 0;
++}
++
++/* a fraction num/den of full brightness onto DBV 1..0x7ff */
++static uint32_t
++sweet_bl_dbv(uint64_t num, uint64_t den)
++{
++	uint64_t dbv = den != 0 ? (num * DBV_MAX + den / 2) / den : DBV_MAX;
++
++	return dbv < 1 ? 1 : dbv > DBV_MAX ? DBV_MAX : (uint32_t)dbv;
++}
++
++/* a value of iOS's, for the log: what it is and, for a number, the number */
++static void
++sweet_bl_describe(const OSObject *o, char *buf, size_t size)
++{
++	const OSNumber *n = OSDynamicCast(OSNumber, o);
++	const OSString *s = OSDynamicCast(OSString, o);
++	const OSBoolean *b = OSDynamicCast(OSBoolean, o);
++	const OSDictionary *d = OSDynamicCast(OSDictionary, o);
++
++	if (n != NULL) {
++		snprintf(buf, size, "%llu (%#llx)", n->unsigned64BitValue(), n->unsigned64BitValue());
++	} else if (s != NULL) {
++		snprintf(buf, size, "\"%s\"", s->getCStringNoCopy());
++	} else if (b != NULL) {
++		snprintf(buf, size, "%s", b->isTrue() ? "true" : "false");
++	} else if (d != NULL) {
++		snprintf(buf, size, "dict of %u", d->getCount());
++	} else {
++		snprintf(buf, size, "%s", o != NULL ? o->getMetaClass()->getClassName() : "NULL");
++	}
++}
++
++/* every key iOS sets on `who`, logged (the first 200 in all), then each one handled by `take` */
++static IOReturn
++sweet_bl_each(const char *who, OSObject *properties, bool (*take)(const OSSymbol *key, OSObject *value))
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *it;
++	const OSSymbol *key;
++	bool any = false;
++
++	if (dict == NULL || (it = OSCollectionIterator::withCollection(dict)) == NULL) {
++		return kIOReturnBadArgument;
++	}
++	while ((key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *value = dict->getObject(key);
++		char what[64];
++
++		if (sweet_bl_ios_logged < 200) {
++			sweet_bl_ios_logged++;
++			sweet_bl_describe(value, what, sizeof(what));
++			LOG("iOS sets %s on %s: %s", key->getCStringNoCopy(), who, what);
++		}
++		any |= take(key, value);
++	}
++	it->release();
++	return any ? kIOReturnSuccess : kIOReturnUnsupported;
++}
++
++/* IOMFBBrightnessLevel (nits; 16.16 when it is >= 0x10000) on the framebuffer */
++static bool
++sweet_bl_take_fb(const OSSymbol *key, OSObject *value)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, value);
++
++	if (n == NULL || !key->isEqualTo("IOMFBBrightnessLevel")) {
++		return false;
++	}
++	uint64_t v = n->unsigned64BitValue(), milli = v >= 0x10000 ? (v * 1000) >> 16 : v * 1000;
++	uint32_t dbv = sweet_bl_dbv(milli, (uint64_t)sweet_bl_nits * 1000);
++
++	LOG("iOS: IOMFBBrightnessLevel %llu -> %llu.%03llu nits -> DBV %u (full scale %u nits)",
++	    v, milli / 1000, milli % 1000, dbv, sweet_bl_nits);
++	(void)sweet_backlight_set(dbv);
++	return true;
++}
++
++/* called by AppleCLCD::setProperties (SweetFramebuffer.cpp) */
++extern "C" IOReturn
++sweet_backlight_fb_properties(OSObject *properties)
++{
++	return sweet_bl_each("the framebuffer", properties, sweet_bl_take_fb);
++}
++
++/*
++ * AppleARMBacklight: what CoreBrightness's findBacklight matches by name. IODisplayParameters
++ * as IODisplay has it: brightness {min, max, value}; the value set comes back either as the
++ * whole IODisplayParameters, as a "brightness" dictionary or as a bare "brightness" number.
++ */
++#define SWEET_BL_SCALE  1024u
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	uint32_t fValue;
++	void publishParameters(void);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::publishParameters(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1), *bright = OSDictionary::withCapacity(3);
++	OSNumber *lo = OSNumber::withNumber(0ULL, 32), *hi = OSNumber::withNumber(SWEET_BL_SCALE, 32);
++	OSNumber *value = OSNumber::withNumber(fValue, 32);
++
++	if (params != NULL && bright != NULL && lo != NULL && hi != NULL && value != NULL) {
++		bright->setObject("min", lo);
++		bright->setObject("max", hi);
++		bright->setObject("value", value);
++		params->setObject("brightness", bright);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(bright);
++	OSSafeReleaseNULL(lo);
++	OSSafeReleaseNULL(hi);
++	OSSafeReleaseNULL(value);
++}
++
++static AppleARMBacklight *sweet_bl_taking;
++
++static bool
++sweet_bl_take_svc(const OSSymbol *key, OSObject *value)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, value);
++	OSNumber *n = OSDynamicCast(OSNumber, value);
++
++	if (key->isEqualTo("IODisplayParameters") && d != NULL) {
++		d = OSDynamicCast(OSDictionary, d->getObject("brightness"));
++		n = d != NULL ? OSDynamicCast(OSNumber, d->getObject("value")) : NULL;
++	} else if (key->isEqualTo("brightness")) {
++		if (d != NULL) {
++			n = OSDynamicCast(OSNumber, d->getObject("value"));
++		}
++	} else {
++		return false;
++	}
++	if (n == NULL || sweet_bl_taking == NULL) {
++		return false;
++	}
++	uint32_t v = n->unsigned32BitValue();
++	uint32_t dbv = sweet_bl_dbv(v > SWEET_BL_SCALE ? SWEET_BL_SCALE : v, SWEET_BL_SCALE);
++
++	LOG("iOS: AppleARMBacklight brightness %u of %u -> DBV %u", v, SWEET_BL_SCALE, dbv);
++	sweet_bl_taking->fValue = v > SWEET_BL_SCALE ? SWEET_BL_SCALE : v;
++	sweet_bl_taking->publishParameters();
++	(void)sweet_backlight_set(dbv);
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	sweet_bl_taking = this;
++	return sweet_bl_each("AppleARMBacklight", properties, sweet_bl_take_svc);
++}
++
++/* kern.sweetbl_svc=1: publish AppleARMBacklight under the framebuffer (once; it stays) */
++extern "C" int
++sweet_backlight_service(void)
++{
++	AppleARMBacklight *svc;
++
++	if (sweet_bl_svc != NULL) {
++		return 0;
++	}
++	if (sweet_bl_fb == NULL || (svc = OSTypeAlloc(AppleARMBacklight)) == NULL) {
++		return ENXIO;
++	}
++	if (!svc->init()) {
++		svc->release();
++		return ENXIO;
++	}
++	svc->fValue = SWEET_BL_SCALE / 2;
++	svc->publishParameters();
++	svc->setProperty("backlight-control", true);
++	if (!svc->attach(sweet_bl_fb)) {
++		svc->release();
++		return ENXIO;
++	}
++	svc->registerService();
++	sweet_bl_svc = svc;
++	LOG("AppleARMBacklight published under %s (restart backboardd for CoreBrightness to look again)",
++	    sweet_bl_fb->getName());
++	return 0;
++}
++
++extern "C" uint32_t
++sweet_backlight_service_get(void)
++{
++	return sweet_bl_svc != NULL;
++}
++
++static void
++sweet_bl_selftest(void *arg, wait_result_t)
++{
++	uint32_t level = (uint32_t)(uintptr_t)arg;
++
++	IOSleep(5000);          /* let the UI come up so the change is visible */
++	LOG("self-test: setting panel level %#x", level);
++	(void)sweet_backlight_set(level);
++	thread_terminate(current_thread());
++}
++
++/* AppleCLCD::start (SweetFramebuffer.cpp) */
++extern "C" void
++sweet_backlight_init(IOService *fb)
++{
++	unsigned level = 0, which = 0, cmd = 0x51;
++	thread_t t;
++
++	sweet_bl_fb = fb;
++	if (sweet_bl_lock == NULL) {
++		sweet_bl_lock = IOLockAlloc();
++	}
++	PE_parse_boot_argn("sweetbldsi", &which, sizeof(which));
++	PE_parse_boot_argn("sweetblcmd", &cmd, sizeof(cmd));
++	sweet_bl_which = which ? 1 : 0;
++	sweet_bl_cmd = cmd & 0xff;
++	if (!PE_parse_boot_argn("sweetbl", &level, sizeof(level)) || level == 0) {
++		return;         /* no self-test asked for; `sysctl kern.sweetbl=N` still works */
++	}
++	if (level > DBV_MAX) {
++		level = DBV_MAX;
++	}
++	LOG("self-test level %#x queued", level);
++	if (kernel_thread_start(sweet_bl_selftest, (void *)(uintptr_t)level, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 33ea2d3..9a230f4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -147,6 +147,7 @@ public:
+ 	bool          scanPresent(const uint8_t *rec);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;      /* 0147 */
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -254,6 +255,8 @@ static uint64_t sweet_fps_second;
+ static uint32_t sweet_fps_swaps;
+ 
+ extern "C" void sweet_drop_start(void);        /* iokit/Kernel/arm/SweetDrop.cpp (0107 v6): files from the boot payload */
++extern "C" void sweet_backlight_init(IOService *fb);                    /* iokit/Kernel/arm/SweetBacklight.cpp (0147) */
++extern "C" IOReturn sweet_backlight_fb_properties(OSObject *properties);
+ 
+ bool
+ AppleCLCD::start(IOService *provider)
+@@ -265,6 +268,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	sweet_drop_start();                     /* 0107 v6: before, nothing called it */
+ 	sweet_modem_init();
++	sweet_backlight_init(this);             /* 0147: panel brightness (kern.sweetbl, iOS's slider) */
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+@@ -396,6 +400,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	fb->rearmVsync(sender);                 /* 0141 */
+ }
+ 
++/* 0147: what iOS sets on the framebuffer (CoreBrightness: IOMFBBrightnessLevel), SweetBacklight.cpp */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	return sweet_backlight_fb_properties(properties);
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -1066,6 +1077,22 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
++	/*
++	 * 0147: the selectors iOS could set brightness with (SetBrightnessCorrection, SPLCSet/
++	 * GetBrightness, SetParameter): every call's scalars, the first 40, to learn which and how.
++	 */
++	static uint32_t sweet_fb_bright_logged;
++	if ((selector == 50 || selector == 66 || selector == 67 || selector == 68) && sweet_fb_bright_logged < 40) {
++		char who[32];
++		sweet_fb_bright_logged++;
++		proc_selfname(who, sizeof(who));
++		IOLog("HOTDOGB FB: %s sel %u scalars %u: %llu %llu %llu %llu, struct %u\n", who, selector,
++		    args->scalarInputCount,
++		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
++		    args->scalarInputCount > 3 ? args->scalarInput[3] : 0ULL, args->structureInputSize);
++	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_fb_logged |= 1ULL << selector;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3bcde1e..8164d4e 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -25,3 +25,4 @@ iokit/Kernel/arm/SweetModem.cpp                                  optional iokitc
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetDrop.cpp                                   optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp

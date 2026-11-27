@@ -1,0 +1,150 @@
+name: xnu
+# iOS 27.2 kernel: xnu-12377.121.6 (macOS 26.5) + xnu/ios27/patches.
+# On this branch xnu.yml builds the iOS 27 kernel; the iOS 16 one is xnu.yml on main.
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG (VMAPPLE = stock tree check, SWEET once the port has it)
+        default: VMAPPLE
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "26.5"
+  KDK_BUILD: 25F71
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'VMAPPLE' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 26.5 patch dir = the build script's 26.0 fixes, then mine (zz- prefix: applied after them)
+          mkdir -p dxb/patches/26.5
+          cp dxb/patches/26.0/* dxb/patches/26.5/
+          for p in xnu/ios27/patches/*.patch; do
+            [ -f "$p" ] || continue
+            cp "$p" "dxb/patches/26.5/zz-$(basename "$p")"
+          done
+          # plain arm64 kernel (no PAC on the Kryo 485)
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          # a patch of mine that does not apply stops the build (the script only warns)
+          perl -0pi -e 's/(\n(\s*)warning "Skipping patch \$\{PATCH\}[^\n]*\n)/$1$2case "\$PATCH" in *\/zz-*) error "patch did not apply: \$PATCH"; exit 1;; esac\n/' dxb/build.sh
+          grep -n 'patch did not apply' dxb/build.sh
+          ls dxb/patches/26.5
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja ccache
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
+          echo "Using Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          mkdir -p /tmp/ccache-bin
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang)" > /tmp/ccache-bin/clang
+          printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$(xcrun --find clang++)" > /tmp/ccache-bin/clang++
+          chmod +x /tmp/ccache-bin/clang /tmp/ccache-bin/clang++
+          ccache -z
+
+      - name: Restore KDK cache
+        id: kdkcache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-${{ env.KDK_BUILD }}
+
+      - name: Install KDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo mkdir -p /Library/Developer/KDKs
+          mkdir -p /tmp/kdk-cache
+          if ! ls /tmp/kdk-cache/*.dmg >/dev/null 2>&1; then
+            gh release download "$KDK_BUILD" -R dortania/KdkSupportPkg -p '*.dmg' -D /tmp/kdk-cache --clobber
+          fi
+          DMG=$(ls /tmp/kdk-cache/*.dmg | head -1)
+          hdiutil attach "$DMG" -nobrowse
+          PKG=$(echo /Volumes/Kernel*/KernelDebugKit.pkg)
+          sudo installer -pkg "$PKG" -target /
+          hdiutil detach "$(dirname "$PKG")" || true
+          FOUND=$(ls -d /Library/Developer/KDKs/KDK_*_${KDK_BUILD}.kdk | head -1)
+          test -d "$FOUND"
+          echo "KDKROOT=$FOUND" >> "$GITHUB_ENV"
+          echo "Installed: $FOUND"
+
+      - name: Save KDK cache
+        if: steps.kdkcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/kdk-cache
+          key: kdk-${{ env.KDK_BUILD }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: xnu27-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            xnu27-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }} CC=/tmp/ccache-bin/clang CXX=/tmp/ccache-bin/clang++
+        run: |
+          echo "KDKROOT=$KDKROOT"
+          bash build.sh
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -sv
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: xnu27-ccache-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu27-kernel
+          path: out/
+          if-no-files-found: warn

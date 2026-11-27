@@ -1,0 +1,38 @@
+0030: read iOS 27's framebuffer swap record.
+
+iOS 27.2's IOMobileFramebuffer sends SwapEnd (selector 5) a 0x6e0-byte record (iOS 26: 0x588); SweetFramebuffer
+reads iOS 16's 0x46c layout. The fields it uses sit 0x48 bytes later in the new records (ios-guacamole's
+disassembly of 24B119: swap id +0x98, surfaces +0x9c, rects +0xac/+0x10c, layer mask +0x14c). Boot 28m: userland
+runs, no framebuffer client yet; needed before the first frame can show.
+- SweetFramebuffer.cpp: SwapEnd reads a 0x6e0 or 0x588 record from +0x48.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1400,12 +1400,24 @@
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+-		if (args->structureInputDescriptor != NULL ||
+-		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		uint32_t insize = args->structureInputSize;
++		/*
++		 * 0030: iOS 27.2 sends a 0x6e0-byte record (iOS 26: 0x588) instead of iOS 16's 0x46c. The fields
++		 * this driver reads sit 0x48 bytes later in both (24B119 IOMobileFramebuffer, from ios-guacamole's
++		 * disassembly: swap id +0x98, surface ids +0x9c, rects +0xac/+0x10c, layer mask +0x14c), so read
++		 * the record from there; the bytes before the id are not used here.
++		 */
++		if (in != NULL && (insize == 0x6e0 || insize == 0x588)) {
++			in += 0x48;
++			insize -= 0x48;
++		}
++		if (args->structureInputDescriptor != NULL || in == NULL ||
++		    insize < SWEET_FB_SWAP_REC_SIZE) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
++		memcpy(rec, in, sizeof(rec));
+ 		fFB->swap(rec);
+ 		break;
+ 	}

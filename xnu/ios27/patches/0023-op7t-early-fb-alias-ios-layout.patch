@@ -1,0 +1,23 @@
+0023: the early framebuffer alias in the kernel's own L1 region.
+
+Boot 28a (first iPhoneOS-config kernel): SWEET EARLY PANIC arm_vm_init.c:1837 in sweet_early_map_final(): the L1
+entry for VM_MIN_KERNEL_ADDRESS + 32 MiB is not a table on the iOS layout. Use LOW_GLOBAL_BASE_ADDRESS + 32 MiB
+(same address as before on the macOS layout).
+
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1826,7 +1826,13 @@
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+  * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
+  */
+-#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++/*
++ * 0023: relative to the low globals, not VM_MIN_KERNEL_ADDRESS. Both are 0xfffffe0000000000 on the macOS layout,
++ * but on the iPhoneOS config (0022) VM_MIN_KERNEL_ADDRESS is 0xffffffe000000000, 64 GiB (one L1 entry) below the
++ * kernel at 0xfffffff007004000: that L1 entry has no L2 table and the assert below fired (boot 28a, arm_vm_init).
++ * The low globals sit at the start of the kernel's own L1 entry on both layouts.
++ */
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ static void
+ sweet_early_map_final(void)

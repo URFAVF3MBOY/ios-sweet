@@ -1,0 +1,187 @@
+0012: emulate the ARMv8.4+ user instructions the SM8150 lacks.
+
+iOS 27.2's iPhone15,2 userland targets the A16. The Cortex-A76/A55 have ARMv8.2 + LRCPC, so LRCPC2
+(LDAPUR/STLUR), FlagM/FlagM2, SB and DIT accesses trap as undefined (ios-guacamole: launchd SIGILL on the same
+SoC). Emulated in handle_uncategorized for 64-bit user code; aligned user accesses stay single-copy atomic.
+
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1181,6 +1181,165 @@
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: iOS 27.2's userland (iPhone15,2) is built for the A16 (ARMv8.6) and uses instructions the SM8150's
++ * Cortex-A76/A55 (ARMv8.2 + LRCPC + DotProd) do not have; they trap here as undefined. Emulated for EL0:
++ *  - LRCPC2 LDAPUR / LDAPURB/H / LDAPURS* / STLUR* (unscaled offset acquire loads and release stores),
++ *  - FlagM CFINV / RMIF / SETF8 / SETF16, FlagM2 AXFLAG / XAFLAG,
++ *  - SB (as DSB SY + ISB), MSR/MRS DIT (DIT reads as 0, writes ignored).
++ * Aligned 4/8-byte user accesses are single-copy atomic (copy{in,out}_atomic*): byte copies would tear the
++ * acquire/release atomics of libdispatch and others on SMP (ios-guacamole hit this). The first 32 emulations and
++ * the first 64 undefined instructions left over are logged as "HOTDOGB EMUL" / "HOTDOGB UNDEF".
++ */
++extern void proc_selfname(char *buf, int size);
++extern int proc_selfpid(void);
++static unsigned sweet_emul_logged, sweet_undef_logged;
++
++static void
++sweet_emul_log(const char *what, arm_saved_state_t *state, uint32_t instr, unsigned *counter, unsigned limit)
++{
++	if (os_atomic_inc_orig(counter, relaxed) < limit) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("HOTDOGB %s: %s[%d] pc 0x%llx instr 0x%08x\n", what, name, proc_selfpid(),
++		    (unsigned long long)get_saved_state_pc(state), instr);
++	}
++}
++
++static uint64_t
++sweet_xreg(arm_saved_state_t *state, unsigned r, bool sp)
++{
++	if (r == 31) {
++		return sp ? saved_state64(state)->sp : 0;
++	}
++	return saved_state64(state)->x[r];
++}
++
++static void
++sweet_set_xreg(arm_saved_state_t *state, unsigned r, uint64_t v)
++{
++	if (r != 31) {
++		saved_state64(state)->x[r] = v;
++	}
++}
++
++static int
++sweet_user_load(user_addr_t addr, unsigned bytes, uint64_t *v)
++{
++	*v = 0;
++	if (bytes == 8 && !(addr & 7)) {
++		return copyin_atomic64(addr, v);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr, &w);
++		*v = w;
++		return err;
++	}
++	if (bytes == 2 && !(addr & 1)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr & ~(user_addr_t)3, &w);
++		*v = (w >> ((addr & 2) * 8)) & 0xffff;
++		return err;
++	}
++	return copyin(addr, (char *)v, bytes);      /* little endian: the low bytes of *v */
++}
++
++static int
++sweet_user_store(user_addr_t addr, unsigned bytes, uint64_t v)
++{
++	if (bytes == 8 && !(addr & 7)) {
++		return copyout_atomic64(v, addr);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		return copyout_atomic32((uint32_t)v, addr);
++	}
++	return copyout((const char *)&v, addr, bytes);
++}
++
++/* Returns true when the instruction was emulated (pc advanced). */
++static bool
++sweet_emulate_user(arm_saved_state_t *state, uint32_t instr)
++{
++	uint32_t cpsr = get_saved_state_cpsr(state);
++	const uint32_t N = 1u << 31, Z = 1u << 30, C = 1u << 29, V = 1u << 28;
++
++	if ((instr & 0x3f200c00) == 0x19000000) {                /* LRCPC2: LDAPUR* / STLUR* (GPR) */
++		unsigned size = instr >> 30, opc = (instr >> 22) & 3, rn = (instr >> 5) & 31, rt = instr & 31;
++		int64_t imm9 = ((int64_t)(int32_t)(instr << 11)) >> 23;
++		user_addr_t addr = (user_addr_t)(sweet_xreg(state, rn, true) + (uint64_t)imm9);
++		unsigned bytes = 1u << size;
++		uint64_t v;
++		if (opc == 0) {                                      /* STLUR{B,H,,}: release store */
++			v = sweet_xreg(state, rt, false);
++			__builtin_arm_dmb(0xb);                          /* DMB ISH */
++			if (sweet_user_store(addr, bytes, v)) {
++				return false;
++			}
++		} else {
++			if ((opc == 2 && size == 3) || (opc == 3 && size >= 2)) {
++				return false;                                /* unallocated: leave it undefined */
++			}
++			if (sweet_user_load(addr, bytes, &v)) {
++				return false;
++			}
++			__builtin_arm_dmb(0x9);                          /* DMB ISHLD: acquire */
++			if (opc >= 2) {                                  /* sign extend to 64 (opc 2) or 32 (opc 3) bits */
++				unsigned bits = bytes * 8;
++				v = (uint64_t)(((int64_t)(v << (64 - bits))) >> (64 - bits));
++				if (opc == 3) {
++					v &= 0xffffffffULL;
++				}
++			}
++			sweet_set_xreg(state, rt, v);
++		}
++		sweet_emul_log("EMUL", state, instr, &sweet_emul_logged, 32);
++		saved_state64(state)->pc += 4;
++		return true;
++	}
++
++	if (instr == 0xd500401f) {                               /* CFINV */
++		cpsr ^= C;
++	} else if ((instr & 0xffe07c10) == 0xba000400) {         /* RMIF Xn, #shift, #mask */
++		unsigned shift = (instr >> 15) & 63, mask = instr & 15;
++		uint64_t x = sweet_xreg(state, (instr >> 5) & 31, false);
++		uint64_t t = shift ? ((x >> shift) | (x << (64 - shift))) : x;
++		uint32_t nzcv = (uint32_t)(t & 15) << 28, m = mask << 28;
++		cpsr = (cpsr & ~m) | (nzcv & m);
++	} else if ((instr & 0xffffbc1f) == 0x3a00080d) {         /* SETF8 / SETF16 Wn */
++		unsigned msb = (instr & (1u << 14)) ? 15 : 7;
++		uint32_t w = (uint32_t)sweet_xreg(state, (instr >> 5) & 31, false);
++		cpsr &= ~(N | Z | V);
++		cpsr |= ((w >> msb) & 1) ? N : 0;
++		cpsr |= (w & ((2u << msb) - 1)) == 0 ? Z : 0;
++		cpsr |= (((w >> (msb + 1)) ^ (w >> msb)) & 1) ? V : 0;
++	} else if (instr == 0xd500405f) {                        /* AXFLAG */
++		bool z = (cpsr & Z) || (cpsr & V), c = (cpsr & C) && !(cpsr & V);
++		cpsr &= ~(N | Z | C | V);
++		cpsr |= (z ? Z : 0) | (c ? C : 0);
++	} else if (instr == 0xd500403f) {                        /* XAFLAG */
++		bool z0 = (cpsr & Z) != 0, c0 = (cpsr & C) != 0;
++		cpsr &= ~(N | Z | C | V);
++		cpsr |= (!c0 && !z0 ? N : 0) | (z0 && c0 ? Z : 0) | (c0 || z0 ? C : 0) | (!c0 && z0 ? V : 0);
++	} else if (instr == 0xd50330ff) {                        /* SB */
++		__builtin_arm_dsb(0xf);
++		__builtin_arm_isb(0xf);
++	} else if ((instr & 0xfffff0ff) == 0xd503405f) {         /* MSR DIT, #imm: ignored */
++	} else if ((instr & 0xffffffe0) == 0xd51b42a0) {         /* MSR DIT, Xt: ignored */
++	} else if ((instr & 0xffffffe0) == 0xd53b42a0) {         /* MRS Xt, DIT: 0 */
++		sweet_set_xreg(state, instr & 31, 0);
++	} else {
++		sweet_emul_log("UNDEF", state, instr, &sweet_undef_logged, 64);
++		return false;
++	}
++	saved_state64(state)->cpsr = cpsr;
++	sweet_emul_log("EMUL", state, instr, &sweet_emul_logged, 32);
++	saved_state64(state)->pc += 4;
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static void
+ handle_uncategorized(arm_saved_state_t *state)
+ {
+@@ -1227,6 +1386,12 @@
+ 	}
+ 
+ #endif /* CONFIG_DTRACE */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_user(state, instr)) {
++		return;
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ 	if (PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
+ 		if (IS_ARM_GDB_TRAP(instr)) {

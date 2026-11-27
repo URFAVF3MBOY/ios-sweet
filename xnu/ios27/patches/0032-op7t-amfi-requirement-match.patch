@@ -1,0 +1,27 @@
+0032: AMFI op 102, launch requirement match.
+
+iOS 26/27 libxpc matches peer launch requirements through __mac_syscall("AMFI", 102, ...) with a zeroed output;
+ENOPOLICY counts as "not matched" with error code 0 and an assertion aborts the caller (ios-guacamole, iOS 26:
+backboardd every minute, from LightSourceSupport when powerd connects).
+- sweet_amfi.c: op 102 succeeds, leaving error code 0 = match.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -551,6 +551,17 @@
+ 	uint64_t flags = SWEET_AMFI_DYLD_OUTPUT_ALLOW_ALL;
+ 	int error;
+ 
++	if (call == 102) {
++		/*
++		 * 0032: iOS 26/27 libxpc (xpc_peer_requirement_match_received_message) asks op 102 to match a
++		 * launch-constraint requirement against a peer's audit token: args { audit_token[32], u64 lwcr,
++		 * u32 size, u64 out, u32 out_size }, the output zeroed by the caller. ENOPOLICY made it "not
++		 * matched" with error code 0 and the assertion aborted the caller (backboardd every minute in
++		 * ios-guacamole's iOS 26 boot). Success leaves error code 0 = AICMR_MATCH: every requirement
++		 * matches, as there is no CoreEntitlements evaluator here.
++		 */
++		return 0;
++	}
+ 	if (call != SWEET_AMFI_SYSCALL_CHECK_DYLD_POLICY) {
+ 		return ENOPOLICY;
+ 	}
