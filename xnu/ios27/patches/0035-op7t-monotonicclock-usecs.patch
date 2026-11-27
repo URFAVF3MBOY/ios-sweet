@@ -1,0 +1,32 @@
+--- a/bsd/kern/kern_clock.c
++++ b/bsd/kern/kern_clock.c
+@@ -1,6 +1,31 @@
+ SYSCTL_PROC(_kern, KERN_CLOCKRATE, clockrate,
+     CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_clockrate, "S,clockinfo", "");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0035: iOS 27's mobileactivationd asks for kern.monotonicclock_usecs (a 64-bit value, microseconds)
++ * during its data-migration init and aborts when sysctlbyname() returns ENOENT. xnu-12377 has no sysctl
++ * by this name -- the only monotonic node it has is kern.monotonic.* (perf counters, bsd/dev/monotonic.c),
++ * which is unrelated. Boot 28o-28r: SIGABRT right after launch, "SWEET SYSCTL: no
++ * 'kern.monotonicclock_usecs'" logged first. Give it a real monotonic clock reading instead.
++ */
++static int
++sweet_kern_monotonicclock_usecs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t nsec;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nsec);
++	uint64_t usec = nsec / NSEC_PER_USEC;
++	return SYSCTL_OUT(req, &usec, sizeof(usec));
++}
++SYSCTL_PROC(_kern, OID_AUTO, monotonicclock_usecs,
++    CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, NULL, 0,
++    sweet_kern_monotonicclock_usecs, "Q", "Monotonic clock, microseconds (iOS 27 mobileactivationd)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 
+ /*
+  * Compute number of ticks in the specified amount of time.
