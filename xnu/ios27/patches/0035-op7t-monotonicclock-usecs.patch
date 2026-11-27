@@ -1,7 +1,6 @@
 --- a/bsd/kern/kern_clock.c
 +++ b/bsd/kern/kern_clock.c
-@@ -1,6 +1,31 @@
- SYSCTL_PROC(_kern, KERN_CLOCKRATE, clockrate,
+@@ -267,6 +267,28 @@
      CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
      0, 0, sysctl_clockrate, "S,clockinfo", "");
  
