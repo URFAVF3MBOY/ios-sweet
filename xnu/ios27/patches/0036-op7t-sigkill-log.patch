@@ -1,0 +1,45 @@
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -1408,6 +1408,19 @@ kill(proc_t cp, struct kill_args *uap, __unused int32_t *retval)
+ 			return EPERM;
+ 		}
+ 		if (uap->signum) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/*
++			 * SWEET: iOS 27.2 backboardd, SpringBoard and others SIGKILL themselves (launchd: "exited due to
++			 * SIGKILL | sent by backboardd"); print where (the same report as a crash: registers + user backtrace) for the first 100.
++			 */
++			static int sweet_selfkill_logged;
++			if (uap->signum == SIGKILL && sweet_selfkill_logged < 100) {
++				extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++				sweet_selfkill_logged++;
++				printf("KILLSYS %s[%d] -> %s[%d]\n", cp->p_comm, proc_getpid(cp), p->p_comm, proc_getpid(p));
++				sweet_crash_log(cp->p_comm, proc_getpid(cp), SIGKILL, (uint64_t)proc_getpid(p), 0);
++			}
++#endif
+ 			psignal(p, uap->signum);
+ 		}
+ 		proc_rele(p);
+@@ -2071,6 +2084,22 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 	mask = sigmask(signum);
+ 	prop = sigprop[signum];
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEET: who SIGKILLs the iOS 27.2 daemons (exit reason ns 2 code 9)? No copyin here (locks may be held). */
++	{
++		static int sweet_sigkill_logged;
++		if (signum == SIGKILL && sweet_sigkill_logged < 400) {
++			proc_t sp = current_proc();
++			sweet_sigkill_logged++;
++			printf("SIGKILL by %s[%d] to %s[%d] flavor %d reason %p ra0 0x%lx ra1 0x%lx ref 0x%lx\n",
++			    sp ? sp->p_comm : "?", sp ? proc_getpid(sp) : -1,
++			    p ? p->p_comm : "?", p ? proc_getpid(p) : -1, flavor, signal_reason,
++			    (unsigned long)__builtin_return_address(0),
++			    (unsigned long)__builtin_return_address(1), (unsigned long)(uintptr_t)&psignal_internal);
++		}
++	}
++#endif
++
+ #if SIGNAL_DEBUG
+ 	if (rdebug_proc && (p != PROC_NULL) && (p == rdebug_proc)) {
+ 		ram_printf(3);
