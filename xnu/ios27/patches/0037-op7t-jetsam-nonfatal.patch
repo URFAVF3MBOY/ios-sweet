@@ -1,0 +1,54 @@
+0037: SWEET only: per-process jetsam limits no longer kill iOS 27.2 daemons (lsd, softposreaderd, intents_helper).
+
+sym.txt (boot 28s) shows lsd dying inside proc_info(set_dirty) <- xpc_transaction_end: the kernel applies the inactive
+limit (12 MB, fatal) at the clean transition and kills it, exit reason ns 1 code 7. This generalises ios-guacamole's
+0142 (which did the same for com.apple.WebKit.* only) to every process, logged as "SWEET MEM: ..." (first 200).
+Boot-arg sweetmemlimit=0 turns it off.
+
+UNTESTED: the context below is copied from 0142, i.e. the xnu-8796 kern_memorystatus.c; the function name/signature
+in xnu-12377.121.6 is unchecked. Run `git apply --check` in the 12377 tree first; if the hunk misses, put the block at
+the top of memorystatus_on_ledger_footprint_exceeded() (it must run before the memlimit_is_fatal kill branch).
+
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -4244,6 +4244,40 @@ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_is_active, boolean_t memlimit_is_fatal)
+ 	}
+ #endif /* VM_PRESSURE_EVENTS */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET (0037): iOS 27.2 per-process jetsam limits are tiny and fatal here (boot 28s: lsd [119] "exceeded
++	 * mem limit: InactiveHard 12 MB (fatal)" at 25.6 s, SIGKILL exit reason ns 1 code 7; softposreaderd and
++	 * intents_helper the same). The footprint counts every page the process touched: all processes unnest the
++	 * shared region's __DATA_CONST (private copies) and every IOSurface is wired memory mapped into the task.
++	 * Instead of the kill: log it and raise the task to a 2 GB non-fatal limit (same call as 0142 for WebKit on
++	 * the iOS 16 tree). Boot-arg sweetmemlimit=0 keeps the stock behaviour.
++	 */
++	if (memlimit_is_fatal) {
++		static int sweetmem = -1;
++		if (sweetmem < 0) {
++			int v = 1;
++			PE_parse_boot_argn("sweetmemlimit", &v, sizeof(v));
++			sweetmem = v;
++		}
++		if (sweetmem) {
++			static int sweetmem_logged;
++			char name[MAXCOMLEN + 1] = "";
++			proc_selfname(name, sizeof(name));
++			memorystatus_memlimit_properties_t raised = { 2048, 0, 2048, 0 };
++			int err = memorystatus_set_memlimit_properties(proc_getpid(p), &raised);
++			if (sweetmem_logged < 200) {
++				sweetmem_logged++;
++				printf("SWEET MEM: %s[%d] over its fatal limit: raised to 2048 MB, not fatal (%d)\n",
++				    name, proc_getpid(p), err);
++			}
++			if (err == 0) {
++				return;
++			}
++		}
++	}
++#endif
++
+ 	if (memlimit_is_fatal) {
+ 		/*
+ 		 * If this process has no high watermark or has a fatal task limit, then we have been invoked because the task
